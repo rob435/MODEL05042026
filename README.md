@@ -4,7 +4,7 @@ Real-time crypto breakout detector built around Bybit V5 candle streams, volatil
 
 ## Canonical Spec
 
-The current source-of-truth system specification is [SPEC.md](/Users/jhbvdnsbkvnsd/Desktop/OutlierDetector/SPEC.md).
+The current source-of-truth system specification is [SPEC.md](SPEC.md).
 Use that document for the actual runtime contract. This README is now an operator overview.
 
 ## What it does
@@ -64,7 +64,7 @@ The 1-day Telegram review showed that the engine is still too reactive for a 3-7
 python3 -m venv .venv
 . .venv/bin/activate
 pip install -r requirements.txt
-cp .env.example .env
+cp deploy/production.env.example .env
 python main.py
 ```
 
@@ -134,9 +134,9 @@ This is the honest soak-test path for startup, WebSocket stability, macro refres
 
 ## Deployment
 
-`deploy/outlier-detector.service` is a minimal `systemd` unit. Adjust paths before installing it.
+`deploy/outlier-detector.service` is a minimal `systemd` unit for a checkout at `/opt/MODEL05042026`.
 
-For the first VPS validation run, use [SOAK_RUN.md](/Users/jhbvdnsbkvnsd/Desktop/OutlierDetector/deploy/SOAK_RUN.md) and start from [production.env.example](/Users/jhbvdnsbkvnsd/Desktop/OutlierDetector/deploy/production.env.example).
+For the first VPS validation run, use [SOAK_RUN.md](deploy/SOAK_RUN.md) and start from [production.env.example](deploy/production.env.example).
 
 ## Operational notes
 

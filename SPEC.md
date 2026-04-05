@@ -76,13 +76,13 @@ Important compromise:
 
 ## 4. Universe
 
-The active tradable universe is defined manually in [universe.py](/Users/jhbvdnsbkvnsd/Desktop/OutlierDetector/universe.py).
+The active tradable universe is defined manually in [universe.py](universe.py).
 
 Rules:
 
 - all configured universe symbols are ranked
 - `BTCUSDT` is also tracked for macro state, but it is not part of the ranked alt universe
-- the universe is expected to be checked periodically with [universe_validator.py](/Users/jhbvdnsbkvnsd/Desktop/OutlierDetector/universe_validator.py)
+- the universe is expected to be checked periodically with [universe_validator.py](universe_validator.py)
 
 ## 5. Timeframes And Windows
 
@@ -90,7 +90,7 @@ Core market timeframe:
 
 - `15m`
 
-Default rolling windows from [config.py](/Users/jhbvdnsbkvnsd/Desktop/OutlierDetector/config.py):
+Default rolling windows from [config.py](config.py):
 
 - ticker state window: `288` 15-minute bars
 - BTC daily lookback: `220`
@@ -189,7 +189,7 @@ If the WebSocket fails:
 
 ## 7. State Model
 
-In-memory state is maintained in [state.py](/Users/jhbvdnsbkvnsd/Desktop/OutlierDetector/state.py).
+In-memory state is maintained in [state.py](state.py).
 
 Confirmed ticker state:
 
@@ -219,7 +219,7 @@ Global macro state:
 
 ## 8. Indicator Definitions
 
-All indicator math lives in [indicators.py](/Users/jhbvdnsbkvnsd/Desktop/OutlierDetector/indicators.py).
+All indicator math lives in [indicators.py](indicators.py).
 
 ### 8.1 Returns
 
@@ -532,7 +532,7 @@ The first valid confirmed breakout is not blocked by persistence. Persistence up
 
 ## 15. Alerting Rules
 
-Telegram alerting is handled by [alerting.py](/Users/jhbvdnsbkvnsd/Desktop/OutlierDetector/alerting.py).
+Telegram alerting is handled by [alerting.py](alerting.py).
 
 ### 15.1 Event alerts
 
@@ -608,7 +608,7 @@ Duplicate confirmed summaries are suppressed by `(stage, cycle_time_ms)` persist
 
 ## 17. Logging And Persistence
 
-SQLite persistence is handled by [database.py](/Users/jhbvdnsbkvnsd/Desktop/OutlierDetector/database.py).
+SQLite persistence is handled by [database.py](database.py).
 
 ### 17.1 Signal row logging
 
@@ -673,11 +673,11 @@ The service raises on missing or non-contiguous history because continuity is re
 
 Operator tooling shipped with the repo:
 
-- [replay.py](/Users/jhbvdnsbkvnsd/Desktop/OutlierDetector/replay.py): historical engine replay
-- [smoke.py](/Users/jhbvdnsbkvnsd/Desktop/OutlierDetector/smoke.py): short validation run
-- [benchmark.py](/Users/jhbvdnsbkvnsd/Desktop/OutlierDetector/benchmark.py): cycle latency benchmark
-- [report.py](/Users/jhbvdnsbkvnsd/Desktop/OutlierDetector/report.py): SQLite reporting
-- [universe_validator.py](/Users/jhbvdnsbkvnsd/Desktop/OutlierDetector/universe_validator.py): live universe check
+- [replay.py](replay.py): historical engine replay
+- [smoke.py](smoke.py): short validation run
+- [benchmark.py](benchmark.py): cycle latency benchmark
+- [report.py](report.py): SQLite reporting
+- [universe_validator.py](universe_validator.py): live universe check
 
 ## 21. Known Compromises
 

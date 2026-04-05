@@ -5,13 +5,12 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-WorkingDirectory=/opt/outlier-detector
-EnvironmentFile=/opt/outlier-detector/.env
-ExecStart=/opt/outlier-detector/.venv/bin/python /opt/outlier-detector/main.py
+WorkingDirectory=/opt/MODEL05042026
+EnvironmentFile=/opt/MODEL05042026/.env
+ExecStart=/opt/MODEL05042026/.venv/bin/python /opt/MODEL05042026/main.py
 Restart=always
 RestartSec=5
 TimeoutStopSec=15
 
 [Install]
 WantedBy=multi-user.target
-

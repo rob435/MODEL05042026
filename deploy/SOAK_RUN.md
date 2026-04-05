@@ -8,8 +8,8 @@ Do not deploy by copying a dirty local working tree full of SQLite files and cac
 ```bash
 sudo mkdir -p /opt
 cd /opt
-git clone https://github.com/rob435/OutlierDetector.git outlier-detector
-cd /opt/outlier-detector
+git clone https://github.com/rob435/MODEL05042026.git
+cd /opt/MODEL05042026
 python3 -m venv .venv
 . .venv/bin/activate
 pip install -r requirements.txt
@@ -18,7 +18,7 @@ mkdir -p data
 
 ## 2. Prepare environment
 
-Start from [production.env.example](/Users/jhbvdnsbkvnsd/Desktop/OutlierDetector/deploy/production.env.example):
+Start from [production.env.example](production.env.example):
 
 ```bash
 cp deploy/production.env.example .env
@@ -38,7 +38,7 @@ If you tune `.env`, restart the service after the change. `systemd` will not mag
 ```bash
 . .venv/bin/activate
 python universe_validator.py
-python smoke.py --cycles 4 --db /opt/outlier-detector/data/smoke.sqlite3 --strict-universe
+python smoke.py --cycles 4 --db /opt/MODEL05042026/data/smoke.sqlite3 --strict-universe
 python benchmark.py --tickers 100 --cycles 10
 ```
 
@@ -71,7 +71,7 @@ python main.py --run-seconds 1800 --disable-telegram
 ## 5. Inspect results
 
 ```bash
-python report.py --db /opt/outlier-detector/data/signals.sqlite3 --top 20
+python report.py --db /opt/MODEL05042026/data/signals.sqlite3 --top 20
 ```
 
 What you want:
@@ -84,7 +84,7 @@ What you want:
 
 ## 6. Promote to systemd
 
-Copy [outlier-detector.service](/Users/jhbvdnsbkvnsd/Desktop/OutlierDetector/deploy/outlier-detector.service) into `/etc/systemd/system/` and reload:
+Copy [outlier-detector.service](outlier-detector.service) into `/etc/systemd/system/` and reload:
 
 ```bash
 sudo cp deploy/outlier-detector.service /etc/systemd/system/outlier-detector.service

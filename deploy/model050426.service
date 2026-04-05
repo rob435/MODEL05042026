@@ -1,5 +1,5 @@
 [Unit]
-Description=Outlier Detector Signal Engine
+Description=MODEL050426 Signal Engine
 After=network-online.target
 Wants=network-online.target
 

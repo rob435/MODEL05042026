@@ -84,28 +84,28 @@ What you want:
 
 ## 6. Promote to systemd
 
-Copy [outlier-detector.service](outlier-detector.service) into `/etc/systemd/system/` and reload:
+Copy [model050426.service](model050426.service) into `/etc/systemd/system/` and reload:
 
 ```bash
-sudo cp deploy/outlier-detector.service /etc/systemd/system/outlier-detector.service
+sudo cp deploy/model050426.service /etc/systemd/system/model050426.service
 sudo systemctl daemon-reload
-sudo systemctl enable outlier-detector
-sudo systemctl start outlier-detector
-sudo systemctl status outlier-detector
+sudo systemctl enable model050426
+sudo systemctl start model050426
+sudo systemctl status model050426
 ```
 
 Then monitor:
 
 ```bash
-journalctl -u outlier-detector -f
+journalctl -u model050426 -f
 ```
 
 Basic control commands:
 
 ```bash
-sudo systemctl restart outlier-detector
-sudo systemctl status outlier-detector --no-pager
-journalctl -u outlier-detector -n 100 --no-pager
+sudo systemctl restart model050426
+sudo systemctl status model050426 --no-pager
+journalctl -u model050426 -n 100 --no-pager
 ```
 
 ## 7. Stop conditions

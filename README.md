@@ -134,7 +134,7 @@ This is the honest soak-test path for startup, WebSocket stability, macro refres
 
 ## Deployment
 
-`deploy/outlier-detector.service` is a minimal `systemd` unit for a checkout at `/opt/MODEL05042026`.
+`deploy/model050426.service` is the shipped `systemd` unit for a checkout at `/opt/MODEL05042026`.
 
 For the first VPS validation run, use [SOAK_RUN.md](deploy/SOAK_RUN.md) and start from [production.env.example](deploy/production.env.example).
 

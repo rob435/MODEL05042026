@@ -1,4 +1,4 @@
-# Outlier Detector
+# MODEL050426
 
 Real-time crypto breakout detector built around Bybit V5 candle streams, volatility-adjusted momentum, return curvature, BTC regime scoring, and cross-sectional ranking.
 

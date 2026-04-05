@@ -1,4 +1,4 @@
-# Outlier Detector Spec
+# MODEL050426 Spec
 
 ## 1. Purpose
 

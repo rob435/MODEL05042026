@@ -294,7 +294,7 @@ def build_client_session() -> aiohttp.ClientSession:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Run the outlier detector service.")
+    parser = argparse.ArgumentParser(description="Run the MODEL050426 service.")
     parser.add_argument(
         "--run-seconds",
         type=float,
@@ -312,7 +312,7 @@ def parse_args() -> argparse.Namespace:
 async def run(run_seconds: float | None = None, disable_telegram: bool = False) -> RuntimeStats:
     settings = load_settings()
     configure_logging(settings.log_level)
-    LOGGER.info("Starting outlier detector with %s universe symbols", len(settings.universe))
+    LOGGER.info("Starting MODEL050426 with %s universe symbols", len(settings.universe))
 
     emerging_queue: asyncio.Queue[int] = asyncio.Queue(maxsize=settings.queue_maxsize)
     confirmed_queue: asyncio.Queue[int] = asyncio.Queue(maxsize=settings.queue_maxsize)

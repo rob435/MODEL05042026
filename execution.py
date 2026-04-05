@@ -1,0 +1,746 @@
+from __future__ import annotations
+
+import logging
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from decimal import Decimal, ROUND_DOWN, ROUND_HALF_UP
+from uuid import uuid4
+
+from alerting import ExecutionPayload, TelegramNotifier
+from config import Settings
+from database import SignalDatabase
+from exchange import BybitTradeClient, WalletBalance, round_decimal
+from signal_engine import RankedSignal
+from state import MarketState
+
+LOGGER = logging.getLogger(__name__)
+
+
+@dataclass(slots=True)
+class OrderSubmission:
+    status: str
+    fill_price: float | None
+    notes: str
+    external_order_id: str | None = None
+
+
+@dataclass(slots=True)
+class ExecutionAction:
+    ticker: str
+    action: str
+    signal_kind: str
+    detail: str
+    order_id: int | None = None
+    position_id: int | None = None
+
+
+class SimulatedExecutionClient:
+    def __init__(self, settings: Settings) -> None:
+        self.settings = settings
+
+    def enabled(self) -> bool:
+        return not self.settings.execution_submit_orders
+
+    async def submit_market_order(
+        self,
+        *,
+        ticker: str,
+        side: str,
+        quantity: float,
+        price_hint: float,
+        reduce_only: bool,
+    ) -> OrderSubmission:
+        mode = "demo" if self.settings.demo_mode else "paper"
+        return OrderSubmission(
+            status="simulated_fill",
+            fill_price=price_hint,
+            notes=(
+                f"Local {mode} fill only. Private Bybit order submission is disabled; "
+                f"qty={quantity:.8f} reduce_only={str(reduce_only).lower()}."
+            ),
+        )
+
+
+class ExecutionEngine:
+    def __init__(
+        self,
+        settings: Settings,
+        state: MarketState,
+        database: SignalDatabase,
+        notifier: TelegramNotifier | None = None,
+        client: BybitTradeClient | SimulatedExecutionClient | None = None,
+    ) -> None:
+        self.settings = settings
+        self.state = state
+        self.database = database
+        self.notifier = notifier
+        self.client = client or SimulatedExecutionClient(settings)
+
+    def _using_live_venue(self) -> bool:
+        enabled = getattr(self.client, "enabled", None)
+        return bool(self.settings.execution_submit_orders and callable(enabled) and enabled())
+
+    def _now(self, cycle_time_ms: int | None, stage: str) -> datetime:
+        if cycle_time_ms is not None and stage == "confirmed":
+            return datetime.fromtimestamp(cycle_time_ms / 1000, tz=timezone.utc)
+        return datetime.now(timezone.utc)
+
+    def _latest_price(self, ticker: str, stage: str) -> float | None:
+        prices = self.state.get_prices(ticker, include_provisional=stage == "emerging")
+        if prices.size == 0:
+            return None
+        return float(prices[-1])
+
+    def _estimate_quantity(self, price: float) -> float:
+        if price <= 0:
+            raise ValueError("Cannot size an order with non-positive price")
+        return round(self.settings.entry_notional_usd / price, 8)
+
+    def _risk_notional_from_wallet(self, wallet_balance: WalletBalance) -> Decimal:
+        if self.settings.stop_loss_pct <= 0:
+            raise ValueError("STOP_LOSS_PCT must be positive for risk-based sizing")
+        risk_budget_usd = wallet_balance.total_available_balance_usd * Decimal(
+            str(self.settings.risk_per_trade_pct)
+        )
+        if risk_budget_usd <= 0:
+            raise ValueError("Available balance is zero; cannot size a new trade")
+        notional_usd = risk_budget_usd / Decimal(str(self.settings.stop_loss_pct))
+        if notional_usd <= 0:
+            raise ValueError("Computed risk notional is zero; cannot size a new trade")
+        return notional_usd
+
+    def _client_order_id(self, lifecycle: str, ticker: str) -> str:
+        return f"{lifecycle}-{ticker.lower()}-{uuid4().hex[:12]}"
+
+    def _infer_exit_event(self, entry_price: float, exit_price: float) -> str:
+        tp_price = entry_price * (1 + self.settings.take_profit_pct)
+        sl_price = entry_price * (1 - self.settings.stop_loss_pct)
+        if exit_price >= tp_price:
+            return "take_profit_exit"
+        if exit_price <= sl_price:
+            return "stop_loss_exit"
+        return "exchange_exit"
+
+    async def _send_execution_notification(
+        self,
+        *,
+        event: str,
+        ticker: str,
+        stage: str,
+        signal_kind: str,
+        quantity: float,
+        entry_price: float | None = None,
+        exit_price: float | None = None,
+        current_price: float | None = None,
+        pnl_pct: float | None = None,
+        notes: str = "",
+    ) -> None:
+        if self.notifier is None or not self.notifier.enabled:
+            return
+        try:
+            await self.notifier.send_execution(
+                ExecutionPayload(
+                    event=event,
+                    ticker=ticker,
+                    side="LONG",
+                    stage=stage,
+                    signal_kind=signal_kind,
+                    quantity=quantity,
+                    entry_price=entry_price,
+                    exit_price=exit_price,
+                    current_price=current_price,
+                    pnl_pct=pnl_pct,
+                    notes=notes,
+                )
+            )
+        except Exception:
+            LOGGER.exception("Execution notification failed for %s %s", event, ticker)
+
+    async def _submit_simulated_exit(
+        self,
+        *,
+        position,
+        ticker: str,
+        stage: str,
+        now_iso: str,
+        exit_price: float,
+        exit_reason: str,
+        signal_kind: str = "none",
+    ) -> ExecutionAction:
+        quantity = float(position["quantity"])
+        submission = await self.client.submit_market_order(
+            ticker=ticker,
+            side="Sell",
+            quantity=quantity,
+            price_hint=exit_price,
+            reduce_only=True,
+        )
+        order_id = await self.database.create_order(
+            client_order_id=self._client_order_id("exit", ticker),
+            ticker=ticker,
+            side="Sell",
+            order_type="Market",
+            lifecycle="exit",
+            status=submission.status,
+            stage=stage,
+            signal_kind=signal_kind,
+            requested_qty=quantity,
+            requested_notional_usd=float(position["notional_usd"]),
+            requested_price=exit_price,
+            venue="bybit",
+            is_demo=self.settings.demo_mode,
+            created_at=now_iso,
+            updated_at=now_iso,
+            fill_price=submission.fill_price,
+            external_order_id=submission.external_order_id,
+            filled_at=now_iso if submission.fill_price is not None else None,
+            notes=submission.notes,
+        )
+        realized_price = float(submission.fill_price or exit_price)
+        pnl_pct = (realized_price / float(position["entry_price"])) - 1.0
+        await self.database.close_position(
+            int(position["id"]),
+            exit_order_id=order_id,
+            exit_price=realized_price,
+            closed_at=now_iso,
+            updated_at=now_iso,
+            notes=exit_reason,
+        )
+        await self._send_execution_notification(
+            event=self._infer_exit_event(float(position["entry_price"]), realized_price),
+            ticker=ticker,
+            stage=stage,
+            signal_kind=signal_kind,
+            quantity=quantity,
+            entry_price=float(position["entry_price"]),
+            exit_price=realized_price,
+            pnl_pct=pnl_pct,
+            notes=submission.notes,
+        )
+        return ExecutionAction(
+            ticker=ticker,
+            action="exit_long",
+            signal_kind=signal_kind,
+            detail=exit_reason,
+            order_id=order_id,
+            position_id=int(position["id"]),
+        )
+
+    async def _process_risk_exits(
+        self,
+        *,
+        stage: str,
+        cycle_time_ms: int | None,
+    ) -> tuple[list[ExecutionAction], set[str]]:
+        actions: list[ExecutionAction] = []
+        closed_tickers: set[str] = set()
+        now_iso = self._now(cycle_time_ms=cycle_time_ms, stage=stage).isoformat()
+        for position in await self.database.list_open_positions():
+            ticker = str(position["ticker"])
+            current_price = self._latest_price(ticker, stage=stage)
+            if current_price is None:
+                continue
+            entry_price = float(position["entry_price"])
+            pnl_pct = (current_price / entry_price) - 1.0
+            if pnl_pct >= self.settings.take_profit_pct:
+                actions.append(
+                    await self._submit_simulated_exit(
+                        position=position,
+                        ticker=ticker,
+                        stage=stage,
+                        now_iso=now_iso,
+                        exit_price=current_price,
+                        exit_reason="take_profit_hit",
+                    )
+                )
+                closed_tickers.add(ticker)
+                continue
+            if pnl_pct <= -self.settings.stop_loss_pct:
+                actions.append(
+                    await self._submit_simulated_exit(
+                        position=position,
+                        ticker=ticker,
+                        stage=stage,
+                        now_iso=now_iso,
+                        exit_price=current_price,
+                        exit_reason="stop_loss_hit",
+                    )
+                )
+                closed_tickers.add(ticker)
+        return actions, closed_tickers
+
+    async def _sync_live_closed_positions(
+        self,
+        *,
+        stage: str,
+    ) -> tuple[list[ExecutionAction], set[str]]:
+        actions: list[ExecutionAction] = []
+        closed_tickers: set[str] = set()
+        if not self._using_live_venue():
+            return actions, closed_tickers
+        for position in await self.database.list_open_positions():
+            ticker = str(position["ticker"])
+            venue_position = await self.client.get_position(ticker)
+            if venue_position is not None:
+                continue
+            closed = await self.client.get_latest_closed_pnl(ticker)
+            if closed is None:
+                continue
+            opened_at_ms = int(datetime.fromisoformat(position["opened_at"]).timestamp() * 1000)
+            if closed.updated_time_ms < opened_at_ms:
+                continue
+            now_iso = datetime.fromtimestamp(closed.updated_time_ms / 1000, tz=timezone.utc).isoformat()
+            exit_price = float(closed.avg_exit_price)
+            entry_price = float(position["entry_price"])
+            pnl_pct = (exit_price / entry_price) - 1.0 if entry_price > 0 else None
+            order_id = await self.database.create_order(
+                client_order_id=self._client_order_id("exit-sync", ticker),
+                ticker=ticker,
+                side="Sell",
+                order_type="Market",
+                lifecycle="exit",
+                status="filled_sync",
+                stage=stage,
+                signal_kind="none",
+                requested_qty=float(position["quantity"]),
+                requested_notional_usd=float(position["notional_usd"]),
+                requested_price=exit_price,
+                venue="bybit",
+                is_demo=self.settings.demo_mode,
+                created_at=now_iso,
+                updated_at=now_iso,
+                fill_price=exit_price,
+                external_order_id=closed.order_id,
+                filled_at=now_iso,
+                notes="Synced from Bybit closed PnL",
+            )
+            await self.database.close_position(
+                int(position["id"]),
+                exit_order_id=order_id,
+                exit_price=exit_price,
+                closed_at=now_iso,
+                updated_at=now_iso,
+                notes="closed on Bybit venue",
+            )
+            event = self._infer_exit_event(entry_price, exit_price)
+            await self._send_execution_notification(
+                event=event,
+                ticker=ticker,
+                stage=stage,
+                signal_kind="none",
+                quantity=float(position["quantity"]),
+                entry_price=entry_price,
+                exit_price=exit_price,
+                pnl_pct=pnl_pct,
+                notes="Synced from Bybit closed PnL",
+            )
+            actions.append(
+                ExecutionAction(
+                    ticker=ticker,
+                    action="exit_synced",
+                    signal_kind="none",
+                    detail=event,
+                    order_id=order_id,
+                    position_id=int(position["id"]),
+                )
+            )
+            closed_tickers.add(ticker)
+        return actions, closed_tickers
+
+    async def process_cycle(
+        self,
+        *,
+        stage: str,
+        cycle_time_ms: int | None,
+        ranked_signals: list[RankedSignal],
+    ) -> list[ExecutionAction]:
+        if not self.settings.execution_enabled:
+            return []
+        if self.settings.execution_submit_orders and not self._using_live_venue():
+            raise RuntimeError(
+                "EXECUTION_SUBMIT_ORDERS=true but the Bybit trade client is not ready. "
+                "Check BYBIT_API_KEY, BYBIT_API_SECRET, and BYBIT_TRADE_BASE_URL."
+            )
+        if self._using_live_venue():
+            sync_actions, closed_tickers = await self._sync_live_closed_positions(stage=stage)
+        else:
+            sync_actions, closed_tickers = await self._process_risk_exits(
+                stage=stage,
+                cycle_time_ms=cycle_time_ms,
+            )
+        if stage == "emerging":
+            stage_actions = await self._process_entries(
+                cycle_time_ms=cycle_time_ms,
+                ranked_signals=ranked_signals,
+                blocked_tickers=closed_tickers,
+            )
+            return sync_actions + stage_actions
+        if stage == "confirmed":
+            stage_actions = await self._process_confirmed(
+                cycle_time_ms=cycle_time_ms,
+                ranked_signals=ranked_signals,
+                blocked_tickers=closed_tickers,
+            )
+            return sync_actions + stage_actions
+        return sync_actions
+
+    async def _process_entries(
+        self,
+        *,
+        cycle_time_ms: int | None,
+        ranked_signals: list[RankedSignal],
+        blocked_tickers: set[str],
+    ) -> list[ExecutionAction]:
+        actions: list[ExecutionAction] = []
+        now = self._now(cycle_time_ms=cycle_time_ms, stage="emerging")
+        now_iso = now.isoformat()
+        open_positions = {
+            row["ticker"]: row for row in await self.database.list_open_positions()
+        }
+        candidates = [signal for signal in ranked_signals if signal.signal_kind == "entry_ready"]
+        candidates.sort(key=lambda signal: signal.rank)
+        for signal in candidates:
+            if signal.ticker in blocked_tickers:
+                actions.append(
+                    ExecutionAction(
+                        ticker=signal.ticker,
+                        action="skip_entry",
+                        signal_kind=signal.signal_kind,
+                        detail="ticker_closed_this_cycle",
+                    )
+                )
+                continue
+            if signal.ticker in open_positions:
+                actions.append(
+                    ExecutionAction(
+                        ticker=signal.ticker,
+                        action="skip_entry",
+                        signal_kind=signal.signal_kind,
+                        detail="position_already_open",
+                        position_id=int(open_positions[signal.ticker]["id"]),
+                    )
+                )
+                continue
+
+            if self._using_live_venue():
+                existing_venue_position = await self.client.get_position(signal.ticker)
+                if existing_venue_position is not None and existing_venue_position.size > 0:
+                    actions.append(
+                        ExecutionAction(
+                            ticker=signal.ticker,
+                            action="skip_entry",
+                            signal_kind=signal.signal_kind,
+                            detail=(
+                                "venue_position_already_open "
+                                f"size={format(existing_venue_position.size.normalize(), 'f')}"
+                            ),
+                        )
+                    )
+                    continue
+                spec = await self.client.fetch_instrument_spec(signal.ticker)
+                wallet_balance = await self.client.get_wallet_balance()
+                target_notional_usd = self._risk_notional_from_wallet(wallet_balance)
+                qty = round_decimal(
+                    target_notional_usd / Decimal(str(signal.current_price)),
+                    spec.qty_step,
+                    ROUND_DOWN,
+                )
+                if qty < spec.min_order_qty or qty <= 0:
+                    actions.append(
+                        ExecutionAction(
+                            ticker=signal.ticker,
+                            action="skip_entry",
+                            signal_kind=signal.signal_kind,
+                            detail=(
+                                f"qty_below_min_order_qty qty={qty} min_order_qty={spec.min_order_qty}"
+                            ),
+                        )
+                    )
+                    continue
+                order_link_id = self._client_order_id("entry", signal.ticker)
+                try:
+                    ack = await self.client.place_market_order(
+                        symbol=signal.ticker,
+                        side="Buy",
+                        quantity=qty,
+                        order_link_id=order_link_id,
+                    )
+                    venue_position = await self.client.wait_for_position(signal.ticker)
+                    entry_price = venue_position.avg_price
+                    tp_price = round_decimal(
+                        entry_price * Decimal(str(1 + self.settings.take_profit_pct)),
+                        spec.tick_size,
+                        ROUND_HALF_UP,
+                    )
+                    sl_price = round_decimal(
+                        entry_price * Decimal(str(1 - self.settings.stop_loss_pct)),
+                        spec.tick_size,
+                        ROUND_HALF_UP,
+                    )
+                    await self.client.set_trading_stop(
+                        symbol=signal.ticker,
+                        position_idx=venue_position.position_idx,
+                        take_profit=tp_price,
+                        stop_loss=sl_price,
+                    )
+                except Exception as exc:
+                    order_id = await self.database.create_order(
+                        client_order_id=order_link_id,
+                        ticker=signal.ticker,
+                        side="Buy",
+                        order_type="Market",
+                        lifecycle="entry",
+                        status="rejected",
+                        stage=signal.stage,
+                        signal_kind=signal.signal_kind,
+                        requested_qty=float(qty),
+                        requested_notional_usd=float(target_notional_usd),
+                        requested_price=signal.current_price,
+                        venue="bybit",
+                        is_demo=self.settings.demo_mode,
+                        created_at=now_iso,
+                        updated_at=now_iso,
+                        notes=str(exc),
+                    )
+                    LOGGER.warning("Live entry submission failed for %s: %s", signal.ticker, exc)
+                    actions.append(
+                        ExecutionAction(
+                            ticker=signal.ticker,
+                            action="entry_rejected",
+                            signal_kind=signal.signal_kind,
+                            detail=str(exc),
+                            order_id=order_id,
+                        )
+                    )
+                    continue
+
+                notes = (
+                    f"Bybit live demo order placed. Risk={self.settings.risk_per_trade_pct * 100:.2f}% "
+                    f"of available balance. Venue TP={format(tp_price.normalize(), 'f')} "
+                    f"SL={format(sl_price.normalize(), 'f')}."
+                )
+                order_id = await self.database.create_order(
+                    client_order_id=order_link_id,
+                    ticker=signal.ticker,
+                    side="Buy",
+                    order_type="Market",
+                    lifecycle="entry",
+                    status="filled_live",
+                    stage=signal.stage,
+                    signal_kind=signal.signal_kind,
+                    requested_qty=float(qty),
+                    requested_notional_usd=float(target_notional_usd),
+                    requested_price=signal.current_price,
+                    venue="bybit",
+                    is_demo=self.settings.demo_mode,
+                    created_at=now_iso,
+                    updated_at=now_iso,
+                    fill_price=float(entry_price),
+                    external_order_id=ack.order_id,
+                    filled_at=now_iso,
+                    notes=notes,
+                )
+                position_id = await self.database.open_position(
+                    ticker=signal.ticker,
+                    opened_at=now_iso,
+                    updated_at=now_iso,
+                    entry_order_id=order_id,
+                    entry_signal_kind=signal.signal_kind,
+                    quantity=float(venue_position.size),
+                    notional_usd=float(venue_position.size * entry_price),
+                    entry_price=float(entry_price),
+                    notes=notes,
+                )
+                actions.append(
+                    ExecutionAction(
+                        ticker=signal.ticker,
+                        action="enter_long",
+                        signal_kind=signal.signal_kind,
+                        detail=notes,
+                        order_id=order_id,
+                        position_id=position_id,
+                    )
+                )
+                await self._send_execution_notification(
+                    event="enter_long",
+                    ticker=signal.ticker,
+                    stage=signal.stage,
+                    signal_kind=signal.signal_kind,
+                    quantity=float(venue_position.size),
+                    entry_price=float(entry_price),
+                    current_price=float(entry_price),
+                    notes=notes,
+                )
+                continue
+
+            quantity = self._estimate_quantity(signal.current_price)
+            try:
+                submission = await self.client.submit_market_order(
+                    ticker=signal.ticker,
+                    side="Buy",
+                    quantity=quantity,
+                    price_hint=signal.current_price,
+                    reduce_only=False,
+                )
+            except Exception as exc:
+                order_id = await self.database.create_order(
+                    client_order_id=self._client_order_id("entry", signal.ticker),
+                    ticker=signal.ticker,
+                    side="Buy",
+                    order_type="Market",
+                    lifecycle="entry",
+                    status="rejected",
+                    stage=signal.stage,
+                    signal_kind=signal.signal_kind,
+                    requested_qty=quantity,
+                    requested_notional_usd=self.settings.entry_notional_usd,
+                    requested_price=signal.current_price,
+                    venue="bybit",
+                    is_demo=self.settings.demo_mode,
+                    created_at=now_iso,
+                    updated_at=now_iso,
+                    notes=str(exc),
+                )
+                LOGGER.warning("Entry submission rejected for %s: %s", signal.ticker, exc)
+                actions.append(
+                    ExecutionAction(
+                        ticker=signal.ticker,
+                        action="entry_rejected",
+                        signal_kind=signal.signal_kind,
+                        detail=str(exc),
+                        order_id=order_id,
+                    )
+                )
+                continue
+
+            order_id = await self.database.create_order(
+                client_order_id=self._client_order_id("entry", signal.ticker),
+                ticker=signal.ticker,
+                side="Buy",
+                order_type="Market",
+                lifecycle="entry",
+                status=submission.status,
+                stage=signal.stage,
+                signal_kind=signal.signal_kind,
+                requested_qty=quantity,
+                requested_notional_usd=self.settings.entry_notional_usd,
+                requested_price=signal.current_price,
+                venue="bybit",
+                is_demo=self.settings.demo_mode,
+                created_at=now_iso,
+                updated_at=now_iso,
+                fill_price=submission.fill_price,
+                external_order_id=submission.external_order_id,
+                filled_at=now_iso if submission.fill_price is not None else None,
+                notes=submission.notes,
+            )
+            if submission.fill_price is None:
+                actions.append(
+                    ExecutionAction(
+                        ticker=signal.ticker,
+                        action="entry_order_recorded",
+                        signal_kind=signal.signal_kind,
+                        detail=submission.notes,
+                        order_id=order_id,
+                    )
+                )
+                continue
+
+            position_id = await self.database.open_position(
+                ticker=signal.ticker,
+                opened_at=now_iso,
+                updated_at=now_iso,
+                entry_order_id=order_id,
+                entry_signal_kind=signal.signal_kind,
+                quantity=quantity,
+                notional_usd=self.settings.entry_notional_usd,
+                entry_price=submission.fill_price,
+                notes=submission.notes,
+            )
+            actions.append(
+                ExecutionAction(
+                    ticker=signal.ticker,
+                    action="enter_long",
+                    signal_kind=signal.signal_kind,
+                    detail=submission.notes,
+                    order_id=order_id,
+                    position_id=position_id,
+                )
+            )
+            await self._send_execution_notification(
+                event="enter_long",
+                ticker=signal.ticker,
+                stage=signal.stage,
+                signal_kind=signal.signal_kind,
+                quantity=quantity,
+                entry_price=submission.fill_price,
+                current_price=submission.fill_price,
+                notes=submission.notes,
+            )
+        return actions
+
+    async def _process_confirmed(
+        self,
+        *,
+        cycle_time_ms: int | None,
+        ranked_signals: list[RankedSignal],
+        blocked_tickers: set[str],
+    ) -> list[ExecutionAction]:
+        actions: list[ExecutionAction] = []
+        now = self._now(cycle_time_ms=cycle_time_ms, stage="confirmed")
+        now_iso = now.isoformat()
+        confirmed_signals = {
+            signal.ticker: signal
+            for signal in ranked_signals
+            if signal.signal_kind in {"confirmed", "confirmed_strong"}
+        }
+        for position in await self.database.list_open_positions():
+            ticker = str(position["ticker"])
+            if ticker in blocked_tickers:
+                continue
+            if ticker in confirmed_signals:
+                signal = confirmed_signals[ticker]
+                if position["confirmation_signal_kind"] != signal.signal_kind:
+                    await self.database.confirm_position(
+                        int(position["id"]),
+                        confirmation_signal_kind=signal.signal_kind,
+                        confirmed_at=now_iso,
+                        updated_at=now_iso,
+                        notes=f"confirmed at rank={signal.rank} score={signal.composite_score:.2f}",
+                    )
+                    actions.append(
+                        ExecutionAction(
+                            ticker=ticker,
+                            action="confirm_position",
+                            signal_kind=signal.signal_kind,
+                            detail=f"rank={signal.rank} score={signal.composite_score:.2f}",
+                            position_id=int(position["id"]),
+                        )
+                    )
+                continue
+
+            if self._using_live_venue() or not self.settings.exit_on_lost_confirmed:
+                continue
+            latest_price = self._latest_price(ticker, stage="confirmed")
+            if latest_price is None:
+                actions.append(
+                    ExecutionAction(
+                        ticker=ticker,
+                        action="skip_exit",
+                        signal_kind="none",
+                        detail="no_market_price_available",
+                        position_id=int(position["id"]),
+                    )
+                )
+                continue
+            actions.append(
+                await self._submit_simulated_exit(
+                    position=position,
+                    ticker=ticker,
+                    stage="confirmed",
+                    now_iso=now_iso,
+                    exit_price=latest_price,
+                    exit_reason="lost_confirmed_signal",
+                )
+            )
+        return actions

@@ -1,0 +1,17 @@
+[Unit]
+Description=Outlier Detector Signal Engine
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/outlier-detector
+EnvironmentFile=/opt/outlier-detector/.env
+ExecStart=/opt/outlier-detector/.venv/bin/python /opt/outlier-detector/main.py
+Restart=always
+RestartSec=5
+TimeoutStopSec=15
+
+[Install]
+WantedBy=multi-user.target
+

@@ -1,0 +1,4 @@
+aiohttp>=3.10,<4
+certifi>=2024.0.0
+numpy>=1.26,<3
+pytest>=8.0,<9

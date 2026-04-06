@@ -48,6 +48,9 @@
 - Live entry sizing is now risk-based instead of fixed-notional: `RISK_PER_TRADE_PCT` defaults to `1%` of Bybit `totalAvailableBalance`, converted into position notional through the configured stop distance.
 - The practical entry rule is now one open position per ticker. `MAX_OPEN_POSITIONS` may still exist in config files, but it is not the live entry gate anymore.
 - Local verification is green again: `28` tests passing.
+- This checkout now has a real repo-root `.env` again, with Bybit demo execution enabled and `SQLITE_PATH` pointed at the local workspace database instead of the VPS example path.
+- Telegram is still not configured in this checkout because no local `TELEGRAM_BOT_TOKEN` or `TELEGRAM_CHAT_ID` were available to write into `.env`.
+- The local `signals.sqlite3` has been confirmed stale relative to the exported Telegram session. It is valid local state, but it is not the DB that produced the observed `entry_ready` alerts and `SOLUSDT` demo entry in chat.
 
 ## Remaining risks
 
@@ -64,6 +67,7 @@
 - TP/SL is checked only when the runtime processes a cycle. There is no separate sub-second price watcher, so a violent move can still gap through the exact configured threshold.
 - Venue exit reconciliation is polling-based, not websocket-based. Telegram exit messages and SQLite close state will lag until the next engine cycle sees that Bybit has already closed the position.
 - A real demo smoke entry was executed successfully on `SOLUSDT`; the venue accepted the order and TP/SL were installed. There is now a live demo position unless it has already exited on Bybit.
+- Because Telegram remains unset in this local `.env`, a run from this checkout will trade on the demo venue but will not send Telegram notifications until those credentials are added.
 
 ## Next validation steps
 
@@ -79,3 +83,4 @@
 - If another live day still shows regime stuck at `1`, revisit the macro regime design before cutting curvature any further.
 - If longer-horizon top/bottom span remains high, tune confirmed stability/persistence before making the ranking math more complex again.
 - Check whether `entry_ready` is selective enough to serve as the primary early-action tier without making `confirmed` feel redundant or late.
+- Run a short bounded local validation from this checkout to prove the new `.env` is actually being loaded and that execution no longer defaults off.

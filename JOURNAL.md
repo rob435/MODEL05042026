@@ -67,3 +67,11 @@
 - Removed the old global open-position cap from the live entry logic. The actual guard now matches the intended rule: one open position per ticker, no duplicate local or venue entries on the same symbol.
 - Switched live position sizing from fixed notional to explicit risk sizing: risk budget is now `1%` of Bybit `totalAvailableBalance`, and position notional is derived from the configured stop distance (`RISK_PER_TRADE_PCT / STOP_LOSS_PCT`).
 - Started the full live bot on the demo account with the real `.env` and confirmed the production loop ran cleanly across the full universe with zero websocket failures before shutdown.
+
+## 2026-04-06
+
+- Investigated why local trades were not executing in `/Users/jhbvdnsbkvnsd/Desktop/MODEL050426`.
+- Confirmed the repo-root `.env` was missing entirely in this checkout, so local runs were defaulting to `EXECUTION_ENABLED=false` and `EXECUTION_SUBMIT_ORDERS=false` despite shell-level Bybit credentials still being present.
+- Confirmed the local `signals.sqlite3` is not the same runtime history as the exported Telegram session: the DB has no `orders`, no `positions`, and no `entry_ready` rows, while the Telegram export shows a real `SOLUSDT` demo entry plus later `entry_ready` alerts.
+- Created a real repo-root `.env` for this checkout from the shipped template, wired it to the local SQLite path, and enabled Bybit demo execution so this specific workspace can place demo orders instead of silently staying detector-only.
+- Left Telegram unset in the new local `.env` because no Telegram credentials were present in the current shell environment; local trading is now enabled, but Telegram delivery from this checkout still requires those two vars.

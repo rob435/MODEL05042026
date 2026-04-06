@@ -9,5 +9,7 @@ __pycache__/
 venv/
 .env
 signals.sqlite3
+signals.sqlite3-shm
+signals.sqlite3-wal
 replay-signals.sqlite3
 smoke-replay.sqlite3

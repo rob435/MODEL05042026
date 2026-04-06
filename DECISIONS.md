@@ -49,3 +49,9 @@
 - In live demo mode, enforce "one position per ticker" against both local SQLite state and Bybit’s venue state. Local-only duplication protection is not enough if the DB ever falls behind reality.
 - Drop the global `MAX_OPEN_POSITIONS` gate from the actual entry logic. It was solving the wrong problem. The meaningful safety rule here is one open position per ticker, not an arbitrary portfolio-wide entry count.
 - Size live demo entries from risk, not fixed notional. With a `2%` stop and `1%` risk budget, notional is `available_balance * 0.01 / 0.02`, i.e. about `50%` of available balance per trade.
+
+## 2026-04-06
+
+- Treat a missing repo-root `.env` in a local checkout as a hard configuration failure for execution debugging. If the file is absent, the process may still look half-configured from inherited shell variables while keeping critical execution toggles at their default `false` values.
+- When creating a local `.env` from the VPS-oriented template, override `SQLITE_PATH` to a workspace-local path instead of leaving the `/opt/...` example in place. Using the deployment example verbatim on a laptop is sloppy and makes state inspection misleading.
+- Do not assume the local SQLite file explains Telegram behavior unless the logged signal kinds and timestamps actually match the chat export. In this session they did not, so the right conclusion was runtime drift, not strategy failure.

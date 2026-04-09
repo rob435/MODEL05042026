@@ -147,7 +147,7 @@ class TelegramNotifier:
 
     async def send_execution(self, payload: ExecutionPayload) -> bool:
         labels = {
-            "enter_long": "entered new long position",
+            "enter_short": "entered new short position",
             "take_profit_exit": "take-profit exit",
             "stop_loss_exit": "stop-loss exit",
             "confirmed_exit": "confirmed-loss exit",

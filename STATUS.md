@@ -43,14 +43,22 @@
   - position-fill polling
   - exchange-native TP/SL via `Set Trading Stop`
   - local exit reconciliation via closed-PnL sync
+- The execution layer is now short-only. The signal engine still ranks the same way, but live and simulated trades now enter short, buy to cover on exit, target `+3%` on downside moves, and stop at `-2%` on upside moves.
+- Execution analytics now persist closed-trade summaries, open-position marks, post-exit follow-through, and portfolio snapshots directly into SQLite.
+- `MAX_DAILY_STOP_LOSSES` is now a live execution guard; once the UTC-day stop-loss count reaches the configured limit, new entries are skipped for the rest of that day.
+- `MAX_ENTRIES_PER_REBALANCE` is now a live execution guard; once an emerging cycle has opened the configured number of fresh positions, lower-ranked `entry_ready` candidates are skipped for that rebalance pass.
+- `MAX_OPEN_POSITIONS` is now back as a live execution guard; once the total open-position count reaches the configured cap, fresh entries are skipped until something closes.
+- `report.py` can now summarize trade analytics and export CSVs for `signals`, `trades`, `trade_daily_summary`, and `portfolio_snapshots`.
 - Live-entry safety now checks both local SQLite and current Bybit venue state, so the bot will not intentionally double-enter the same ticker if the venue already has an open position.
 - `.env` loading now overrides stale inherited shell variables, so local credential edits actually take effect without restarting the whole environment.
 - Live entry sizing is now risk-based instead of fixed-notional: `RISK_PER_TRADE_PCT` defaults to `1%` of Bybit `totalAvailableBalance`, converted into position notional through the configured stop distance.
-- The practical entry rule is now one open position per ticker. `MAX_OPEN_POSITIONS` may still exist in config files, but it is not the live entry gate anymore.
-- Local verification is green again: `28` tests passing.
+- The practical entry rule is now one open position per ticker, plus optional portfolio and per-batch throttles via `MAX_OPEN_POSITIONS` and `MAX_ENTRIES_PER_REBALANCE`.
+- Dead config surface has been trimmed: `ANALYTICS_EXPORT_DIR` was removed because it no longer affected live behavior.
+- Local verification is green again: `37` tests passing.
 - This checkout now has a real repo-root `.env` again, with Bybit demo execution enabled and `SQLITE_PATH` pointed at the local workspace database instead of the VPS example path.
 - Telegram is still not configured in this checkout because no local `TELEGRAM_BOT_TOKEN` or `TELEGRAM_CHAT_ID` were available to write into `.env`.
 - The local `signals.sqlite3` has been confirmed stale relative to the exported Telegram session. It is valid local state, but it is not the DB that produced the observed `entry_ready` alerts and `SOLUSDT` demo entry in chat.
+- A macOS pull-sync path is now documented: a local `launchd` job can run `deploy/sync_exports.sh` every 30 minutes, fetch the VPS analytics export bundle, and write logs under `~/Library/Logs/`.
 
 ## Remaining risks
 
@@ -84,3 +92,4 @@
 - If longer-horizon top/bottom span remains high, tune confirmed stability/persistence before making the ranking math more complex again.
 - Check whether `entry_ready` is selective enough to serve as the primary early-action tier without making `confirmed` feel redundant or late.
 - Run a short bounded local validation from this checkout to prove the new `.env` is actually being loaded and that execution no longer defaults off.
+- Install the launchd template on the Mac, verify `deploy/sync_exports.sh` exists and is executable, and confirm the first pull writes logs plus a fresh CSV export set locally.

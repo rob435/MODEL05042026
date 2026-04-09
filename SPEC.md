@@ -163,7 +163,7 @@ Emerging consumer:
 
 Execution handling:
 
-- if execution is enabled, `entry_ready` can open a long position
+- if execution is enabled, `entry_ready` can open a short position
 - confirmed cycles can upgrade that position to confirmed / confirmed-strong state
 - if `EXECUTION_SUBMIT_ORDERS=true`, the bot:
   - submits a real market order to Bybit demo trading

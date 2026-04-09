@@ -6,6 +6,8 @@ from datetime import datetime, timezone
 from decimal import Decimal, ROUND_DOWN, ROUND_HALF_UP
 from uuid import uuid4
 
+import numpy as np
+
 from alerting import ExecutionPayload, TelegramNotifier
 from config import Settings
 from database import SignalDatabase
@@ -113,13 +115,359 @@ class ExecutionEngine:
         return f"{lifecycle}-{ticker.lower()}-{uuid4().hex[:12]}"
 
     def _infer_exit_event(self, entry_price: float, exit_price: float) -> str:
-        tp_price = entry_price * (1 + self.settings.take_profit_pct)
-        sl_price = entry_price * (1 - self.settings.stop_loss_pct)
-        if exit_price >= tp_price:
+        tp_price = entry_price * (1 - self.settings.take_profit_pct)
+        sl_price = entry_price * (1 + self.settings.stop_loss_pct)
+        if exit_price <= tp_price:
             return "take_profit_exit"
-        if exit_price <= sl_price:
+        if exit_price >= sl_price:
             return "stop_loss_exit"
         return "exchange_exit"
+
+    def _directional_pnl_pct(self, side: str, entry_price: float, price: float) -> float:
+        if entry_price <= 0:
+            return 0.0
+        if side.upper() == "SHORT":
+            return 1.0 - (price / entry_price)
+        return (price / entry_price) - 1.0
+
+    def _directional_excursions(
+        self,
+        side: str,
+        entry_price: float,
+        price: float,
+    ) -> tuple[float, float]:
+        pnl_pct = self._directional_pnl_pct(side, entry_price, price)
+        favorable = max(pnl_pct, 0.0)
+        adverse = max(-pnl_pct, 0.0)
+        return favorable, adverse
+
+    def _rolling_volatility(self, prices: list[float]) -> float | None:
+        if len(prices) < 3:
+            return None
+        returns = np.diff(np.log(np.asarray(prices, dtype=float)))
+        if returns.size < 2:
+            return None
+        return float(np.std(returns, ddof=1))
+
+    async def _record_position_mark(
+        self,
+        *,
+        position,
+        stage: str,
+        timestamp_iso: str,
+        price: float,
+        phase: str,
+        bars_since_entry: int = 0,
+        bars_since_exit: int = 0,
+    ) -> None:
+        if not self.settings.analytics_enabled or not self.settings.analytics_log_position_marks:
+            return
+        side = str(position["side"])
+        entry_price = float(position["entry_price"])
+        pnl_pct = self._directional_pnl_pct(side, entry_price, price)
+        favorable_excursion_pct, adverse_excursion_pct = self._directional_excursions(
+            side,
+            entry_price,
+            price,
+        )
+        existing_marks = await self.database.list_position_marks(int(position["id"]), phase=phase)
+        prices = [float(mark["price"]) for mark in existing_marks] + [price]
+        rolling_volatility = self._rolling_volatility(prices)
+        if existing_marks:
+            favorable_excursion_pct = max(
+                favorable_excursion_pct,
+                max(float(mark["favorable_excursion_pct"]) for mark in existing_marks),
+            )
+            adverse_excursion_pct = max(
+                adverse_excursion_pct,
+                max(float(mark["adverse_excursion_pct"]) for mark in existing_marks),
+            )
+        if phase == "open" and bars_since_entry == 0:
+            bars_since_entry = len(existing_marks) + 1
+        if phase == "post_exit" and bars_since_exit == 0:
+            bars_since_exit = len(existing_marks) + 1
+        await self.database.log_position_mark(
+            position_id=int(position["id"]),
+            ticker=str(position["ticker"]),
+            side=side,
+            phase=phase,
+            timestamp=timestamp_iso,
+            stage=stage,
+            price=price,
+            pnl_pct=pnl_pct,
+            favorable_excursion_pct=favorable_excursion_pct,
+            adverse_excursion_pct=adverse_excursion_pct,
+            rolling_volatility=rolling_volatility,
+            regime_score=self.state.global_state.btc_regime_score,
+            dom_state=(
+                "falling"
+                if self.state.global_state.btcdom_state < 0
+                else "rising"
+                if self.state.global_state.btcdom_state > 0
+                else "neutral"
+            ),
+            dom_change_pct=self.state.global_state.btcdom_change_pct,
+            bars_since_entry=bars_since_entry,
+            bars_since_exit=bars_since_exit,
+        )
+
+    async def _record_open_position_marks(
+        self,
+        *,
+        stage: str,
+        cycle_time_ms: int | None,
+    ) -> None:
+        if not self.settings.analytics_enabled or not self.settings.analytics_log_position_marks:
+            return
+        timestamp_iso = self._now(cycle_time_ms=cycle_time_ms, stage=stage).isoformat()
+        for position in await self.database.list_open_positions():
+            price = self._latest_price(str(position["ticker"]), stage=stage)
+            if price is None:
+                continue
+            await self._record_position_mark(
+                position=position,
+                stage=stage,
+                timestamp_iso=timestamp_iso,
+                price=price,
+                phase="open",
+            )
+
+    async def _record_trade_analytics(
+        self,
+        *,
+        position,
+        exit_stage: str,
+        exit_signal_kind: str,
+        exit_event: str,
+        exit_reason: str,
+        closed_at_iso: str,
+        exit_price: float,
+    ) -> None:
+        if not self.settings.analytics_enabled:
+            return
+        position_id = int(position["id"])
+        open_marks = await self.database.list_position_marks(position_id, phase="open")
+        prices = [float(mark["price"]) for mark in open_marks]
+        side = str(position["side"])
+        entry_price = float(position["entry_price"])
+        quantity = float(position["quantity"])
+        realized_pnl_pct = self._directional_pnl_pct(side, entry_price, exit_price)
+        realized_pnl_usd = realized_pnl_pct * float(position["notional_usd"])
+        holding_minutes = (
+            datetime.fromisoformat(closed_at_iso) - datetime.fromisoformat(str(position["opened_at"]))
+        ).total_seconds() / 60.0
+        if open_marks:
+            mfe_pct = max(float(mark["favorable_excursion_pct"]) for mark in open_marks)
+            mae_pct = max(float(mark["adverse_excursion_pct"]) for mark in open_marks)
+            favorable_mark = max(
+                open_marks,
+                key=lambda mark: float(mark["favorable_excursion_pct"]),
+            )
+            adverse_mark = max(
+                open_marks,
+                key=lambda mark: float(mark["adverse_excursion_pct"]),
+            )
+            peak_favorable_price = float(favorable_mark["price"])
+            peak_adverse_price = float(adverse_mark["price"])
+        else:
+            favorable, adverse = self._directional_excursions(side, entry_price, exit_price)
+            mfe_pct = favorable
+            mae_pct = adverse
+            peak_favorable_price = exit_price
+            peak_adverse_price = exit_price
+        await self.database.record_trade_analytics(
+            position_id=position_id,
+            ticker=str(position["ticker"]),
+            side=side,
+            entry_stage=str(position["entry_stage"]),
+            entry_signal_kind=str(position["entry_signal_kind"]),
+            confirmation_signal_kind=position["confirmation_signal_kind"],
+            exit_stage=exit_stage,
+            exit_signal_kind=exit_signal_kind,
+            exit_event=exit_event,
+            exit_reason=exit_reason,
+            opened_at=str(position["opened_at"]),
+            confirmed_at=position["confirmed_at"],
+            closed_at=closed_at_iso,
+            holding_minutes=holding_minutes,
+            bars_held=len(open_marks),
+            quantity=quantity,
+            notional_usd=float(position["notional_usd"]),
+            entry_price=entry_price,
+            exit_price=exit_price,
+            realized_pnl_pct=realized_pnl_pct,
+            realized_pnl_usd=realized_pnl_usd,
+            mfe_pct=mfe_pct,
+            mae_pct=mae_pct,
+            peak_favorable_price=peak_favorable_price,
+            peak_adverse_price=peak_adverse_price,
+            intratrade_volatility=self._rolling_volatility(prices),
+            regime_score_at_entry=position["regime_score_at_entry"],
+            dom_state_at_entry=position["dom_state_at_entry"],
+            dom_change_pct_at_entry=position["dom_change_pct_at_entry"],
+            entry_rank=position["entry_rank"],
+            entry_composite_score=position["entry_composite_score"],
+            entry_momentum_z=position["entry_momentum_z"],
+            entry_curvature=position["entry_curvature"],
+            entry_hurst=position["entry_hurst"],
+            post_exit_bars_target=max(self.settings.analytics_post_exit_bars, 0),
+            post_exit_bars_observed=0,
+            post_exit_completed=int(self.settings.analytics_post_exit_bars <= 0),
+            post_exit_tracking_started_at=closed_at_iso if self.settings.analytics_post_exit_bars > 0 else None,
+            post_exit_tracking_completed_at=closed_at_iso if self.settings.analytics_post_exit_bars <= 0 else None,
+            post_exit_last_price=exit_price,
+            post_exit_best_price=exit_price,
+            post_exit_worst_price=exit_price,
+            post_exit_favorable_excursion_pct=0.0,
+            post_exit_adverse_excursion_pct=0.0,
+            post_exit_volatility=None,
+        )
+        day_summary = await self.database.summarize_trade_day(closed_at_iso[:10])
+        LOGGER.info(
+            "Daily trade summary %s trades=%s wins=%s losses=%s stop_losses=%s net_pnl_usd=%.2f",
+            closed_at_iso[:10],
+            int(day_summary["trades"]),
+            int(day_summary["wins"]),
+            int(day_summary["losses"]),
+            int(day_summary["stop_losses"]),
+            float(day_summary["net_pnl_usd"]),
+        )
+
+    async def _update_post_exit_analytics(
+        self,
+        *,
+        stage: str,
+        cycle_time_ms: int | None,
+    ) -> None:
+        if not self.settings.analytics_enabled or self.settings.analytics_post_exit_bars <= 0:
+            return
+        if stage != "confirmed":
+            return
+        trackers = await self.database.list_pending_post_exit_analytics()
+        if not trackers:
+            return
+        timestamp_iso = self._now(cycle_time_ms=cycle_time_ms, stage=stage).isoformat()
+        for tracker in trackers:
+            price = self._latest_price(str(tracker["ticker"]), stage="confirmed")
+            if price is None:
+                continue
+            side = str(tracker["side"])
+            exit_price = float(tracker["exit_price"])
+            favorable, adverse = self._directional_excursions(side, exit_price, price)
+            existing_marks = await self.database.list_position_marks(int(tracker["position_id"]), phase="post_exit")
+            prices = [float(mark["price"]) for mark in existing_marks] + [price]
+            best_price = min([price] + [float(mark["price"]) for mark in existing_marks]) if side == "SHORT" else max([price] + [float(mark["price"]) for mark in existing_marks])
+            worst_price = max([price] + [float(mark["price"]) for mark in existing_marks]) if side == "SHORT" else min([price] + [float(mark["price"]) for mark in existing_marks])
+            await self.database.log_position_mark(
+                position_id=int(tracker["position_id"]),
+                ticker=str(tracker["ticker"]),
+                side=side,
+                phase="post_exit",
+                timestamp=timestamp_iso,
+                stage=stage,
+                price=price,
+                pnl_pct=self._directional_pnl_pct(side, exit_price, price),
+                favorable_excursion_pct=max(
+                    favorable,
+                    float(tracker["post_exit_favorable_excursion_pct"]),
+                ),
+                adverse_excursion_pct=max(
+                    adverse,
+                    float(tracker["post_exit_adverse_excursion_pct"]),
+                ),
+                rolling_volatility=self._rolling_volatility(prices),
+                regime_score=self.state.global_state.btc_regime_score,
+                dom_state=(
+                    "falling"
+                    if self.state.global_state.btcdom_state < 0
+                    else "rising"
+                    if self.state.global_state.btcdom_state > 0
+                    else "neutral"
+                ),
+                dom_change_pct=self.state.global_state.btcdom_change_pct,
+                bars_since_entry=0,
+                bars_since_exit=len(existing_marks) + 1,
+            )
+            observed = int(tracker["post_exit_bars_observed"]) + 1
+            completed = observed >= int(tracker["post_exit_bars_target"])
+            tracking_started_at = (
+                str(tracker["post_exit_tracking_started_at"])
+                if tracker["post_exit_tracking_started_at"] not in (None, "")
+                else timestamp_iso
+            )
+            await self.database.update_trade_post_exit(
+                position_id=int(tracker["position_id"]),
+                post_exit_bars_observed=observed,
+                post_exit_completed=completed,
+                post_exit_tracking_started_at=tracking_started_at,
+                post_exit_tracking_completed_at=timestamp_iso if completed else None,
+                post_exit_last_price=price,
+                post_exit_best_price=best_price,
+                post_exit_worst_price=worst_price,
+                post_exit_favorable_excursion_pct=max(
+                    favorable,
+                    float(tracker["post_exit_favorable_excursion_pct"]),
+                ),
+                post_exit_adverse_excursion_pct=max(
+                    adverse,
+                    float(tracker["post_exit_adverse_excursion_pct"]),
+                ),
+                post_exit_volatility=self._rolling_volatility(prices),
+            )
+
+    async def _maybe_log_portfolio_snapshot(
+        self,
+        *,
+        stage: str,
+        cycle_time_ms: int | None,
+        event: str,
+        notes: str = "",
+    ) -> None:
+        if not self.settings.analytics_enabled or not self.settings.analytics_log_portfolio_snapshots:
+            return
+        if stage == "emerging" and not self.settings.analytics_portfolio_snapshot_on_emerging:
+            return
+        timestamp_iso = self._now(cycle_time_ms=cycle_time_ms, stage=stage).isoformat()
+        open_positions = await self.database.list_open_positions()
+        gross_notional_usd = sum(float(position["notional_usd"]) for position in open_positions)
+        remaining_slots = None
+        if self.settings.max_open_positions > 0:
+            remaining_slots = max(self.settings.max_open_positions - len(open_positions), 0)
+        wallet_equity_usd = None
+        available_balance_usd = None
+        risk_budget_usd = None
+        target_notional_usd = None
+        balance_position_capacity = None
+        if self._using_live_venue():
+            try:
+                wallet = await self.client.get_wallet_balance()
+                wallet_equity_usd = float(wallet.total_equity_usd)
+                available_balance_usd = float(wallet.total_available_balance_usd)
+                risk_budget_usd = available_balance_usd * self.settings.risk_per_trade_pct
+                target_notional_usd = float(self._risk_notional_from_wallet(wallet))
+                if target_notional_usd > 0:
+                    balance_position_capacity = int(available_balance_usd // target_notional_usd)
+            except Exception:
+                LOGGER.exception("Portfolio snapshot wallet fetch failed")
+        daily_stop_loss_count = await self.database.count_trade_exit_events_for_day(
+            "stop_loss_exit",
+            timestamp_iso[:10],
+        )
+        await self.database.log_portfolio_snapshot(
+            timestamp=timestamp_iso,
+            stage=stage,
+            event=event,
+            wallet_equity_usd=wallet_equity_usd,
+            available_balance_usd=available_balance_usd,
+            open_positions=len(open_positions),
+            gross_notional_usd=gross_notional_usd,
+            remaining_slots=remaining_slots,
+            balance_position_capacity=balance_position_capacity,
+            risk_budget_usd=risk_budget_usd,
+            target_notional_usd=target_notional_usd,
+            daily_stop_loss_count=daily_stop_loss_count,
+            notes=notes,
+        )
 
     async def _send_execution_notification(
         self,
@@ -142,7 +490,7 @@ class ExecutionEngine:
                 ExecutionPayload(
                     event=event,
                     ticker=ticker,
-                    side="LONG",
+                    side="SHORT",
                     stage=stage,
                     signal_kind=signal_kind,
                     quantity=quantity,
@@ -170,7 +518,7 @@ class ExecutionEngine:
         quantity = float(position["quantity"])
         submission = await self.client.submit_market_order(
             ticker=ticker,
-            side="Sell",
+            side="Buy",
             quantity=quantity,
             price_hint=exit_price,
             reduce_only=True,
@@ -178,7 +526,7 @@ class ExecutionEngine:
         order_id = await self.database.create_order(
             client_order_id=self._client_order_id("exit", ticker),
             ticker=ticker,
-            side="Sell",
+            side="Buy",
             order_type="Market",
             lifecycle="exit",
             status=submission.status,
@@ -197,7 +545,8 @@ class ExecutionEngine:
             notes=submission.notes,
         )
         realized_price = float(submission.fill_price or exit_price)
-        pnl_pct = (realized_price / float(position["entry_price"])) - 1.0
+        pnl_pct = 1.0 - (realized_price / float(position["entry_price"]))
+        exit_event = self._infer_exit_event(float(position["entry_price"]), realized_price)
         await self.database.close_position(
             int(position["id"]),
             exit_order_id=order_id,
@@ -206,8 +555,17 @@ class ExecutionEngine:
             updated_at=now_iso,
             notes=exit_reason,
         )
+        await self._record_trade_analytics(
+            position=position,
+            exit_stage=stage,
+            exit_signal_kind=signal_kind,
+            exit_event=exit_event,
+            exit_reason=exit_reason,
+            closed_at_iso=now_iso,
+            exit_price=realized_price,
+        )
         await self._send_execution_notification(
-            event=self._infer_exit_event(float(position["entry_price"]), realized_price),
+            event=exit_event,
             ticker=ticker,
             stage=stage,
             signal_kind=signal_kind,
@@ -219,7 +577,7 @@ class ExecutionEngine:
         )
         return ExecutionAction(
             ticker=ticker,
-            action="exit_long",
+            action="exit_short",
             signal_kind=signal_kind,
             detail=exit_reason,
             order_id=order_id,
@@ -241,7 +599,7 @@ class ExecutionEngine:
             if current_price is None:
                 continue
             entry_price = float(position["entry_price"])
-            pnl_pct = (current_price / entry_price) - 1.0
+            pnl_pct = 1.0 - (current_price / entry_price)
             if pnl_pct >= self.settings.take_profit_pct:
                 actions.append(
                     await self._submit_simulated_exit(
@@ -292,11 +650,11 @@ class ExecutionEngine:
             now_iso = datetime.fromtimestamp(closed.updated_time_ms / 1000, tz=timezone.utc).isoformat()
             exit_price = float(closed.avg_exit_price)
             entry_price = float(position["entry_price"])
-            pnl_pct = (exit_price / entry_price) - 1.0 if entry_price > 0 else None
+            pnl_pct = 1.0 - (exit_price / entry_price) if entry_price > 0 else None
             order_id = await self.database.create_order(
                 client_order_id=self._client_order_id("exit-sync", ticker),
                 ticker=ticker,
-                side="Sell",
+                side="Buy",
                 order_type="Market",
                 lifecycle="exit",
                 status="filled_sync",
@@ -323,6 +681,15 @@ class ExecutionEngine:
                 notes="closed on Bybit venue",
             )
             event = self._infer_exit_event(entry_price, exit_price)
+            await self._record_trade_analytics(
+                position=position,
+                exit_stage=stage,
+                exit_signal_kind="none",
+                exit_event=event,
+                exit_reason="closed on Bybit venue",
+                closed_at_iso=now_iso,
+                exit_price=exit_price,
+            )
             await self._send_execution_notification(
                 event=event,
                 ticker=ticker,
@@ -361,6 +728,7 @@ class ExecutionEngine:
                 "EXECUTION_SUBMIT_ORDERS=true but the Bybit trade client is not ready. "
                 "Check BYBIT_API_KEY, BYBIT_API_SECRET, and BYBIT_TRADE_BASE_URL."
             )
+        await self._record_open_position_marks(stage=stage, cycle_time_ms=cycle_time_ms)
         if self._using_live_venue():
             sync_actions, closed_tickers = await self._sync_live_closed_positions(stage=stage)
         else:
@@ -374,14 +742,34 @@ class ExecutionEngine:
                 ranked_signals=ranked_signals,
                 blocked_tickers=closed_tickers,
             )
-            return sync_actions + stage_actions
+            actions = sync_actions + stage_actions
+            await self._maybe_log_portfolio_snapshot(
+                stage=stage,
+                cycle_time_ms=cycle_time_ms,
+                event="cycle",
+                notes="; ".join(f"{action.action}:{action.ticker}" for action in actions[:10]),
+            )
+            return actions
         if stage == "confirmed":
             stage_actions = await self._process_confirmed(
                 cycle_time_ms=cycle_time_ms,
                 ranked_signals=ranked_signals,
                 blocked_tickers=closed_tickers,
             )
-            return sync_actions + stage_actions
+            await self._update_post_exit_analytics(stage=stage, cycle_time_ms=cycle_time_ms)
+            actions = sync_actions + stage_actions
+            await self._maybe_log_portfolio_snapshot(
+                stage=stage,
+                cycle_time_ms=cycle_time_ms,
+                event="cycle",
+                notes="; ".join(f"{action.action}:{action.ticker}" for action in actions[:10]),
+            )
+            return actions
+        await self._maybe_log_portfolio_snapshot(
+            stage=stage,
+            cycle_time_ms=cycle_time_ms,
+            event="cycle",
+        )
         return sync_actions
 
     async def _process_entries(
@@ -394,12 +782,53 @@ class ExecutionEngine:
         actions: list[ExecutionAction] = []
         now = self._now(cycle_time_ms=cycle_time_ms, stage="emerging")
         now_iso = now.isoformat()
+        entered_this_rebalance = 0
         open_positions = {
             row["ticker"]: row for row in await self.database.list_open_positions()
         }
+        daily_stop_loss_count = 0
+        if self.settings.max_daily_stop_losses > 0:
+            daily_stop_loss_count = await self.database.count_trade_exit_events_for_day(
+                "stop_loss_exit",
+                now_iso[:10],
+            )
         candidates = [signal for signal in ranked_signals if signal.signal_kind == "entry_ready"]
         candidates.sort(key=lambda signal: signal.rank)
         for signal in candidates:
+            if (
+                self.settings.max_open_positions > 0
+                and len(open_positions) >= self.settings.max_open_positions
+            ):
+                actions.append(
+                    ExecutionAction(
+                        ticker=signal.ticker,
+                        action="skip_entry",
+                        signal_kind=signal.signal_kind,
+                        detail=(
+                            "max_open_positions_reached "
+                            f"count={len(open_positions)} "
+                            f"limit={self.settings.max_open_positions}"
+                        ),
+                    )
+                )
+                continue
+            if (
+                self.settings.max_entries_per_rebalance > 0
+                and entered_this_rebalance >= self.settings.max_entries_per_rebalance
+            ):
+                actions.append(
+                    ExecutionAction(
+                        ticker=signal.ticker,
+                        action="skip_entry",
+                        signal_kind=signal.signal_kind,
+                        detail=(
+                            "max_entries_per_rebalance_reached "
+                            f"count={entered_this_rebalance} "
+                            f"limit={self.settings.max_entries_per_rebalance}"
+                        ),
+                    )
+                )
+                continue
             if signal.ticker in blocked_tickers:
                 actions.append(
                     ExecutionAction(
@@ -418,6 +847,22 @@ class ExecutionEngine:
                         signal_kind=signal.signal_kind,
                         detail="position_already_open",
                         position_id=int(open_positions[signal.ticker]["id"]),
+                    )
+                )
+                continue
+            if (
+                self.settings.max_daily_stop_losses > 0
+                and daily_stop_loss_count >= self.settings.max_daily_stop_losses
+            ):
+                actions.append(
+                    ExecutionAction(
+                        ticker=signal.ticker,
+                        action="skip_entry",
+                        signal_kind=signal.signal_kind,
+                        detail=(
+                            "max_daily_stop_losses_reached "
+                            f"count={daily_stop_loss_count} limit={self.settings.max_daily_stop_losses}"
+                        ),
                     )
                 )
                 continue
@@ -461,19 +906,19 @@ class ExecutionEngine:
                 try:
                     ack = await self.client.place_market_order(
                         symbol=signal.ticker,
-                        side="Buy",
+                        side="Sell",
                         quantity=qty,
                         order_link_id=order_link_id,
                     )
                     venue_position = await self.client.wait_for_position(signal.ticker)
                     entry_price = venue_position.avg_price
                     tp_price = round_decimal(
-                        entry_price * Decimal(str(1 + self.settings.take_profit_pct)),
+                        entry_price * Decimal(str(1 - self.settings.take_profit_pct)),
                         spec.tick_size,
                         ROUND_HALF_UP,
                     )
                     sl_price = round_decimal(
-                        entry_price * Decimal(str(1 - self.settings.stop_loss_pct)),
+                        entry_price * Decimal(str(1 + self.settings.stop_loss_pct)),
                         spec.tick_size,
                         ROUND_HALF_UP,
                     )
@@ -487,7 +932,7 @@ class ExecutionEngine:
                     order_id = await self.database.create_order(
                         client_order_id=order_link_id,
                         ticker=signal.ticker,
-                        side="Buy",
+                        side="Sell",
                         order_type="Market",
                         lifecycle="entry",
                         status="rejected",
@@ -522,7 +967,7 @@ class ExecutionEngine:
                 order_id = await self.database.create_order(
                     client_order_id=order_link_id,
                     ticker=signal.ticker,
-                    side="Buy",
+                    side="Sell",
                     order_type="Market",
                     lifecycle="entry",
                     status="filled_live",
@@ -542,19 +987,35 @@ class ExecutionEngine:
                 )
                 position_id = await self.database.open_position(
                     ticker=signal.ticker,
+                    side="SHORT",
                     opened_at=now_iso,
                     updated_at=now_iso,
                     entry_order_id=order_id,
+                    entry_stage=signal.stage,
                     entry_signal_kind=signal.signal_kind,
                     quantity=float(venue_position.size),
                     notional_usd=float(venue_position.size * entry_price),
                     entry_price=float(entry_price),
+                    regime_score_at_entry=signal.regime_score,
+                    dom_state_at_entry=(
+                        "falling"
+                        if self.state.global_state.btcdom_state < 0
+                        else "rising"
+                        if self.state.global_state.btcdom_state > 0
+                        else "neutral"
+                    ),
+                    dom_change_pct_at_entry=self.state.global_state.btcdom_change_pct,
+                    entry_rank=signal.rank,
+                    entry_composite_score=signal.composite_score,
+                    entry_momentum_z=signal.momentum_z,
+                    entry_curvature=signal.curvature,
+                    entry_hurst=signal.hurst,
                     notes=notes,
                 )
                 actions.append(
                     ExecutionAction(
                         ticker=signal.ticker,
-                        action="enter_long",
+                        action="enter_short",
                         signal_kind=signal.signal_kind,
                         detail=notes,
                         order_id=order_id,
@@ -562,7 +1023,7 @@ class ExecutionEngine:
                     )
                 )
                 await self._send_execution_notification(
-                    event="enter_long",
+                    event="enter_short",
                     ticker=signal.ticker,
                     stage=signal.stage,
                     signal_kind=signal.signal_kind,
@@ -571,13 +1032,27 @@ class ExecutionEngine:
                     current_price=float(entry_price),
                     notes=notes,
                 )
+                await self._record_position_mark(
+                    position={
+                        "id": position_id,
+                        "ticker": signal.ticker,
+                        "side": "SHORT",
+                        "entry_price": float(entry_price),
+                    },
+                    stage=signal.stage,
+                    timestamp_iso=now_iso,
+                    price=float(entry_price),
+                    phase="open",
+                )
+                open_positions[signal.ticker] = {"id": position_id}
+                entered_this_rebalance += 1
                 continue
 
             quantity = self._estimate_quantity(signal.current_price)
             try:
                 submission = await self.client.submit_market_order(
                     ticker=signal.ticker,
-                    side="Buy",
+                    side="Sell",
                     quantity=quantity,
                     price_hint=signal.current_price,
                     reduce_only=False,
@@ -586,7 +1061,7 @@ class ExecutionEngine:
                 order_id = await self.database.create_order(
                     client_order_id=self._client_order_id("entry", signal.ticker),
                     ticker=signal.ticker,
-                    side="Buy",
+                    side="Sell",
                     order_type="Market",
                     lifecycle="entry",
                     status="rejected",
@@ -616,7 +1091,7 @@ class ExecutionEngine:
             order_id = await self.database.create_order(
                 client_order_id=self._client_order_id("entry", signal.ticker),
                 ticker=signal.ticker,
-                side="Buy",
+                side="Sell",
                 order_type="Market",
                 lifecycle="entry",
                 status=submission.status,
@@ -648,19 +1123,35 @@ class ExecutionEngine:
 
             position_id = await self.database.open_position(
                 ticker=signal.ticker,
+                side="SHORT",
                 opened_at=now_iso,
                 updated_at=now_iso,
                 entry_order_id=order_id,
+                entry_stage=signal.stage,
                 entry_signal_kind=signal.signal_kind,
                 quantity=quantity,
                 notional_usd=self.settings.entry_notional_usd,
                 entry_price=submission.fill_price,
+                regime_score_at_entry=signal.regime_score,
+                dom_state_at_entry=(
+                    "falling"
+                    if self.state.global_state.btcdom_state < 0
+                    else "rising"
+                    if self.state.global_state.btcdom_state > 0
+                    else "neutral"
+                ),
+                dom_change_pct_at_entry=self.state.global_state.btcdom_change_pct,
+                entry_rank=signal.rank,
+                entry_composite_score=signal.composite_score,
+                entry_momentum_z=signal.momentum_z,
+                entry_curvature=signal.curvature,
+                entry_hurst=signal.hurst,
                 notes=submission.notes,
             )
             actions.append(
                 ExecutionAction(
                     ticker=signal.ticker,
-                    action="enter_long",
+                    action="enter_short",
                     signal_kind=signal.signal_kind,
                     detail=submission.notes,
                     order_id=order_id,
@@ -668,7 +1159,7 @@ class ExecutionEngine:
                 )
             )
             await self._send_execution_notification(
-                event="enter_long",
+                event="enter_short",
                 ticker=signal.ticker,
                 stage=signal.stage,
                 signal_kind=signal.signal_kind,
@@ -677,6 +1168,20 @@ class ExecutionEngine:
                 current_price=submission.fill_price,
                 notes=submission.notes,
             )
+            await self._record_position_mark(
+                position={
+                    "id": position_id,
+                    "ticker": signal.ticker,
+                    "side": "SHORT",
+                    "entry_price": submission.fill_price,
+                },
+                stage=signal.stage,
+                timestamp_iso=now_iso,
+                price=submission.fill_price,
+                phase="open",
+            )
+            open_positions[signal.ticker] = {"id": position_id}
+            entered_this_rebalance += 1
         return actions
 
     async def _process_confirmed(

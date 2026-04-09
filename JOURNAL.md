@@ -75,3 +75,24 @@
 - Confirmed the local `signals.sqlite3` is not the same runtime history as the exported Telegram session: the DB has no `orders`, no `positions`, and no `entry_ready` rows, while the Telegram export shows a real `SOLUSDT` demo entry plus later `entry_ready` alerts.
 - Created a real repo-root `.env` for this checkout from the shipped template, wired it to the local SQLite path, and enabled Bybit demo execution so this specific workspace can place demo orders instead of silently staying detector-only.
 - Left Telegram unset in the new local `.env` because no Telegram credentials were present in the current shell environment; local trading is now enabled, but Telegram delivery from this checkout still requires those two vars.
+
+## 2026-04-09
+
+- Reversed the execution layer from long-only to short-only while leaving the signal engine unchanged, so the same `entry_ready` and confirmed signals now express as contrarian shorts.
+- Changed short trade exits to match the requested asymmetry: take profit at `3%` below entry and stop loss at `2%` above entry.
+- Updated real-demo order submission, simulated exits, venue exit reconciliation, Telegram execution wording, config defaults, and the repo-local `.env` to use short semantics consistently.
+- Reran the local verification suite successfully with `32` passing tests.
+- Added a full analytics layer around execution and persistence:
+  - `trade_analytics` rows for every closed trade with realized PnL, holding time, MFE, MAE, entry context, and post-exit tracking state
+  - `position_marks` rows for open-position and post-exit price/volatility snapshots
+  - `portfolio_snapshots` rows for balance, gross notional, open-position count, estimated balance capacity, and daily stop-loss totals
+- Added `MAX_DAILY_STOP_LOSSES` as an execution guard so fresh entries stop for the UTC day after the configured number of stop-loss exits.
+- Extended `report.py` into a real analytics/export tool that now summarizes daily wins/losses, trade quality, follow-through, and portfolio snapshots, and can export CSVs for VPS retrieval.
+- Added analytics env knobs to both the local `.env` and `deploy/production.env.example`.
+- Reran the full local suite successfully with `37` passing tests.
+- Added a macOS pull-sync deployment note and launchd template so the VPS analytics exports can be copied back to the local Mac on a 30-minute interval without touching the runtime code.
+- Added `MAX_ENTRIES_PER_REBALANCE` as a real execution knob so one emerging rebalance pass can be limited to the top N fresh entries.
+- Removed two dead config knobs that were only creating confusion:
+  - `ANALYTICS_EXPORT_DIR`, which was not consumed by the runtime or sync path
+- Corrected stale spec wording so execution documentation now reflects the current short-only entry path instead of the old long-side behavior.
+- Restored `MAX_OPEN_POSITIONS` as a real live-entry safety net after the user explicitly asked for the portfolio cap back.

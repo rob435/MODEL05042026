@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 import asyncio
 import sqlite3
 from decimal import Decimal
@@ -36,6 +34,14 @@ def test_execution_engine_allows_multiple_tickers_but_only_one_position_per_tick
     asyncio.run(_exercise_per_ticker_entry_guard(tmp_path))
 
 
+def test_execution_engine_limits_entries_per_rebalance(tmp_path: Path) -> None:
+    asyncio.run(_exercise_max_entries_per_rebalance(tmp_path))
+
+
+def test_execution_engine_respects_max_open_positions(tmp_path: Path) -> None:
+    asyncio.run(_exercise_max_open_positions(tmp_path))
+
+
 def test_execution_engine_places_real_demo_order_and_syncs_exchange_exit(tmp_path: Path) -> None:
     asyncio.run(_exercise_live_demo_path(tmp_path))
 
@@ -48,8 +54,7 @@ async def _exercise_execution_take_profit_lifecycle(tmp_path: Path) -> None:
         demo_mode=True,
         execution_submit_orders=False,
         entry_notional_usd=200.0,
-        max_open_positions=2,
-        take_profit_pct=0.02,
+        take_profit_pct=0.03,
         stop_loss_pct=0.02,
         exit_on_lost_confirmed=False,
     )
@@ -97,7 +102,7 @@ async def _exercise_execution_take_profit_lifecycle(tmp_path: Path) -> None:
             )
         ],
     )
-    assert [(action.action, action.ticker) for action in entry_actions] == [("enter_long", "AAAUSDT")]
+    assert [(action.action, action.ticker) for action in entry_actions] == [("enter_short", "AAAUSDT")]
 
     confirm_actions = await execution.process_cycle(
         stage="confirmed",
@@ -123,7 +128,7 @@ async def _exercise_execution_take_profit_lifecycle(tmp_path: Path) -> None:
         ("confirm_position", "AAAUSDT")
     ]
 
-    assert state.update_provisional("AAAUSDT", settings.ticker_interval_ms * 2, 103.50) is True
+    assert state.update_provisional("AAAUSDT", settings.ticker_interval_ms * 2, 97.50) is True
     assert state.update_provisional("BTCUSDT", settings.ticker_interval_ms * 2, 20_200.0) is True
 
     exit_actions = await execution.process_cycle(
@@ -132,7 +137,7 @@ async def _exercise_execution_take_profit_lifecycle(tmp_path: Path) -> None:
         ranked_signals=[],
     )
     assert [(action.action, action.ticker) for action in exit_actions] == [
-        ("exit_long", "AAAUSDT")
+        ("exit_short", "AAAUSDT")
     ]
 
     with sqlite3.connect(settings.sqlite_path) as connection:
@@ -150,8 +155,8 @@ async def _exercise_execution_take_profit_lifecycle(tmp_path: Path) -> None:
         ).fetchone()
 
     assert order_counts == {"entry": 1, "exit": 1}
-    assert position == ("closed", "confirmed", 101.0, 103.5)
-    assert notifier.events == [("enter_long", "AAAUSDT"), ("take_profit_exit", "AAAUSDT")]
+    assert position == ("closed", "confirmed", 101.0, 97.5)
+    assert notifier.events == [("enter_short", "AAAUSDT"), ("take_profit_exit", "AAAUSDT")]
 
 
 async def _exercise_stop_loss_lifecycle(tmp_path: Path) -> None:
@@ -162,8 +167,7 @@ async def _exercise_stop_loss_lifecycle(tmp_path: Path) -> None:
         demo_mode=True,
         execution_submit_orders=False,
         entry_notional_usd=200.0,
-        max_open_positions=1,
-        take_profit_pct=0.02,
+        take_profit_pct=0.03,
         stop_loss_pct=0.02,
         exit_on_lost_confirmed=False,
     )
@@ -208,7 +212,7 @@ async def _exercise_stop_loss_lifecycle(tmp_path: Path) -> None:
         ],
     )
 
-    assert state.update_provisional("AAAUSDT", settings.ticker_interval_ms * 2, 98.90) is True
+    assert state.update_provisional("AAAUSDT", settings.ticker_interval_ms * 2, 103.10) is True
     assert state.update_provisional("BTCUSDT", settings.ticker_interval_ms * 2, 20_200.0) is True
 
     exit_actions = await execution.process_cycle(
@@ -217,15 +221,15 @@ async def _exercise_stop_loss_lifecycle(tmp_path: Path) -> None:
         ranked_signals=[],
     )
     assert [(action.action, action.ticker) for action in exit_actions] == [
-        ("exit_long", "AAAUSDT")
+        ("exit_short", "AAAUSDT")
     ]
-    assert notifier.events == [("enter_long", "AAAUSDT"), ("stop_loss_exit", "AAAUSDT")]
+    assert notifier.events == [("enter_short", "AAAUSDT"), ("stop_loss_exit", "AAAUSDT")]
 
     with sqlite3.connect(settings.sqlite_path) as connection:
         position = connection.execute(
             "SELECT status, exit_price FROM positions WHERE ticker = 'AAAUSDT'"
         ).fetchone()
-    assert position == ("closed", 98.9)
+    assert position == ("closed", 103.1)
 
 
 async def _exercise_per_ticker_entry_guard(tmp_path: Path) -> None:
@@ -288,8 +292,8 @@ async def _exercise_per_ticker_entry_guard(tmp_path: Path) -> None:
     )
 
     assert [(action.action, action.ticker) for action in actions] == [
-        ("enter_long", "AAAUSDT"),
-        ("enter_long", "BBBUSDT"),
+        ("enter_short", "AAAUSDT"),
+        ("enter_short", "BBBUSDT"),
     ]
 
     with sqlite3.connect(settings.sqlite_path) as connection:
@@ -359,7 +363,7 @@ async def _exercise_live_demo_path(tmp_path: Path) -> None:
             self.position_open = True
             return VenuePosition(
                 symbol=symbol,
-                side="Buy",
+                side="Sell",
                 size=Decimal("1.980"),
                 avg_price=Decimal("101.0"),
                 position_idx=0,
@@ -372,7 +376,7 @@ async def _exercise_live_demo_path(tmp_path: Path) -> None:
             if self.position_open:
                 return VenuePosition(
                     symbol=symbol,
-                    side="Buy",
+                    side="Sell",
                     size=Decimal("1.980"),
                     avg_price=Decimal("101.0"),
                     position_idx=0,
@@ -384,7 +388,7 @@ async def _exercise_live_demo_path(tmp_path: Path) -> None:
                 symbol=symbol,
                 order_id="venue-exit-1",
                 avg_entry_price=Decimal("101.0"),
-                avg_exit_price=Decimal("103.1"),
+                avg_exit_price=Decimal("97.9"),
                 closed_pnl=Decimal("4.158"),
                 updated_time_ms=4_102_444_800_000,
             )
@@ -396,7 +400,7 @@ async def _exercise_live_demo_path(tmp_path: Path) -> None:
         demo_mode=True,
         execution_submit_orders=True,
         risk_per_trade_pct=0.01,
-        take_profit_pct=0.02,
+        take_profit_pct=0.03,
         stop_loss_pct=0.02,
     )
     state = MarketState(settings=settings)
@@ -441,9 +445,9 @@ async def _exercise_live_demo_path(tmp_path: Path) -> None:
             )
         ],
     )
-    assert [(action.action, action.ticker) for action in entry_actions] == [("enter_long", "AAAUSDT")]
+    assert [(action.action, action.ticker) for action in entry_actions] == [("enter_short", "AAAUSDT")]
     assert fake_client.last_quantity == Decimal("4.950")
-    assert fake_client.stops == [("AAAUSDT", "103.0", "99.0")]
+    assert fake_client.stops == [("AAAUSDT", "98.0", "103.0")]
 
     fake_client.position_open = False
     sync_actions = await execution.process_cycle(
@@ -466,8 +470,155 @@ async def _exercise_live_demo_path(tmp_path: Path) -> None:
 
     assert order_statuses == [("entry", "filled_live"), ("exit", "filled_sync")]
     assert requested_notional == 500.0
-    assert position == ("closed", 101.0, 103.1)
-    assert notifier.events == [("enter_long", "AAAUSDT"), ("take_profit_exit", "AAAUSDT")]
+    assert position == ("closed", 101.0, 97.9)
+    assert notifier.events == [("enter_short", "AAAUSDT"), ("take_profit_exit", "AAAUSDT")]
+
+
+async def _exercise_max_entries_per_rebalance(tmp_path: Path) -> None:
+    settings = Settings(
+        sqlite_path=str(tmp_path / "execution-rebalance-cap.db"),
+        universe=["AAAUSDT", "BBBUSDT", "CCCUSDT"],
+        execution_enabled=True,
+        demo_mode=True,
+        execution_submit_orders=False,
+        max_entries_per_rebalance=1,
+    )
+    state = MarketState(settings=settings)
+    for symbol, price in (
+        ("BTCUSDT", 20_000.0),
+        ("AAAUSDT", 100.0),
+        ("BBBUSDT", 90.0),
+        ("CCCUSDT", 80.0),
+    ):
+        state.replace_history(
+            symbol,
+            [(0, price), (settings.ticker_interval_ms, price + 1.0)],
+        )
+
+    database = SignalDatabase(settings.sqlite_path)
+    await database.initialize()
+    execution = ExecutionEngine(settings=settings, state=state, database=database)
+
+    actions = await execution.process_cycle(
+        stage="emerging",
+        cycle_time_ms=settings.ticker_interval_ms * 2,
+        ranked_signals=[
+            RankedSignal(
+                stage="emerging",
+                signal_kind="entry_ready",
+                ticker="AAAUSDT",
+                current_price=101.0,
+                momentum_z=2.0,
+                curvature=0.2,
+                hurst=0.7,
+                regime_score=2,
+                composite_score=1.4,
+                rank=1,
+                persistence_hits=0,
+                alerted=False,
+            ),
+            RankedSignal(
+                stage="emerging",
+                signal_kind="entry_ready",
+                ticker="BBBUSDT",
+                current_price=91.0,
+                momentum_z=1.5,
+                curvature=0.15,
+                hurst=0.68,
+                regime_score=2,
+                composite_score=1.2,
+                rank=2,
+                persistence_hits=0,
+                alerted=False,
+            ),
+        ],
+    )
+
+    assert [(action.action, action.ticker) for action in actions] == [
+        ("enter_short", "AAAUSDT"),
+        ("skip_entry", "BBBUSDT"),
+    ]
+    assert "max_entries_per_rebalance_reached" in actions[1].detail
+
+    with sqlite3.connect(settings.sqlite_path) as connection:
+        open_positions = connection.execute(
+            "SELECT ticker FROM positions WHERE status = 'open' ORDER BY ticker"
+        ).fetchall()
+    assert open_positions == [("AAAUSDT",)]
+
+
+async def _exercise_max_open_positions(tmp_path: Path) -> None:
+    settings = Settings(
+        sqlite_path=str(tmp_path / "execution-open-cap.db"),
+        universe=["AAAUSDT", "BBBUSDT", "CCCUSDT"],
+        execution_enabled=True,
+        demo_mode=True,
+        execution_submit_orders=False,
+        max_open_positions=1,
+        max_entries_per_rebalance=0,
+    )
+    state = MarketState(settings=settings)
+    for symbol, price in (
+        ("BTCUSDT", 20_000.0),
+        ("AAAUSDT", 100.0),
+        ("BBBUSDT", 90.0),
+        ("CCCUSDT", 80.0),
+    ):
+        state.replace_history(
+            symbol,
+            [(0, price), (settings.ticker_interval_ms, price + 1.0)],
+        )
+
+    database = SignalDatabase(settings.sqlite_path)
+    await database.initialize()
+    execution = ExecutionEngine(settings=settings, state=state, database=database)
+
+    actions = await execution.process_cycle(
+        stage="emerging",
+        cycle_time_ms=settings.ticker_interval_ms * 2,
+        ranked_signals=[
+            RankedSignal(
+                stage="emerging",
+                signal_kind="entry_ready",
+                ticker="AAAUSDT",
+                current_price=101.0,
+                momentum_z=2.0,
+                curvature=0.2,
+                hurst=0.7,
+                regime_score=2,
+                composite_score=1.4,
+                rank=1,
+                persistence_hits=0,
+                alerted=False,
+            ),
+            RankedSignal(
+                stage="emerging",
+                signal_kind="entry_ready",
+                ticker="BBBUSDT",
+                current_price=91.0,
+                momentum_z=1.5,
+                curvature=0.15,
+                hurst=0.68,
+                regime_score=2,
+                composite_score=1.2,
+                rank=2,
+                persistence_hits=0,
+                alerted=False,
+            ),
+        ],
+    )
+
+    assert [(action.action, action.ticker) for action in actions] == [
+        ("enter_short", "AAAUSDT"),
+        ("skip_entry", "BBBUSDT"),
+    ]
+    assert "max_open_positions_reached" in actions[1].detail
+
+    with sqlite3.connect(settings.sqlite_path) as connection:
+        open_positions = connection.execute(
+            "SELECT ticker FROM positions WHERE status = 'open' ORDER BY ticker"
+        ).fetchall()
+    assert open_positions == [("AAAUSDT",)]
 
 
 def test_execution_engine_skips_live_entry_when_venue_position_exists(tmp_path: Path) -> None:
@@ -482,7 +633,7 @@ async def _exercise_live_duplicate_position_guard(tmp_path: Path) -> None:
         async def get_position(self, symbol: str):
             return VenuePosition(
                 symbol=symbol,
-                side="Buy",
+                side="Sell",
                 size=Decimal("1.000"),
                 avg_price=Decimal("100.0"),
                 position_idx=0,

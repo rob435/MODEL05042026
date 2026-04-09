@@ -60,8 +60,10 @@ class Settings:
     entry_notional_usd: float = 100.0
     risk_per_trade_pct: float = 0.01
     max_open_positions: int = 3
-    take_profit_pct: float = 0.02
+    max_entries_per_rebalance: int = 0
+    take_profit_pct: float = 0.03
     stop_loss_pct: float = 0.02
+    max_daily_stop_losses: int = 0
     exit_on_lost_confirmed: bool = False
     bybit_recv_window: int = 5000
     trade_fill_poll_attempts: int = 10
@@ -124,6 +126,11 @@ class Settings:
     macro_refresh_seconds: int = 3600
     queue_maxsize: int = 4096
     sqlite_path: str = "signals.sqlite3"
+    analytics_enabled: bool = True
+    analytics_log_position_marks: bool = True
+    analytics_log_portfolio_snapshots: bool = True
+    analytics_portfolio_snapshot_on_emerging: bool = False
+    analytics_post_exit_bars: int = 24
     telegram_bot_token: str | None = None
     telegram_chat_id: str | None = None
     log_level: str = "INFO"
@@ -174,8 +181,10 @@ def load_settings() -> Settings:
         entry_notional_usd=_get_float("ENTRY_NOTIONAL_USD", 100.0),
         risk_per_trade_pct=_get_float("RISK_PER_TRADE_PCT", 0.01),
         max_open_positions=_get_int("MAX_OPEN_POSITIONS", 3),
-        take_profit_pct=_get_float("TAKE_PROFIT_PCT", 0.02),
+        max_entries_per_rebalance=_get_int("MAX_ENTRIES_PER_REBALANCE", 0),
+        take_profit_pct=_get_float("TAKE_PROFIT_PCT", 0.03),
         stop_loss_pct=_get_float("STOP_LOSS_PCT", 0.02),
+        max_daily_stop_losses=_get_int("MAX_DAILY_STOP_LOSSES", 0),
         exit_on_lost_confirmed=_get_bool("EXIT_ON_LOST_CONFIRMED", False),
         bybit_recv_window=_get_int("BYBIT_RECV_WINDOW", 5000),
         trade_fill_poll_attempts=_get_int("TRADE_FILL_POLL_ATTEMPTS", 10),
@@ -240,6 +249,14 @@ def load_settings() -> Settings:
         macro_refresh_seconds=_get_int("MACRO_REFRESH_SECONDS", 3600),
         queue_maxsize=_get_int("QUEUE_MAXSIZE", 4096),
         sqlite_path=os.getenv("SQLITE_PATH", "signals.sqlite3"),
+        analytics_enabled=_get_bool("ANALYTICS_ENABLED", True),
+        analytics_log_position_marks=_get_bool("ANALYTICS_LOG_POSITION_MARKS", True),
+        analytics_log_portfolio_snapshots=_get_bool("ANALYTICS_LOG_PORTFOLIO_SNAPSHOTS", True),
+        analytics_portfolio_snapshot_on_emerging=_get_bool(
+            "ANALYTICS_PORTFOLIO_SNAPSHOT_ON_EMERGING",
+            False,
+        ),
+        analytics_post_exit_bars=_get_int("ANALYTICS_POST_EXIT_BARS", 24),
         telegram_bot_token=os.getenv("TELEGRAM_BOT_TOKEN"),
         telegram_chat_id=os.getenv("TELEGRAM_CHAT_ID"),
         log_level=os.getenv("LOG_LEVEL", "INFO").upper(),

@@ -132,6 +132,7 @@ class SignalDatabase:
             CREATE TABLE IF NOT EXISTS positions (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 ticker TEXT NOT NULL,
+                side TEXT NOT NULL DEFAULT 'SHORT',
                 status TEXT NOT NULL,
                 opened_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
@@ -139,15 +140,163 @@ class SignalDatabase:
                 confirmed_at TEXT,
                 entry_order_id INTEGER NOT NULL,
                 exit_order_id INTEGER,
+                entry_stage TEXT NOT NULL DEFAULT 'emerging',
                 entry_signal_kind TEXT NOT NULL,
                 confirmation_signal_kind TEXT,
                 quantity REAL NOT NULL,
                 notional_usd REAL NOT NULL,
                 entry_price REAL NOT NULL,
                 exit_price REAL,
+                regime_score_at_entry INTEGER,
+                dom_state_at_entry TEXT,
+                dom_change_pct_at_entry REAL,
+                entry_rank INTEGER,
+                entry_composite_score REAL,
+                entry_momentum_z REAL,
+                entry_curvature REAL,
+                entry_hurst REAL,
                 notes TEXT NOT NULL DEFAULT '',
                 FOREIGN KEY (entry_order_id) REFERENCES orders(id),
                 FOREIGN KEY (exit_order_id) REFERENCES orders(id)
+            )
+            """
+        )
+        position_columns = {
+            row[1] for row in self._conn.execute("PRAGMA table_info(positions)")
+        }
+        if "side" not in position_columns:
+            self._conn.execute(
+                "ALTER TABLE positions ADD COLUMN side TEXT NOT NULL DEFAULT 'SHORT'"
+            )
+        if "entry_stage" not in position_columns:
+            self._conn.execute(
+                "ALTER TABLE positions ADD COLUMN entry_stage TEXT NOT NULL DEFAULT 'emerging'"
+            )
+        if "regime_score_at_entry" not in position_columns:
+            self._conn.execute(
+                "ALTER TABLE positions ADD COLUMN regime_score_at_entry INTEGER"
+            )
+        if "dom_state_at_entry" not in position_columns:
+            self._conn.execute(
+                "ALTER TABLE positions ADD COLUMN dom_state_at_entry TEXT"
+            )
+        if "dom_change_pct_at_entry" not in position_columns:
+            self._conn.execute(
+                "ALTER TABLE positions ADD COLUMN dom_change_pct_at_entry REAL"
+            )
+        if "entry_rank" not in position_columns:
+            self._conn.execute(
+                "ALTER TABLE positions ADD COLUMN entry_rank INTEGER"
+            )
+        if "entry_composite_score" not in position_columns:
+            self._conn.execute(
+                "ALTER TABLE positions ADD COLUMN entry_composite_score REAL"
+            )
+        if "entry_momentum_z" not in position_columns:
+            self._conn.execute(
+                "ALTER TABLE positions ADD COLUMN entry_momentum_z REAL"
+            )
+        if "entry_curvature" not in position_columns:
+            self._conn.execute(
+                "ALTER TABLE positions ADD COLUMN entry_curvature REAL"
+            )
+        if "entry_hurst" not in position_columns:
+            self._conn.execute(
+                "ALTER TABLE positions ADD COLUMN entry_hurst REAL"
+            )
+        self._conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS trade_analytics (
+                position_id INTEGER PRIMARY KEY,
+                ticker TEXT NOT NULL,
+                side TEXT NOT NULL,
+                entry_stage TEXT NOT NULL,
+                entry_signal_kind TEXT NOT NULL,
+                confirmation_signal_kind TEXT,
+                exit_stage TEXT NOT NULL,
+                exit_signal_kind TEXT NOT NULL,
+                exit_event TEXT NOT NULL,
+                exit_reason TEXT NOT NULL DEFAULT '',
+                opened_at TEXT NOT NULL,
+                confirmed_at TEXT,
+                closed_at TEXT NOT NULL,
+                holding_minutes REAL NOT NULL DEFAULT 0,
+                bars_held INTEGER NOT NULL DEFAULT 0,
+                quantity REAL NOT NULL,
+                notional_usd REAL NOT NULL,
+                entry_price REAL NOT NULL,
+                exit_price REAL NOT NULL,
+                realized_pnl_pct REAL NOT NULL,
+                realized_pnl_usd REAL NOT NULL,
+                mfe_pct REAL NOT NULL DEFAULT 0,
+                mae_pct REAL NOT NULL DEFAULT 0,
+                peak_favorable_price REAL,
+                peak_adverse_price REAL,
+                intratrade_volatility REAL,
+                regime_score_at_entry INTEGER,
+                dom_state_at_entry TEXT,
+                dom_change_pct_at_entry REAL,
+                entry_rank INTEGER,
+                entry_composite_score REAL,
+                entry_momentum_z REAL,
+                entry_curvature REAL,
+                entry_hurst REAL,
+                post_exit_bars_target INTEGER NOT NULL DEFAULT 0,
+                post_exit_bars_observed INTEGER NOT NULL DEFAULT 0,
+                post_exit_completed INTEGER NOT NULL DEFAULT 0,
+                post_exit_tracking_started_at TEXT,
+                post_exit_tracking_completed_at TEXT,
+                post_exit_last_price REAL,
+                post_exit_best_price REAL,
+                post_exit_worst_price REAL,
+                post_exit_favorable_excursion_pct REAL NOT NULL DEFAULT 0,
+                post_exit_adverse_excursion_pct REAL NOT NULL DEFAULT 0,
+                post_exit_volatility REAL,
+                FOREIGN KEY (position_id) REFERENCES positions(id)
+            )
+            """
+        )
+        self._conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS position_marks (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                position_id INTEGER NOT NULL,
+                ticker TEXT NOT NULL,
+                side TEXT NOT NULL,
+                phase TEXT NOT NULL,
+                timestamp TEXT NOT NULL,
+                stage TEXT NOT NULL,
+                price REAL NOT NULL,
+                pnl_pct REAL NOT NULL,
+                favorable_excursion_pct REAL NOT NULL DEFAULT 0,
+                adverse_excursion_pct REAL NOT NULL DEFAULT 0,
+                rolling_volatility REAL,
+                regime_score INTEGER,
+                dom_state TEXT,
+                dom_change_pct REAL,
+                bars_since_entry INTEGER NOT NULL DEFAULT 0,
+                bars_since_exit INTEGER NOT NULL DEFAULT 0,
+                FOREIGN KEY (position_id) REFERENCES positions(id)
+            )
+            """
+        )
+        self._conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS portfolio_snapshots (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp TEXT NOT NULL,
+                stage TEXT NOT NULL,
+                event TEXT NOT NULL,
+                wallet_equity_usd REAL,
+                available_balance_usd REAL,
+                open_positions INTEGER NOT NULL,
+                gross_notional_usd REAL NOT NULL DEFAULT 0,
+                remaining_slots INTEGER,
+                balance_position_capacity INTEGER,
+                risk_budget_usd REAL,
+                target_notional_usd REAL,
+                daily_stop_loss_count INTEGER NOT NULL DEFAULT 0,
+                notes TEXT NOT NULL DEFAULT ''
             )
             """
         )
@@ -174,6 +323,24 @@ class SignalDatabase:
             CREATE UNIQUE INDEX IF NOT EXISTS idx_positions_open_ticker
             ON positions (ticker)
             WHERE status = 'open'
+            """
+        )
+        self._conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_trade_analytics_closed_at
+            ON trade_analytics (closed_at, exit_event)
+            """
+        )
+        self._conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_position_marks_position_phase
+            ON position_marks (position_id, phase, timestamp)
+            """
+        )
+        self._conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_portfolio_snapshots_timestamp
+            ON portfolio_snapshots (timestamp, stage)
             """
         )
         self._conn.commit()
@@ -392,65 +559,116 @@ class SignalDatabase:
         self,
         *,
         ticker: str,
+        side: str,
         opened_at: str,
         updated_at: str,
         entry_order_id: int,
+        entry_stage: str,
         entry_signal_kind: str,
         quantity: float,
         notional_usd: float,
         entry_price: float,
+        regime_score_at_entry: int | None = None,
+        dom_state_at_entry: str | None = None,
+        dom_change_pct_at_entry: float | None = None,
+        entry_rank: int | None = None,
+        entry_composite_score: float | None = None,
+        entry_momentum_z: float | None = None,
+        entry_curvature: float | None = None,
+        entry_hurst: float | None = None,
         notes: str = "",
     ) -> int:
         return await asyncio.to_thread(
             self._open_position_sync,
             ticker,
+            side,
             opened_at,
             updated_at,
             entry_order_id,
+            entry_stage,
             entry_signal_kind,
             quantity,
             notional_usd,
             entry_price,
+            regime_score_at_entry,
+            dom_state_at_entry,
+            dom_change_pct_at_entry,
+            entry_rank,
+            entry_composite_score,
+            entry_momentum_z,
+            entry_curvature,
+            entry_hurst,
             notes,
         )
 
     def _open_position_sync(
         self,
         ticker: str,
+        side: str,
         opened_at: str,
         updated_at: str,
         entry_order_id: int,
+        entry_stage: str,
         entry_signal_kind: str,
         quantity: float,
         notional_usd: float,
         entry_price: float,
+        regime_score_at_entry: int | None,
+        dom_state_at_entry: str | None,
+        dom_change_pct_at_entry: float | None,
+        entry_rank: int | None,
+        entry_composite_score: float | None,
+        entry_momentum_z: float | None,
+        entry_curvature: float | None,
+        entry_hurst: float | None,
         notes: str,
     ) -> int:
         cursor = self._conn.execute(
             """
             INSERT INTO positions (
                 ticker,
+                side,
                 status,
                 opened_at,
                 updated_at,
                 entry_order_id,
+                entry_stage,
                 entry_signal_kind,
                 quantity,
                 notional_usd,
                 entry_price,
+                regime_score_at_entry,
+                dom_state_at_entry,
+                dom_change_pct_at_entry,
+                entry_rank,
+                entry_composite_score,
+                entry_momentum_z,
+                entry_curvature,
+                entry_hurst,
                 notes
             )
-            VALUES (?, 'open', ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 ticker,
+                side,
+                "open",
                 opened_at,
                 updated_at,
                 entry_order_id,
+                entry_stage,
                 entry_signal_kind,
                 quantity,
                 notional_usd,
                 entry_price,
+                regime_score_at_entry,
+                dom_state_at_entry,
+                dom_change_pct_at_entry,
+                entry_rank,
+                entry_composite_score,
+                entry_momentum_z,
+                entry_curvature,
+                entry_hurst,
                 notes,
             ),
         )
@@ -591,6 +809,476 @@ class SignalDatabase:
             ),
         )
         self._conn.commit()
+
+    async def log_position_mark(
+        self,
+        *,
+        position_id: int,
+        ticker: str,
+        side: str,
+        phase: str,
+        timestamp: str,
+        stage: str,
+        price: float,
+        pnl_pct: float,
+        favorable_excursion_pct: float,
+        adverse_excursion_pct: float,
+        rolling_volatility: float | None,
+        regime_score: int | None,
+        dom_state: str | None,
+        dom_change_pct: float | None,
+        bars_since_entry: int = 0,
+        bars_since_exit: int = 0,
+    ) -> int:
+        return await asyncio.to_thread(
+            self._log_position_mark_sync,
+            position_id,
+            ticker,
+            side,
+            phase,
+            timestamp,
+            stage,
+            price,
+            pnl_pct,
+            favorable_excursion_pct,
+            adverse_excursion_pct,
+            rolling_volatility,
+            regime_score,
+            dom_state,
+            dom_change_pct,
+            bars_since_entry,
+            bars_since_exit,
+        )
+
+    def _log_position_mark_sync(
+        self,
+        position_id: int,
+        ticker: str,
+        side: str,
+        phase: str,
+        timestamp: str,
+        stage: str,
+        price: float,
+        pnl_pct: float,
+        favorable_excursion_pct: float,
+        adverse_excursion_pct: float,
+        rolling_volatility: float | None,
+        regime_score: int | None,
+        dom_state: str | None,
+        dom_change_pct: float | None,
+        bars_since_entry: int,
+        bars_since_exit: int,
+    ) -> int:
+        cursor = self._conn.execute(
+            """
+            INSERT INTO position_marks (
+                position_id,
+                ticker,
+                side,
+                phase,
+                timestamp,
+                stage,
+                price,
+                pnl_pct,
+                favorable_excursion_pct,
+                adverse_excursion_pct,
+                rolling_volatility,
+                regime_score,
+                dom_state,
+                dom_change_pct,
+                bars_since_entry,
+                bars_since_exit
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                position_id,
+                ticker,
+                side,
+                phase,
+                timestamp,
+                stage,
+                price,
+                pnl_pct,
+                favorable_excursion_pct,
+                adverse_excursion_pct,
+                rolling_volatility,
+                regime_score,
+                dom_state,
+                dom_change_pct,
+                bars_since_entry,
+                bars_since_exit,
+            ),
+        )
+        self._conn.commit()
+        return int(cursor.lastrowid)
+
+    async def list_position_marks(
+        self,
+        position_id: int,
+        phase: str | None = None,
+    ) -> list[sqlite3.Row]:
+        return await asyncio.to_thread(self._list_position_marks_sync, position_id, phase)
+
+    def _list_position_marks_sync(
+        self,
+        position_id: int,
+        phase: str | None,
+    ) -> list[sqlite3.Row]:
+        if phase is None:
+            return self._conn.execute(
+                """
+                SELECT *
+                FROM position_marks
+                WHERE position_id = ?
+                ORDER BY id ASC
+                """,
+                (position_id,),
+            ).fetchall()
+        return self._conn.execute(
+            """
+            SELECT *
+            FROM position_marks
+            WHERE position_id = ?
+              AND phase = ?
+            ORDER BY id ASC
+            """,
+            (position_id, phase),
+        ).fetchall()
+
+    async def record_trade_analytics(self, **kwargs) -> None:
+        await asyncio.to_thread(self._record_trade_analytics_sync, kwargs)
+
+    def _record_trade_analytics_sync(self, data: dict) -> None:
+        self._conn.execute(
+            """
+            INSERT OR REPLACE INTO trade_analytics (
+                position_id,
+                ticker,
+                side,
+                entry_stage,
+                entry_signal_kind,
+                confirmation_signal_kind,
+                exit_stage,
+                exit_signal_kind,
+                exit_event,
+                exit_reason,
+                opened_at,
+                confirmed_at,
+                closed_at,
+                holding_minutes,
+                bars_held,
+                quantity,
+                notional_usd,
+                entry_price,
+                exit_price,
+                realized_pnl_pct,
+                realized_pnl_usd,
+                mfe_pct,
+                mae_pct,
+                peak_favorable_price,
+                peak_adverse_price,
+                intratrade_volatility,
+                regime_score_at_entry,
+                dom_state_at_entry,
+                dom_change_pct_at_entry,
+                entry_rank,
+                entry_composite_score,
+                entry_momentum_z,
+                entry_curvature,
+                entry_hurst,
+                post_exit_bars_target,
+                post_exit_bars_observed,
+                post_exit_completed,
+                post_exit_tracking_started_at,
+                post_exit_tracking_completed_at,
+                post_exit_last_price,
+                post_exit_best_price,
+                post_exit_worst_price,
+                post_exit_favorable_excursion_pct,
+                post_exit_adverse_excursion_pct,
+                post_exit_volatility
+            )
+            VALUES (
+                :position_id,
+                :ticker,
+                :side,
+                :entry_stage,
+                :entry_signal_kind,
+                :confirmation_signal_kind,
+                :exit_stage,
+                :exit_signal_kind,
+                :exit_event,
+                :exit_reason,
+                :opened_at,
+                :confirmed_at,
+                :closed_at,
+                :holding_minutes,
+                :bars_held,
+                :quantity,
+                :notional_usd,
+                :entry_price,
+                :exit_price,
+                :realized_pnl_pct,
+                :realized_pnl_usd,
+                :mfe_pct,
+                :mae_pct,
+                :peak_favorable_price,
+                :peak_adverse_price,
+                :intratrade_volatility,
+                :regime_score_at_entry,
+                :dom_state_at_entry,
+                :dom_change_pct_at_entry,
+                :entry_rank,
+                :entry_composite_score,
+                :entry_momentum_z,
+                :entry_curvature,
+                :entry_hurst,
+                :post_exit_bars_target,
+                :post_exit_bars_observed,
+                :post_exit_completed,
+                :post_exit_tracking_started_at,
+                :post_exit_tracking_completed_at,
+                :post_exit_last_price,
+                :post_exit_best_price,
+                :post_exit_worst_price,
+                :post_exit_favorable_excursion_pct,
+                :post_exit_adverse_excursion_pct,
+                :post_exit_volatility
+            )
+            """,
+            data,
+        )
+        self._conn.commit()
+
+    async def get_trade_analytics(self, position_id: int) -> sqlite3.Row | None:
+        return await asyncio.to_thread(self._get_trade_analytics_sync, position_id)
+
+    def _get_trade_analytics_sync(self, position_id: int) -> sqlite3.Row | None:
+        return self._conn.execute(
+            """
+            SELECT *
+            FROM trade_analytics
+            WHERE position_id = ?
+            """,
+            (position_id,),
+        ).fetchone()
+
+    async def list_pending_post_exit_analytics(self) -> list[sqlite3.Row]:
+        return await asyncio.to_thread(self._list_pending_post_exit_analytics_sync)
+
+    def _list_pending_post_exit_analytics_sync(self) -> list[sqlite3.Row]:
+        return self._conn.execute(
+            """
+            SELECT *
+            FROM trade_analytics
+            WHERE post_exit_bars_target > 0
+              AND post_exit_completed = 0
+            ORDER BY closed_at ASC
+            """
+        ).fetchall()
+
+    async def update_trade_post_exit(
+        self,
+        *,
+        position_id: int,
+        post_exit_bars_observed: int,
+        post_exit_completed: bool,
+        post_exit_tracking_started_at: str | None,
+        post_exit_tracking_completed_at: str | None,
+        post_exit_last_price: float | None,
+        post_exit_best_price: float | None,
+        post_exit_worst_price: float | None,
+        post_exit_favorable_excursion_pct: float,
+        post_exit_adverse_excursion_pct: float,
+        post_exit_volatility: float | None,
+    ) -> None:
+        await asyncio.to_thread(
+            self._update_trade_post_exit_sync,
+            position_id,
+            post_exit_bars_observed,
+            post_exit_completed,
+            post_exit_tracking_started_at,
+            post_exit_tracking_completed_at,
+            post_exit_last_price,
+            post_exit_best_price,
+            post_exit_worst_price,
+            post_exit_favorable_excursion_pct,
+            post_exit_adverse_excursion_pct,
+            post_exit_volatility,
+        )
+
+    def _update_trade_post_exit_sync(
+        self,
+        position_id: int,
+        post_exit_bars_observed: int,
+        post_exit_completed: bool,
+        post_exit_tracking_started_at: str | None,
+        post_exit_tracking_completed_at: str | None,
+        post_exit_last_price: float | None,
+        post_exit_best_price: float | None,
+        post_exit_worst_price: float | None,
+        post_exit_favorable_excursion_pct: float,
+        post_exit_adverse_excursion_pct: float,
+        post_exit_volatility: float | None,
+    ) -> None:
+        self._conn.execute(
+            """
+            UPDATE trade_analytics
+            SET post_exit_bars_observed = ?,
+                post_exit_completed = ?,
+                post_exit_tracking_started_at = ?,
+                post_exit_tracking_completed_at = ?,
+                post_exit_last_price = ?,
+                post_exit_best_price = ?,
+                post_exit_worst_price = ?,
+                post_exit_favorable_excursion_pct = ?,
+                post_exit_adverse_excursion_pct = ?,
+                post_exit_volatility = ?
+            WHERE position_id = ?
+            """,
+            (
+                post_exit_bars_observed,
+                int(post_exit_completed),
+                post_exit_tracking_started_at,
+                post_exit_tracking_completed_at,
+                post_exit_last_price,
+                post_exit_best_price,
+                post_exit_worst_price,
+                post_exit_favorable_excursion_pct,
+                post_exit_adverse_excursion_pct,
+                post_exit_volatility,
+                position_id,
+            ),
+        )
+        self._conn.commit()
+
+    async def log_portfolio_snapshot(
+        self,
+        *,
+        timestamp: str,
+        stage: str,
+        event: str,
+        wallet_equity_usd: float | None,
+        available_balance_usd: float | None,
+        open_positions: int,
+        gross_notional_usd: float,
+        remaining_slots: int | None,
+        balance_position_capacity: int | None,
+        risk_budget_usd: float | None,
+        target_notional_usd: float | None,
+        daily_stop_loss_count: int,
+        notes: str = "",
+    ) -> int:
+        return await asyncio.to_thread(
+            self._log_portfolio_snapshot_sync,
+            timestamp,
+            stage,
+            event,
+            wallet_equity_usd,
+            available_balance_usd,
+            open_positions,
+            gross_notional_usd,
+            remaining_slots,
+            balance_position_capacity,
+            risk_budget_usd,
+            target_notional_usd,
+            daily_stop_loss_count,
+            notes,
+        )
+
+    def _log_portfolio_snapshot_sync(
+        self,
+        timestamp: str,
+        stage: str,
+        event: str,
+        wallet_equity_usd: float | None,
+        available_balance_usd: float | None,
+        open_positions: int,
+        gross_notional_usd: float,
+        remaining_slots: int | None,
+        balance_position_capacity: int | None,
+        risk_budget_usd: float | None,
+        target_notional_usd: float | None,
+        daily_stop_loss_count: int,
+        notes: str,
+    ) -> int:
+        cursor = self._conn.execute(
+            """
+            INSERT INTO portfolio_snapshots (
+                timestamp,
+                stage,
+                event,
+                wallet_equity_usd,
+                available_balance_usd,
+                open_positions,
+                gross_notional_usd,
+                remaining_slots,
+                balance_position_capacity,
+                risk_budget_usd,
+                target_notional_usd,
+                daily_stop_loss_count,
+                notes
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                timestamp,
+                stage,
+                event,
+                wallet_equity_usd,
+                available_balance_usd,
+                open_positions,
+                gross_notional_usd,
+                remaining_slots,
+                balance_position_capacity,
+                risk_budget_usd,
+                target_notional_usd,
+                daily_stop_loss_count,
+                notes,
+            ),
+        )
+        self._conn.commit()
+        return int(cursor.lastrowid)
+
+    async def count_trade_exit_events_for_day(self, exit_event: str, utc_day: str) -> int:
+        return await asyncio.to_thread(
+            self._count_trade_exit_events_for_day_sync,
+            exit_event,
+            utc_day,
+        )
+
+    def _count_trade_exit_events_for_day_sync(self, exit_event: str, utc_day: str) -> int:
+        row = self._conn.execute(
+            """
+            SELECT COUNT(*)
+            FROM trade_analytics
+            WHERE exit_event = ?
+              AND substr(closed_at, 1, 10) = ?
+            """,
+            (exit_event, utc_day),
+        ).fetchone()
+        return int(row[0]) if row is not None else 0
+
+    async def summarize_trade_day(self, utc_day: str) -> sqlite3.Row:
+        return await asyncio.to_thread(self._summarize_trade_day_sync, utc_day)
+
+    def _summarize_trade_day_sync(self, utc_day: str) -> sqlite3.Row:
+        return self._conn.execute(
+            """
+            SELECT
+                COUNT(*) AS trades,
+                COALESCE(SUM(CASE WHEN realized_pnl_pct > 0 THEN 1 ELSE 0 END), 0) AS wins,
+                COALESCE(SUM(CASE WHEN realized_pnl_pct <= 0 THEN 1 ELSE 0 END), 0) AS losses,
+                COALESCE(SUM(CASE WHEN exit_event = 'stop_loss_exit' THEN 1 ELSE 0 END), 0) AS stop_losses,
+                COALESCE(SUM(realized_pnl_usd), 0) AS net_pnl_usd,
+                AVG(CASE WHEN realized_pnl_pct > 0 THEN realized_pnl_pct END) AS avg_win_pct,
+                AVG(CASE WHEN realized_pnl_pct <= 0 THEN realized_pnl_pct END) AS avg_loss_pct
+            FROM trade_analytics
+            WHERE substr(closed_at, 1, 10) = ?
+            """,
+            (utc_day,),
+        ).fetchone()
 
     def close(self) -> None:
         self._conn.close()

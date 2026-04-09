@@ -55,3 +55,16 @@
 - Treat a missing repo-root `.env` in a local checkout as a hard configuration failure for execution debugging. If the file is absent, the process may still look half-configured from inherited shell variables while keeping critical execution toggles at their default `false` values.
 - When creating a local `.env` from the VPS-oriented template, override `SQLITE_PATH` to a workspace-local path instead of leaving the `/opt/...` example in place. Using the deployment example verbatim on a laptop is sloppy and makes state inspection misleading.
 - Do not assume the local SQLite file explains Telegram behavior unless the logged signal kinds and timestamps actually match the chat export. In this session they did not, so the right conclusion was runtime drift, not strategy failure.
+
+## 2026-04-09
+
+- Keep the ranking and signal-generation logic unchanged for now and invert only the execution layer. This makes the current system an explicit contrarian test instead of pretending it has become a different alpha model.
+- Use asymmetric short exits of `TP=3%` and `SL=2%` for this inversion pass. If the short bias still fails under those terms, the signal is probably weak rather than merely directionally inverted.
+- Put research data in SQLite, not just the app log. Journald is for runtime/debugging; SQLite is the source of truth for daily stats, trade analytics, position marks, and portfolio snapshots.
+- Track post-exit follow-through directly in the runtime so TP/SL tuning is based on what trades did after closure, not just whether they closed green or red.
+- Use a UTC-day stop-loss breaker (`MAX_DAILY_STOP_LOSSES`) instead of ad hoc manual shutdown when the bot is clearly trading poorly intraday.
+- Use CSV export from `report.py` as the VPS retrieval path. Pull flat files with `rsync`; do not make future analysis depend on SSHing in and hand-querying SQLite every time.
+- Keep the export-sync automation pull-based from the Mac side. The VPS should remain the source of truth, and the local machine should schedule the backup fetch and analysis pass instead of relying on the server to push files outward.
+- Add a separate `MAX_ENTRIES_PER_REBALANCE` gate instead of reviving the dead portfolio-wide open-position cap. The useful control here is "how many fresh names may one emerging batch open," not "pretend portfolio state alone solves correlation."
+- Remove dead config surface aggressively when it no longer changes runtime behavior. In this pass that meant dropping `MAX_OPEN_POSITIONS` and `ANALYTICS_EXPORT_DIR` instead of keeping misleading env knobs around for compatibility theater.
+- Restore `MAX_OPEN_POSITIONS` once the user explicitly wants it back as a hard safety net. It is still a blunt tool, but that is fine if it is treated honestly as a kill-switch style portfolio cap rather than alpha logic.

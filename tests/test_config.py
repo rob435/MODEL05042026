@@ -15,6 +15,7 @@ def test_load_settings_reads_dotenv_and_overrides_existing_env(monkeypatch, tmp_
         "ENTRY_READY_MIN_OBSERVATIONS=6\n"
         "EXECUTION_ENABLED=true\n"
         "DEMO_MODE=false\n"
+        "TELEGRAM_SIGNAL_ALERTS_ENABLED=false\n"
         "ENTRY_NOTIONAL_USD=250\n"
         "RISK_PER_TRADE_PCT=0.015\n"
         "MAX_OPEN_POSITIONS=5\n"
@@ -42,6 +43,7 @@ def test_load_settings_reads_dotenv_and_overrides_existing_env(monkeypatch, tmp_
     assert settings.entry_ready_cooldown_minutes == 15
     assert settings.execution_enabled is True
     assert settings.demo_mode is False
+    assert settings.telegram_signal_alerts_enabled is False
     assert settings.entry_notional_usd == 250
     assert settings.risk_per_trade_pct == 0.015
     assert settings.max_open_positions == 5

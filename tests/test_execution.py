@@ -1,6 +1,7 @@
 import asyncio
 import sqlite3
 from decimal import Decimal
+from datetime import datetime, timezone
 from pathlib import Path
 
 from config import Settings
@@ -40,6 +41,10 @@ def test_execution_engine_limits_entries_per_rebalance(tmp_path: Path) -> None:
 
 def test_execution_engine_respects_max_open_positions(tmp_path: Path) -> None:
     asyncio.run(_exercise_max_open_positions(tmp_path))
+
+
+def test_execution_engine_resets_daily_stop_loss_limit_on_new_utc_day(tmp_path: Path) -> None:
+    asyncio.run(_exercise_daily_stop_loss_reset(tmp_path))
 
 
 def test_execution_engine_places_real_demo_order_and_syncs_exchange_exit(tmp_path: Path) -> None:
@@ -619,6 +624,127 @@ async def _exercise_max_open_positions(tmp_path: Path) -> None:
             "SELECT ticker FROM positions WHERE status = 'open' ORDER BY ticker"
         ).fetchall()
     assert open_positions == [("AAAUSDT",)]
+
+
+async def _exercise_daily_stop_loss_reset(tmp_path: Path) -> None:
+    settings = Settings(
+        sqlite_path=str(tmp_path / "execution-daily-stop-reset.db"),
+        universe=["AAAUSDT", "BBBUSDT"],
+        execution_enabled=True,
+        demo_mode=True,
+        execution_submit_orders=False,
+        max_daily_stop_losses=1,
+        take_profit_pct=0.03,
+        stop_loss_pct=0.02,
+    )
+    state = MarketState(settings=settings)
+    for symbol, price in (
+        ("BTCUSDT", 20_000.0),
+        ("AAAUSDT", 100.0),
+        ("BBBUSDT", 90.0),
+    ):
+        state.replace_history(
+            symbol,
+            [(0, price), (settings.ticker_interval_ms, price + 1.0)],
+        )
+
+    database = SignalDatabase(settings.sqlite_path)
+    await database.initialize()
+    execution = ExecutionEngine(settings=settings, state=state, database=database)
+
+    current_time = datetime(2026, 4, 9, 12, 0, tzinfo=timezone.utc)
+
+    def fake_now(*, cycle_time_ms, stage):
+        return current_time
+
+    execution._now = fake_now  # type: ignore[method-assign]
+
+    first_entry = await execution.process_cycle(
+        stage="emerging",
+        cycle_time_ms=settings.ticker_interval_ms * 2,
+        ranked_signals=[
+            RankedSignal(
+                stage="emerging",
+                signal_kind="entry_ready",
+                ticker="AAAUSDT",
+                current_price=101.0,
+                momentum_z=2.0,
+                curvature=0.2,
+                hurst=0.7,
+                regime_score=2,
+                composite_score=1.4,
+                rank=1,
+                persistence_hits=0,
+                alerted=False,
+            )
+        ],
+    )
+    assert [(action.action, action.ticker) for action in first_entry] == [
+        ("enter_short", "AAAUSDT")
+    ]
+
+    assert state.update_provisional("AAAUSDT", settings.ticker_interval_ms * 2, 103.10) is True
+    assert state.update_provisional("BTCUSDT", settings.ticker_interval_ms * 2, 20_200.0) is True
+
+    first_exit = await execution.process_cycle(
+        stage="emerging",
+        cycle_time_ms=settings.ticker_interval_ms * 2,
+        ranked_signals=[],
+    )
+    assert [(action.action, action.ticker) for action in first_exit] == [
+        ("exit_short", "AAAUSDT")
+    ]
+
+    current_time = datetime(2026, 4, 9, 13, 0, tzinfo=timezone.utc)
+    blocked_same_day = await execution.process_cycle(
+        stage="emerging",
+        cycle_time_ms=settings.ticker_interval_ms * 3,
+        ranked_signals=[
+            RankedSignal(
+                stage="emerging",
+                signal_kind="entry_ready",
+                ticker="BBBUSDT",
+                current_price=91.0,
+                momentum_z=1.5,
+                curvature=0.15,
+                hurst=0.68,
+                regime_score=2,
+                composite_score=1.2,
+                rank=1,
+                persistence_hits=0,
+                alerted=False,
+            )
+        ],
+    )
+    assert [(action.action, action.ticker) for action in blocked_same_day] == [
+        ("skip_entry", "BBBUSDT")
+    ]
+    assert "max_daily_stop_losses_reached" in blocked_same_day[0].detail
+
+    current_time = datetime(2026, 4, 10, 0, 5, tzinfo=timezone.utc)
+    allowed_next_day = await execution.process_cycle(
+        stage="emerging",
+        cycle_time_ms=settings.ticker_interval_ms * 4,
+        ranked_signals=[
+            RankedSignal(
+                stage="emerging",
+                signal_kind="entry_ready",
+                ticker="BBBUSDT",
+                current_price=91.0,
+                momentum_z=1.5,
+                curvature=0.15,
+                hurst=0.68,
+                regime_score=2,
+                composite_score=1.2,
+                rank=1,
+                persistence_hits=0,
+                alerted=False,
+            )
+        ],
+    )
+    assert [(action.action, action.ticker) for action in allowed_next_day] == [
+        ("enter_short", "BBBUSDT")
+    ]
 
 
 def test_execution_engine_skips_live_entry_when_venue_position_exists(tmp_path: Path) -> None:

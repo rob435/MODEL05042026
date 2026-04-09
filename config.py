@@ -94,6 +94,7 @@ class Settings:
     confirmed_persistence_min_hits: int = 2
     confirmed_persistence_rank: int = 3
     ranking_log_top_n: int = 5
+    telegram_signal_alerts_enabled: bool = True
     telegram_summary_enabled: bool = True
     summary_top_n: int = 5
     summary_bottom_n: int = 5
@@ -217,6 +218,7 @@ def load_settings() -> Settings:
         confirmed_persistence_min_hits=_get_int("CONFIRMED_PERSISTENCE_MIN_HITS", 2),
         confirmed_persistence_rank=_get_int("CONFIRMED_PERSISTENCE_RANK", 3),
         ranking_log_top_n=_get_int("RANKING_LOG_TOP_N", 5),
+        telegram_signal_alerts_enabled=_get_bool("TELEGRAM_SIGNAL_ALERTS_ENABLED", True),
         telegram_summary_enabled=_get_bool("TELEGRAM_SUMMARY_ENABLED", True),
         summary_top_n=_get_int("SUMMARY_TOP_N", 5),
         summary_bottom_n=_get_int("SUMMARY_BOTTOM_N", 5),

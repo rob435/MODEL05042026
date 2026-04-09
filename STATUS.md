@@ -54,6 +54,8 @@
 - Live entry sizing is now risk-based instead of fixed-notional: `RISK_PER_TRADE_PCT` defaults to `1%` of Bybit `totalAvailableBalance`, converted into position notional through the configured stop distance.
 - The practical entry rule is now one open position per ticker, plus optional portfolio and per-batch throttles via `MAX_OPEN_POSITIONS` and `MAX_ENTRIES_PER_REBALANCE`.
 - Dead config surface has been trimmed: `ANALYTICS_EXPORT_DIR` was removed because it no longer affected live behavior.
+- The production env template is now grouped by operational impact, with Telegram, execution/risk, and high-impact signal-quality controls separated into clearer sections.
+- Telegram control now includes a signal-alert master switch, so the bot can run in execution-only chat mode without still sending `confirmed` or `entry_ready` candidate alerts.
 - Local verification is green again: `37` tests passing.
 - This checkout now has a real repo-root `.env` again, with Bybit demo execution enabled and `SQLITE_PATH` pointed at the local workspace database instead of the VPS example path.
 - Telegram is still not configured in this checkout because no local `TELEGRAM_BOT_TOKEN` or `TELEGRAM_CHAT_ID` were available to write into `.env`.

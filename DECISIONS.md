@@ -68,3 +68,5 @@
 - Add a separate `MAX_ENTRIES_PER_REBALANCE` gate instead of reviving the dead portfolio-wide open-position cap. The useful control here is "how many fresh names may one emerging batch open," not "pretend portfolio state alone solves correlation."
 - Remove dead config surface aggressively when it no longer changes runtime behavior. In this pass that meant dropping `MAX_OPEN_POSITIONS` and `ANALYTICS_EXPORT_DIR` instead of keeping misleading env knobs around for compatibility theater.
 - Restore `MAX_OPEN_POSITIONS` once the user explicitly wants it back as a hard safety net. It is still a blunt tool, but that is fine if it is treated honestly as a kill-switch style portfolio cap rather than alpha logic.
+- Organize the production env template by impact, not by historical accident. Telegram, execution/risk, and high-impact signal knobs should be visually obvious because those are the settings people actually reach for during live tuning.
+- Split Telegram control into signal alerts vs execution events. People often want fills and exits without candidate spam; that requires a dedicated signal-alert master switch, not more overloaded summary toggles.

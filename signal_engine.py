@@ -413,6 +413,8 @@ class SignalEngine:
                     and signal_kind != previous_kind
                     and (last_alerted is None or now - last_alerted >= cooldown)
                 )
+                if not self.settings.telegram_signal_alerts_enabled:
+                    eligible_to_alert = False
                 if signal_kind == "watchlist" and not self.settings.watchlist_telegram_enabled:
                     eligible_to_alert = False
                 self.state.intrabar_state[ticker] = signal_kind if should_signal else "neutral"
@@ -430,6 +432,8 @@ class SignalEngine:
                     should_signal
                     and (last_alerted is None or now - last_alerted >= cooldown)
                 )
+                if not self.settings.telegram_signal_alerts_enabled:
+                    eligible_to_alert = False
                 if not should_signal:
                     self.state.reset_intrabar(ticker)
             alerted = False

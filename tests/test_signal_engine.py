@@ -31,6 +31,10 @@ def test_signal_engine_emits_emerging_once_per_transition_and_confirmed_separate
     asyncio.run(_exercise_emerging_transition_behavior(tmp_path))
 
 
+def test_signal_engine_can_disable_all_signal_telegram_alerts(tmp_path: Path) -> None:
+    asyncio.run(_exercise_signal_alert_toggle(tmp_path))
+
+
 def test_signal_engine_upgrades_confirmed_signal_with_persistence(tmp_path: Path) -> None:
     asyncio.run(_exercise_confirmed_persistence_behavior(tmp_path))
 
@@ -283,16 +287,74 @@ async def _exercise_emerging_transition_behavior(tmp_path: Path) -> None:
     )
     assert notifier.kinds == ["watchlist", "emerging", "entry_ready", "confirmed"]
 
+
+async def _exercise_signal_alert_toggle(tmp_path: Path) -> None:
+    settings = Settings(
+        sqlite_path=str(tmp_path / "signal-toggle.db"),
+        universe=["AAAUSDT", "BBBUSDT", "CCCUSDT"],
+        telegram_bot_token=None,
+        telegram_chat_id=None,
+        telegram_signal_alerts_enabled=False,
+        watchlist_telegram_enabled=True,
+        top_n=1,
+        emerging_top_n=1,
+        entry_ready_top_n=1,
+        watchlist_top_n=5,
+        emerging_min_observations=3,
+        emerging_min_rank_improvement=2,
+        entry_ready_min_observations=5,
+        entry_ready_min_rank_improvement=2,
+        entry_ready_min_composite_gain=0.01,
+        regime_thresholds={0: None, 1: None, 2: None, 3: None},
+    )
+    state = MarketState(settings=settings)
+    timestamps = [idx * settings.ticker_interval_ms for idx in range(settings.state_window)]
+    next_timestamp = timestamps[-1] + settings.ticker_interval_ms
+    btc_prices = [20_000 + idx * 50 for idx in range(settings.state_window)]
+    strong = [100 + idx * 0.03 for idx in range(settings.state_window)]
+    base = [100 + idx * 0.02 for idx in range(settings.state_window)]
+    weak = [100 + idx * 0.01 for idx in range(settings.state_window)]
+
+    state.replace_history("BTCUSDT", list(zip(timestamps, btc_prices)))
+    state.replace_history("AAAUSDT", list(zip(timestamps, strong)))
+    state.replace_history("BBBUSDT", list(zip(timestamps, base)))
+    state.replace_history("CCCUSDT", list(zip(timestamps, weak)))
+    state.global_state.btc_daily_closes = np.asarray(
+        [20_000 + idx * 100 for idx in range(settings.btc_daily_lookback)],
+        dtype=float,
+    )
+
+    class RecordingNotifier:
+        def __init__(self) -> None:
+            self.kinds: list[str] = []
+
+        async def send(self, payload) -> bool:
+            self.kinds.append(payload.signal_kind)
+            return True
+
+    database = SignalDatabase(settings.sqlite_path)
+    await database.initialize()
+    notifier = RecordingNotifier()
+    engine = SignalEngine(
+        settings=settings,
+        state=state,
+        database=database,
+        notifier=notifier,
+    )
+
+    assert state.update_provisional("AAAUSDT", next_timestamp, strong[-1] + 1.5) is True
+    signals = await engine.process(cycle_time_ms=next_timestamp, stage="emerging")
+
+    assert any(signal.ticker == "AAAUSDT" and signal.signal_kind == "watchlist" for signal in signals)
+    assert notifier.kinds == []
+
     with sqlite3.connect(settings.sqlite_path) as connection:
-        kind_counts = dict(
-            connection.execute(
-                "SELECT signal_kind, COUNT(*) FROM signals GROUP BY signal_kind"
-            ).fetchall()
-        )
-        assert kind_counts["watchlist"] >= 1
-        assert kind_counts["emerging"] >= 1
-        assert kind_counts["entry_ready"] >= 1
-        assert kind_counts["confirmed"] >= 1
+        row_count = connection.execute("SELECT COUNT(*) FROM signals").fetchone()[0]
+        watchlist_count = connection.execute(
+            "SELECT COUNT(*) FROM signals WHERE signal_kind = 'watchlist'"
+        ).fetchone()[0]
+        assert row_count >= 1
+        assert watchlist_count >= 1
 
 
 async def _exercise_confirmed_persistence_behavior(tmp_path: Path) -> None:

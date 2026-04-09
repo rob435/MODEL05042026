@@ -96,3 +96,5 @@
   - `ANALYTICS_EXPORT_DIR`, which was not consumed by the runtime or sync path
 - Corrected stale spec wording so execution documentation now reflects the current short-only entry path instead of the old long-side behavior.
 - Restored `MAX_OPEN_POSITIONS` as a real live-entry safety net after the user explicitly asked for the portfolio cap back.
+- Reorganized `deploy/production.env.example` by operational impact so Telegram settings, execution/risk controls, and high-impact signal-quality knobs are grouped clearly instead of scattered.
+- Added `TELEGRAM_SIGNAL_ALERTS_ENABLED` so Telegram can be switched into execution-only mode without suppressing entry/exit notifications.

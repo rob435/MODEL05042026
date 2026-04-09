@@ -204,6 +204,7 @@ For the first VPS validation run, use [SOAK_RUN.md](deploy/SOAK_RUN.md) and star
 - Execution is currently short-only. The strategy direction changed, but the ranking engine did not; the current run is explicitly testing the inverted bias rather than claiming a new alpha model.
 - `MAX_OPEN_POSITIONS` is back as a blunt portfolio safety net. It caps the total number of simultaneously open positions, while `MAX_ENTRIES_PER_REBALANCE` separately caps how many new names one rebalance pass may add.
 - `MAX_ENTRIES_PER_REBALANCE` is now the clean way to cap how many fresh positions one `emerging` rebalance pass may open. It does not change ranking; it just limits how many top-ranked `entry_ready` names are allowed through in that batch.
+- `TELEGRAM_SIGNAL_ALERTS_ENABLED=false` is the clean execution-only Telegram mode. With that off and `TELEGRAM_SUMMARY_ENABLED=false`, chat can be reduced to entry/exit execution messages only.
 - `CONFIRMED_STRONG` is not a hard gate. The first valid confirmed bar can still alert as `CONFIRMED`; the signal upgrades to `CONFIRMED_STRONG` when recent confirmed-bar history also supports it.
 - If a candle gap is detected mid-stream, the supervisor falls back to a fresh REST bootstrap instead of pretending state is intact.
 - Cooldown only advances after a successful alert send; a failed Telegram request does not silently suppress the next valid signal.

@@ -686,7 +686,17 @@ async def fetch_minute_replay_plan(
     client: BybitMarketDataClient,
     settings: Settings,
     replay_cycles: int,
+    *,
+    replay_end_ms: int | None = None,
 ) -> MinuteReplayPlan:
+    if replay_end_ms is not None:
+        return await fetch_minute_replay_plan_for_window(
+            client,
+            settings,
+            replay_cycles,
+            replay_end_ms=replay_end_ms,
+        )
+
     confirmed_plan = await fetch_replay_plan(client, settings, replay_cycles, settings.tracked_symbols)
     first_replay_bar_ms = confirmed_plan.replay_timestamps[0]
     last_replay_bar_ms = confirmed_plan.replay_timestamps[-1]
@@ -1811,11 +1821,17 @@ async def fetch_and_run_comprehensive_backtest(
     replay_cycles: int,
     sqlite_path: str,
     intraday_regime_filter_enabled: bool | None = None,
+    end_date: str | None = None,
 ) -> ComprehensiveBacktestResult:
     async with aiohttp.ClientSession() as session:
         client = BybitMarketDataClient(session=session, settings=settings)
         try:
-            plan = await fetch_minute_replay_plan(client, settings, replay_cycles)
+            plan = await fetch_minute_replay_plan(
+                client,
+                settings,
+                replay_cycles,
+                replay_end_ms=_resolve_end_ms(settings, end_date),
+            )
         finally:
             client.close_cache()
     return await run_comprehensive_backtest_plan(
@@ -2544,6 +2560,12 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Optional hard cap on the number of walk-forward windows.",
     )
+    parser.add_argument(
+        "--end-date",
+        type=str,
+        default=None,
+        help="Optional UTC anchor date for ordinary intrabar runs in YYYY-MM-DD. Defaults to now.",
+    )
     return parser.parse_args()
 
 
@@ -2689,7 +2711,12 @@ def main() -> None:
             async with aiohttp.ClientSession() as session:
                 client = BybitMarketDataClient(session=session, settings=settings)
                 try:
-                    plan = await fetch_minute_replay_plan(client, settings, args.cycles)
+                    plan = await fetch_minute_replay_plan(
+                        client,
+                        settings,
+                        args.cycles,
+                        replay_end_ms=_resolve_end_ms(settings, args.end_date),
+                    )
                 finally:
                     client.close_cache()
             filter_on = await run_comprehensive_backtest_plan(
@@ -2726,7 +2753,12 @@ def main() -> None:
             async with aiohttp.ClientSession() as session:
                 client = BybitMarketDataClient(session=session, settings=settings)
                 try:
-                    plan = await fetch_minute_replay_plan(client, settings, args.cycles)
+                    plan = await fetch_minute_replay_plan(
+                        client,
+                        settings,
+                        args.cycles,
+                        replay_end_ms=_resolve_end_ms(settings, args.end_date),
+                    )
                 finally:
                     client.close_cache()
             return await run_comprehensive_backtest_variants(
@@ -2751,6 +2783,7 @@ def main() -> None:
             intraday_regime_filter_enabled=(
                 False if args.disable_intraday_regime_filter else None
             ),
+            end_date=args.end_date,
         )
     )
     if args.export_dir:

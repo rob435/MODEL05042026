@@ -8,6 +8,7 @@
 - Replay tooling exists for recent-candle validation through the production engine path.
 - A minute-aware historical backtest harness now exists in `backtest.py`. It reuses the live `SignalEngine`, replays historical `1m` OHLC inside each `15m` bar, models fees/slippage/exposure caps, and can compare the intraday regime filter on vs off over the same sample.
 - The backtest fetch path now supports an on-disk SQLite candle cache plus explicit prefetch warming through `python backtest.py --prefetch-lookback-days ...`.
+- Ordinary intrabar backtests now also support a fixed UTC anchor via `python backtest.py --end-date YYYY-MM-DD ...`, so a warmed cache can be reused without the default CLI quietly drifting into fresh tail fetches.
 - The backtest now also has an explicit `--research-fast` mode that skips signal-row persistence and post-run signal-summary SQL while keeping trade and equity simulation intact for parameter sweeps.
 - The backtest now also supports generic plan-reuse grids through `--grid-setting KEY=v1,v2,...`, so one fetched `MinuteReplayPlan` can drive many parameter variants without rebuilding the same replay input every time.
 - Variant grids can now also use bounded worker-process parallelism through `--variant-workers` / `BACKTEST_VARIANT_WORKERS`, with each worker loading the same serialized replay-plan snapshot and writing to its own SQLite output.
@@ -20,7 +21,7 @@
 - `main.py` supports bounded live runs with runtime counters for soak validation.
 - Deployment docs now include a dedicated soak-run guide and production env template.
 - Deployment scaffold exists for `systemd`.
-- Local verification is green: `69` tests passing.
+- Local verification is green: `73` tests passing.
 - Cycle processing now batches DB writes and waits briefly for the WebSocket close wave before scoring.
 - Confirmed logs and cooldown are tied to candle event time; emerging alerts use wall-clock detection time because they fire before candle close.
 - Default universe was live-validated against Bybit; `FETUSDT` and `FTMUSDT` were removed after failing validation.

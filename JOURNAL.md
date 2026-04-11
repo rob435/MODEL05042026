@@ -302,3 +302,14 @@
   - `python3 -m pyflakes *.py deploy/*.py tests/*.py`
   - `python3 -m py_compile *.py deploy/*.py`
   - `python3 -m pytest -q` -> `72 passed`
+- Fixed the ordinary intrabar backtest CLI so it can pin to a deterministic UTC anchor date instead of always drifting to "now":
+  - added `--end-date YYYY-MM-DD` for normal single-run, comparison, and grid backtests
+  - wired those paths through the existing window-pinned replay fetch instead of the moving current-time fetch
+  - this stops a warmed cache from still fetching the newest aligned tail and tripping Bybit rate limits during long runs
+- Added regression tests for:
+  - parsing the new general `--end-date` CLI flag
+  - ensuring `fetch_minute_replay_plan()` actually honors an explicit replay end timestamp
+- Reran validation after the backtest anchor fix:
+  - `python3 -m pytest -q tests/test_backtest.py tests/test_replay.py` -> `14 passed`
+  - `python3 -m py_compile backtest.py tests/test_backtest.py`
+  - `python3 -m pytest -q` -> `73 passed`

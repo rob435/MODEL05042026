@@ -1,16 +1,20 @@
 from __future__ import annotations
 
 import asyncio
+import sys
 from pathlib import Path
 
 import pytest
 
+import backtest
 from backtest import (
     BacktestTrade,
     BacktestVariantSummary,
     BacktestVariantSpec,
     HistoricalBacktestSimulator,
     MinuteReplayPlan,
+    fetch_minute_replay_plan,
+    parse_args,
     _build_stress_variant_specs,
     _resolve_window_universe,
     _select_best_variant,
@@ -127,6 +131,50 @@ def test_build_sweep_window_end_times_honors_spacing_and_limit() -> None:
     assert windows[0] > windows[1] > windows[2]
     assert windows[0] - windows[1] == 90 * day_ms
     assert windows[1] - windows[2] == 90 * day_ms
+
+
+def test_parse_args_accepts_general_end_date(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["backtest.py", "--cycles", "96", "--end-date", "2026-04-11"],
+    )
+    args = parse_args()
+    assert args.end_date == "2026-04-11"
+
+
+def test_fetch_minute_replay_plan_uses_explicit_end_ms(monkeypatch: pytest.MonkeyPatch) -> None:
+    settings = Settings()
+    sentinel = MinuteReplayPlan(
+        confirmed_plan=build_replay_plan(
+            history_by_symbol={
+                "BTCUSDT": [(0, 1.0), (settings.ticker_interval_ms, 1.1)],
+            },
+            btc_daily_history=[(0, 20_000.0)],
+            state_window=1,
+            replay_cycles=1,
+        ),
+        intrabar_by_symbol={},
+        btc_daily_history=[],
+        btcdom_history=[],
+    )
+    captured: dict[str, int] = {}
+
+    async def _fake_fetch_for_window(client, settings_arg, replay_cycles, *, replay_end_ms):
+        captured["replay_end_ms"] = replay_end_ms
+        return sentinel
+
+    monkeypatch.setattr(backtest, "fetch_minute_replay_plan_for_window", _fake_fetch_for_window)
+    result = asyncio.run(
+        fetch_minute_replay_plan(
+            client=None,
+            settings=settings,
+            replay_cycles=1,
+            replay_end_ms=123_456_000,
+        )
+    )
+    assert captured["replay_end_ms"] == 123_456_000
+    assert result is sentinel
 
 
 def test_build_variant_specs_creates_cartesian_product() -> None:

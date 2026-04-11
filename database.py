@@ -137,12 +137,10 @@ class SignalDatabase:
                 opened_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
                 closed_at TEXT,
-                confirmed_at TEXT,
                 entry_order_id INTEGER NOT NULL,
                 exit_order_id INTEGER,
                 entry_stage TEXT NOT NULL DEFAULT 'emerging',
                 entry_signal_kind TEXT NOT NULL,
-                confirmation_signal_kind TEXT,
                 quantity REAL NOT NULL,
                 notional_usd REAL NOT NULL,
                 entry_price REAL NOT NULL,
@@ -212,13 +210,11 @@ class SignalDatabase:
                 side TEXT NOT NULL,
                 entry_stage TEXT NOT NULL,
                 entry_signal_kind TEXT NOT NULL,
-                confirmation_signal_kind TEXT,
                 exit_stage TEXT NOT NULL,
                 exit_signal_kind TEXT NOT NULL,
                 exit_event TEXT NOT NULL,
                 exit_reason TEXT NOT NULL DEFAULT '',
                 opened_at TEXT NOT NULL,
-                confirmed_at TEXT,
                 closed_at TEXT NOT NULL,
                 holding_minutes REAL NOT NULL DEFAULT 0,
                 bars_held INTEGER NOT NULL DEFAULT 0,
@@ -793,56 +789,6 @@ class SignalDatabase:
             """
         ).fetchall()
 
-    async def confirm_position(
-        self,
-        position_id: int,
-        confirmation_signal_kind: str,
-        confirmed_at: str,
-        updated_at: str,
-        notes: str = "",
-    ) -> None:
-        await asyncio.to_thread(
-            self._confirm_position_sync,
-            position_id,
-            confirmation_signal_kind,
-            confirmed_at,
-            updated_at,
-            notes,
-        )
-
-    def _confirm_position_sync(
-        self,
-        position_id: int,
-        confirmation_signal_kind: str,
-        confirmed_at: str,
-        updated_at: str,
-        notes: str,
-    ) -> None:
-        self._conn.execute(
-            """
-            UPDATE positions
-            SET confirmation_signal_kind = ?,
-                confirmed_at = ?,
-                updated_at = ?,
-                notes = CASE
-                    WHEN ? = '' THEN notes
-                    WHEN notes = '' THEN ?
-                    ELSE notes || ' | ' || ?
-                END
-            WHERE id = ?
-            """,
-            (
-                confirmation_signal_kind,
-                confirmed_at,
-                updated_at,
-                notes,
-                notes,
-                notes,
-                position_id,
-            ),
-        )
-        self._conn.commit()
-
     async def close_position(
         self,
         position_id: int,
@@ -1047,13 +993,11 @@ class SignalDatabase:
                 side,
                 entry_stage,
                 entry_signal_kind,
-                confirmation_signal_kind,
                 exit_stage,
                 exit_signal_kind,
                 exit_event,
                 exit_reason,
                 opened_at,
-                confirmed_at,
                 closed_at,
                 holding_minutes,
                 bars_held,
@@ -1095,13 +1039,11 @@ class SignalDatabase:
                 :side,
                 :entry_stage,
                 :entry_signal_kind,
-                :confirmation_signal_kind,
                 :exit_stage,
                 :exit_signal_kind,
                 :exit_event,
                 :exit_reason,
                 :opened_at,
-                :confirmed_at,
                 :closed_at,
                 :holding_minutes,
                 :bars_held,

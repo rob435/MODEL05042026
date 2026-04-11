@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import sqlite3
-from decimal import Decimal
 from pathlib import Path
 
 import pytest
@@ -10,7 +9,6 @@ import pytest
 from config import Settings
 from database import SignalDatabase
 from execution import ExecutionEngine
-from exchange import ClosedPnlRecord, InstrumentSpec, VenuePosition
 from signal_engine import RankedSignal
 from state import MarketState
 

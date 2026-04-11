@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -66,14 +67,16 @@ async def fetch_replay_plan(
     symbols: list[str],
 ) -> ReplayPlan:
     required = settings.state_window + replay_cycles
-    if required > 950:
-        raise ValueError("Replay currently supports at most 950 total 15m candles per symbol")
+    interval_ms = settings.ticker_interval_ms
+    aligned_end_ms = (int(time.time() * 1000) // interval_ms) * interval_ms
+    start_ms = aligned_end_ms - (required * interval_ms)
 
     async def _load_symbol(symbol: str) -> tuple[str, list[tuple[int, float]]]:
-        candles = await client.fetch_closed_klines(
+        candles = await client.fetch_closed_klines_range(
             symbol=symbol,
             interval=settings.candle_interval,
-            limit=required,
+            start_ms=start_ms,
+            end_ms=aligned_end_ms,
         )
         return symbol, candles
 

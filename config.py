@@ -83,7 +83,6 @@ class Settings:
     trade_fill_poll_delay_seconds: float = 0.5
     binance_futures_base_url: str = "https://fapi.binance.com"
     candle_interval: str = "15"
-    candle_interval_minutes: int = 15
     state_window: int = 288
     btc_daily_lookback: int = 220
     btc_vol_lookback: int = 30
@@ -172,7 +171,7 @@ class Settings:
 
     @property
     def ticker_interval_ms(self) -> int:
-        return self.candle_interval_minutes * 60 * 1000
+        return int(self.candle_interval) * 60 * 1000
 
     @property
     def ticker_history(self) -> int:
@@ -235,7 +234,6 @@ def load_settings() -> Settings:
             "BINANCE_FUTURES_BASE_URL", "https://fapi.binance.com"
         ),
         candle_interval=os.getenv("CANDLE_INTERVAL", "15"),
-        candle_interval_minutes=_get_int("CANDLE_INTERVAL_MINUTES", 15),
         state_window=_get_int("STATE_WINDOW", 288),
         btc_daily_lookback=_get_int("BTC_DAILY_LOOKBACK", 220),
         btc_vol_lookback=_get_int("BTC_VOL_LOOKBACK", 30),

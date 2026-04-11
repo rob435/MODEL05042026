@@ -9,7 +9,7 @@ import re
 import sqlite3
 import time
 from dataclasses import dataclass
-from decimal import Decimal, ROUND_DOWN, ROUND_HALF_UP
+from decimal import Decimal
 from pathlib import Path
 from urllib.parse import urlencode
 

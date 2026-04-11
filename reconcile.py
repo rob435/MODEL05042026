@@ -102,7 +102,7 @@ def parse_telegram_trade_events(html_text: str) -> list[ActualTradeEvent]:
             )
             continue
         exit_match = re.match(
-            r"(?P<ticker>[A-Z0-9]+USDT) (?P<label>take-profit exit|stop-loss exit|venue-managed exit|exchange exit|confirmed-loss exit)",
+            r"(?P<ticker>[A-Z0-9]+USDT) (?P<label>take-profit exit|stop-loss exit|venue-managed exit|exchange exit)",
             text,
         )
         if exit_match:

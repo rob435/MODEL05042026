@@ -79,7 +79,6 @@ class SimulatedPosition:
     stop_loss_price: float
     entry_fee_usd: float
     entry_slippage_usd: float
-    confirmation_signal_kind: str | None = None
     mfe_pct: float = 0.0
     mae_pct: float = 0.0
     peak_favorable_price: float | None = None
@@ -96,7 +95,6 @@ class BacktestTrade:
     entry_signal_kind: str
     cluster_label: str
     entry_diagnostics: str
-    confirmation_signal_kind: str | None
     exit_reason: str
     quantity: float
     entry_price: float
@@ -882,7 +880,6 @@ async def prefetch_backtest_cache(
 
     day_ms = interval_to_milliseconds("D")
     interval_ms = settings.ticker_interval_ms
-    intrabar_interval_ms = interval_to_milliseconds(settings.backtest_intrabar_interval)
     end_ms = _resolve_end_ms(settings, end_date)
     price_start_ms = end_ms - (lookback_days * day_ms) - (settings.state_window * interval_ms)
     intrabar_start_ms = end_ms - (lookback_days * day_ms)
@@ -1188,7 +1185,6 @@ class HistoricalBacktestSimulator:
             entry_signal_kind=position.entry_signal_kind,
             cluster_label=position.cluster_label,
             entry_diagnostics=position.entry_diagnostics,
-            confirmation_signal_kind=position.confirmation_signal_kind,
             exit_reason=exit_reason,
             quantity=position.quantity,
             entry_price=position.entry_price,

@@ -59,7 +59,6 @@ def test_post_exit_tracking_populates_trade_follow_through_metrics() -> None:
             entry_signal_kind="entry_ready",
             cluster_label="corr:AAAUSDT",
             entry_diagnostics="ref=cluster_relative:corr:AAAUSDT",
-            confirmation_signal_kind=None,
             exit_reason="take_profit",
             quantity=1.0,
             entry_price=99.0,

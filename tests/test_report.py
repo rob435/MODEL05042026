@@ -52,7 +52,7 @@ def test_load_report_summary_aggregates_signal_rows(tmp_path: Path) -> None:
     assert summary.first_timestamp == "2026-04-03T00:00:00+00:00"
     assert summary.last_timestamp == "2026-04-03T00:15:00+00:00"
     assert summary.stage_counts == [("confirmed", 1, 1), ("emerging", 2, 0)]
-    assert summary.signal_kind_counts == [("confirmed", 1, 1), ("none", 1, 0), ("watchlist", 1, 0)]
+    assert summary.signal_kind_counts == [("watchlist", 1, 0), ("legacy_confirmed", 1, 1), ("none", 1, 0)]
     assert summary.top_tickers[0][0] == "AAAUSDT"
     assert summary.top_tickers[0][1] == 2
     assert summary.top_tickers[0][2] == 1
@@ -66,7 +66,7 @@ def test_format_report_renders_expected_sections() -> None:
             "first_timestamp": "a",
             "last_timestamp": "b",
             "stage_counts": [("confirmed", 1, 1), ("emerging", 1, 0)],
-            "signal_kind_counts": [("confirmed", 1, 1), ("watchlist", 1, 0)],
+            "signal_kind_counts": [("legacy_confirmed", 1, 1), ("watchlist", 1, 0)],
             "top_tickers": [("AAAUSDT", 2, 1, 1.25, 2.5)],
         })()
     )
@@ -75,6 +75,7 @@ def test_format_report_renders_expected_sections() -> None:
     assert "Alerted rows: 1" in rendered
     assert "emerging: rows=1 alerts=0" in rendered
     assert "watchlist: rows=1 alerts=0" in rendered
+    assert "legacy_confirmed: rows=1 alerts=1" in rendered
     assert "AAAUSDT: rows=2 alerts=1" in rendered
     assert rendered.index("Stage rows:") < rendered.index("  confirmed: rows=1 alerts=1")
     assert rendered.index("Signal kinds:") < rendered.index("  watchlist: rows=1 alerts=0")

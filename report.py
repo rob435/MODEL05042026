@@ -15,17 +15,15 @@ SIGNAL_KIND_ORDER = {
     "watchlist": 0,
     "emerging": 1,
     "entry_ready": 2,
-    "confirmed": 3,
-    "confirmed_strong": 4,
-    "none": 5,
+    "legacy_confirmed": 3,
+    "none": 4,
 }
 
 SIGNAL_KIND_LABELS = {
     "watchlist": "broad intrabar context",
     "emerging": "building intrabar setup",
     "entry_ready": "tradeable intrabar entry candidate",
-    "confirmed": "legacy confirmed row",
-    "confirmed_strong": "legacy confirmed upgrade row",
+    "legacy_confirmed": "historical confirmed-era row",
     "none": "no signal",
 }
 
@@ -35,7 +33,6 @@ TRADE_EXPORT_COLUMNS = [
     "ticker",
     "side",
     "entry_signal_kind",
-    "confirmation_signal_kind",
     "exit_reason",
     "entry_price",
     "exit_price",
@@ -213,6 +210,15 @@ def _timestamp_to_day(value: Any) -> str | None:
     return timestamp.date().isoformat()
 
 
+def _normalize_signal_kind(value: Any) -> str:
+    if value in (None, ""):
+        return "legacy_confirmed"
+    normalized = str(value).strip()
+    if normalized in {"confirmed", "confirmed_strong"}:
+        return "legacy_confirmed"
+    return normalized
+
+
 def _is_short_side(side: Any) -> bool:
     if side is None:
         return False
@@ -284,9 +290,6 @@ def _normalize_trade_row(row: dict[str, Any]) -> dict[str, Any]:
         "side": str(side) if side is not None else None,
         "entry_signal_kind": _first_present(
             row, ("entry_signal_kind", "signal_kind", "signal", "entry_kind")
-        ),
-        "confirmation_signal_kind": _first_present(
-            row, ("confirmation_signal_kind", "confirmed_signal_kind", "confirmation_kind")
         ),
         "exit_reason": exit_reason,
         "entry_price": entry_price,
@@ -413,38 +416,46 @@ def _load_signal_summary(connection: sqlite3.Connection, top_n: int) -> tuple[
     stage_counts = connection.execute(
         """
         SELECT
-            COALESCE(stage, 'confirmed') AS stage,
+            COALESCE(stage, 'unknown') AS stage,
             COUNT(*) AS total_rows,
             COALESCE(SUM(alerted), 0) AS alerted_rows
         FROM signals
-        GROUP BY COALESCE(stage, 'confirmed')
+        GROUP BY COALESCE(stage, 'unknown')
         ORDER BY stage ASC
         """
     ).fetchall()
     if "signal_kind" in existing_columns:
-        signal_kind_counts = connection.execute(
+        raw_signal_kind_counts = connection.execute(
             """
             SELECT
-                COALESCE(signal_kind, 'confirmed') AS signal_kind,
+                signal_kind AS signal_kind,
                 COUNT(*) AS total_rows,
                 COALESCE(SUM(alerted), 0) AS alerted_rows
             FROM signals
-            GROUP BY COALESCE(signal_kind, 'confirmed')
+            GROUP BY signal_kind
             ORDER BY signal_kind ASC
             """
         ).fetchall()
     else:
-        signal_kind_counts = connection.execute(
+        raw_signal_kind_counts = connection.execute(
             """
             SELECT
-                COALESCE(stage, 'confirmed') AS signal_kind,
+                stage AS signal_kind,
                 COUNT(*) AS total_rows,
                 COALESCE(SUM(alerted), 0) AS alerted_rows
             FROM signals
-            GROUP BY COALESCE(stage, 'confirmed')
+            GROUP BY stage
             ORDER BY signal_kind ASC
             """
         ).fetchall()
+    normalized_signal_kind_counts: dict[str, tuple[int, int]] = {}
+    for signal_kind, kind_rows, kind_alerts in raw_signal_kind_counts:
+        normalized = _normalize_signal_kind(signal_kind)
+        prior_rows, prior_alerts = normalized_signal_kind_counts.get(normalized, (0, 0))
+        normalized_signal_kind_counts[normalized] = (
+            prior_rows + int(kind_rows),
+            prior_alerts + int(kind_alerts),
+        )
     top_tickers = connection.execute(
         """
         SELECT
@@ -470,8 +481,11 @@ def _load_signal_summary(connection: sqlite3.Connection, top_n: int) -> tuple[
             for stage, stage_rows, stage_alerts in stage_counts
         ],
         [
-            (str(signal_kind), int(kind_rows), int(kind_alerts))
-            for signal_kind, kind_rows, kind_alerts in signal_kind_counts
+            (signal_kind, kind_rows, kind_alerts)
+            for signal_kind, (kind_rows, kind_alerts) in sorted(
+                normalized_signal_kind_counts.items(),
+                key=lambda item: (SIGNAL_KIND_ORDER.get(item[0], 99), item[0]),
+            )
         ],
         [
             (str(ticker), int(ticker_rows), int(ticker_alerts), float(avg_composite), float(max_composite))
@@ -821,13 +835,18 @@ def format_report(summary: ReportSummary) -> str:
     if not summary.signal_kind_counts:
         lines.append("  none")
     else:
-        lines.append("  legend:")
-        for signal_kind in ("watchlist", "emerging", "entry_ready", "confirmed", "confirmed_strong"):
-            lines.append(f"    {signal_kind}: {SIGNAL_KIND_LABELS[signal_kind]}")
         ordered_signal_kinds = sorted(
             summary.signal_kind_counts,
             key=lambda item: (SIGNAL_KIND_ORDER.get(item[0], 99), item[0]),
         )
+        legend_rows = [
+            f"    {signal_kind}: {SIGNAL_KIND_LABELS[signal_kind]}"
+            for signal_kind, _, _ in ordered_signal_kinds
+            if signal_kind in SIGNAL_KIND_LABELS
+        ]
+        if legend_rows:
+            lines.append("  legend:")
+            lines.extend(legend_rows)
         for signal_kind, total_rows, alerted_rows in ordered_signal_kinds:
             lines.append(f"  {signal_kind}: rows={total_rows} alerts={alerted_rows}")
     lines.append("Top tickers:")

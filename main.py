@@ -202,7 +202,6 @@ async def queue_consumer_loop(
                 break
         try:
             async with process_lock:
-                signals: list[RankedSignal]
                 ranking_summary = ""
                 if stage == "emerging":
                     signals = await engine.process(cycle_time_ms=cycle_time_ms, stage=stage)

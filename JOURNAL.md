@@ -282,3 +282,23 @@
   - `deploy/setup_windows.ps1` bootstraps a Windows box, optionally restores a cache bundle, and runs `pytest -q`
 - Updated `README.md` so the PC setup and cache-handoff flow now live in the repo rather than in chat memory.
 - Added focused tests for the new deploy helpers and cache bundle round-trip path.
+- Ran a deliberate cleanup pass against the current codebase with `pyflakes`, `vulture`, `py_compile`, and the full test suite instead of relying on “looks fine” optimism.
+- Removed actual dead code and duplicated config surface:
+  - dropped the unused `intrabar_interval_ms` local in `prefetch_backtest_cache`
+  - removed unused imports in `exchange.py`, `runtime_monitor.py`, and `tests/test_analytics.py`
+  - removed the stray local `RankedSignal` annotation in `main.py` that `pyflakes` correctly flagged as undefined
+  - removed the duplicate `CANDLE_INTERVAL_MINUTES` setting and now derive `ticker_interval_ms` directly from `CANDLE_INTERVAL`
+- Reran validation after the cleanup:
+  - `python3 -m pyflakes *.py deploy/*.py tests/*.py`
+  - `python3 -m py_compile *.py deploy/*.py`
+  - `python3 -m pytest -q` -> `72 passed`
+- Did the deeper legacy cleanup around the old confirmed-era compatibility layer:
+  - removed the dead `confirmed_exit` Telegram/reconciliation label
+  - stopped new runtime writes from carrying `confirmation_signal_kind` / `confirmed_at` through positions-to-trade-analytics
+  - removed the dead `confirm_position()` DB API entirely
+  - removed confirmation fields from the backtest trade model and trade CSV export
+  - changed the report layer to collapse old `confirmed` / `confirmed_strong` signal kinds into one explicit `legacy_confirmed` bucket instead of pretending they are still current signal tiers
+- Reran validation after the legacy cleanup:
+  - `python3 -m pyflakes *.py deploy/*.py tests/*.py`
+  - `python3 -m py_compile *.py deploy/*.py`
+  - `python3 -m pytest -q` -> `72 passed`

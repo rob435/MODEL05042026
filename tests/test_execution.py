@@ -144,14 +144,14 @@ async def _exercise_execution_take_profit_lifecycle(tmp_path: Path) -> None:
         )
         position = connection.execute(
             """
-            SELECT status, confirmation_signal_kind, entry_price, exit_price
+            SELECT status, entry_price, exit_price
             FROM positions
             WHERE ticker = 'AAAUSDT'
             """
         ).fetchone()
 
     assert order_counts == {"entry": 1, "exit": 1}
-    assert position == ("closed", None, 101.0, 103.1)
+    assert position == ("closed", 101.0, 103.1)
     assert notifier.events == [("enter_long", "AAAUSDT"), ("take_profit_exit", "AAAUSDT")]
 
 

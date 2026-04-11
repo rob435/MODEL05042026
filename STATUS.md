@@ -113,6 +113,15 @@
   - `deploy/prepare_local_env.py` writes a safe local `.env`
   - `deploy/cache_bundle.py` transfers the large backtest cache between machines
   - `deploy/setup_windows.ps1` bootstraps a Windows research PC around those helpers
+- Static cleanup now matches the runtime contract better:
+  - `pyflakes` is clean across repo code, deploy helpers, and tests
+  - the duplicate `CANDLE_INTERVAL_MINUTES` knob is gone
+  - obvious dead locals/imports were removed instead of being left as low-grade repo noise
+- The old confirmed-era compatibility layer is now narrower and more honest:
+  - live writes no longer propagate dead confirmation fields
+  - the dead `confirm_position()` database API is gone
+  - trade exports no longer expose `confirmation_signal_kind`
+  - old `confirmed` / `confirmed_strong` signal rows still read, but they now collapse into a single `legacy_confirmed` report bucket
 
 ## Remaining risks
 
@@ -138,6 +147,8 @@
 - The new drift monitor is periodic and symbol-by-symbol. It is good enough for a first control layer, but it is not a private-websocket reconciliation engine.
 - The runtime control plane is now real, but it is still SQLite-based and local-process based. That is appropriate for this repo; it is not the same thing as institutional monitoring infrastructure.
 - The Windows bootstrap itself is only lightly validated here. The risky logic lives in Python helpers and is tested; the PowerShell wrapper still needs one real run on the target PC.
+- There are still intentional legacy compatibility paths in reporting and schema handling for old `confirmed`/`confirmed_strong` data. They are not live-strategy logic anymore, but they are still serving historical DB reads, so they were left in place deliberately.
+- Existing SQLite databases may still physically contain `confirmation_signal_kind` / `confirmed_at` columns from older runs. The new code no longer writes or depends on them, but cleaning the on-disk schema itself would require an explicit SQLite table-rebuild migration.
 - TP/SL is checked only when the runtime processes a cycle. There is no separate sub-second price watcher, so a violent move can still gap through the exact configured threshold.
 - Venue exit reconciliation is polling-based, not websocket-based. Telegram exit messages and SQLite close state will lag until the next engine cycle sees that Bybit has already closed the position.
 - A real demo smoke entry was executed successfully on `SOLUSDT`; the venue accepted the order and TP/SL were installed. There is now a live demo position unless it has already exited on Bybit.

@@ -13,7 +13,14 @@
 - The backtest now also has an explicit `--research-fast` mode that skips signal-row persistence and post-run signal-summary SQL while keeping trade and equity simulation intact for parameter sweeps.
 - The backtest now also supports generic plan-reuse grids through `--grid-setting KEY=v1,v2,...`, so one fetched `MinuteReplayPlan` can drive many parameter variants without rebuilding the same replay input every time.
 - Variant grids can now also use bounded worker-process parallelism through `--variant-workers` / `BACKTEST_VARIANT_WORKERS`, with each worker loading the same serialized replay-plan snapshot and writing to its own SQLite output.
+- Variant grids now also support checkpoint/resume via `--resume-variants`, using `variant_summary.csv` as the persisted completion state for interrupted long runs.
 - Comprehensive backtests now also record bounded post-exit follow-through per trade (`post_exit_best_pct`, `post_exit_worst_pct`, `volatility_pct`) plus corresponding summary averages, so TP/SL research can use actual modeled after-close behavior instead of only in-trade excursion stats.
+- Backtest fetch phases now expose real cache/network visibility from `exchange.py`: cache hits, misses, stored candles, and Bybit/Binance HTTP request counts.
+- Grid exports are stronger now: `variant_summary.csv`, `variant_ranked_summary.csv`, `variant_best_summary.csv`, and `best_variant_trades.csv` all land under the export directory.
+- `backtest.py` can now run Telegram-vs-backtest reconciliation directly for exported runs via `--reconcile-telegram-html`; grid runs reconcile the current best variant.
+- `reconcile.py` now exports ticker-level alignment diagnostics in `ticker_reconciliation.csv` and reports unique-ticker precision/recall in addition to raw entry/exit event metrics.
+- `reconcile.py` can now also load actual forward trades directly from the live SQLite `trade_analytics` table for a UTC day, and SQLite now persists those summaries in `reconciliation_runs`.
+- `deploy/run_daily_forward_reconcile.sh` now exists as the end-of-day forward-testing wrapper. It runs the prior UTC day backtest, reconciles against the live DB, exports the files, and logs the summary back into SQLite without touching the live process.
 - `BACKTEST_RESEARCH_PLAN.md` now exists and defines the repo's testing workflow for parameter pruning, interaction checks, TP/SL tuning, portfolio-throttle tuning, and final long-horizon validation.
 - Universe validation tooling exists for checking the manual symbol list against Bybit’s current instruments.
 - SQLite reporting tooling exists for quick inspection of replay and live signal logs.
@@ -22,7 +29,7 @@
 - `main.py` supports bounded live runs with runtime counters for soak validation.
 - Deployment docs now include a dedicated soak-run guide and production env template.
 - Deployment scaffold exists for `systemd`.
-- Local verification is green: `73` tests passing.
+- Local verification is green: `79` tests passing.
 - Cycle processing now batches DB writes and waits briefly for the WebSocket close wave before scoring.
 - Confirmed logs and cooldown are tied to candle event time; emerging alerts use wall-clock detection time because they fire before candle close.
 - Default universe was live-validated against Bybit; `FETUSDT` and `FTMUSDT` were removed after failing validation.
@@ -68,7 +75,7 @@
 - This checkout now has a real repo-root `.env` again, with Bybit demo execution enabled and `SQLITE_PATH` pointed at the local workspace database instead of the VPS example path.
 - Telegram is still not configured in this checkout because no local `TELEGRAM_BOT_TOKEN` or `TELEGRAM_CHAT_ID` were available to write into `.env`.
 - The local `signals.sqlite3` has been confirmed stale relative to the exported Telegram session. It is valid local state, but it is not the DB that produced the observed `entry_ready` alerts and `SOLUSDT` demo entry in chat.
-- A macOS pull-sync path is now documented: a local `launchd` job can run `deploy/sync_exports.sh` once per day, fetch the VPS analytics export bundle, and write logs under `~/Library/Logs/`.
+- A macOS pull-sync path is now documented: a local `launchd` job can run `deploy/sync_exports.sh` once per day, fetch the VPS analytics export bundle, mirror `reconciliation-daily/`, and write logs under `~/Library/Logs/`.
 - Backtest config now has explicit env knobs for starting equity, fee rate, slippage, gross exposure cap, and intrabar replay interval, and the production env template documents them in a dedicated research section.
 - The first minute-aware filter comparison is mildly encouraging:
   - latest `96` confirmed bars with filter `on`: `6` trades, `+$1,418.66` net, `+1.42%`, `1.79%` max drawdown

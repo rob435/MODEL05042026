@@ -45,4 +45,8 @@ async def _exercise_cached_ohlc_range(tmp_path: Path) -> None:
 
     assert loaded == candles
     assert client.cached_candle_count() == 3
+    stats = client.cache_stats_snapshot()
+    assert stats.cache_hits == 1
+    assert stats.cache_misses == 0
+    assert stats.bybit_http_requests == 0
     client.close_cache()

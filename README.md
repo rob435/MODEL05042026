@@ -207,6 +207,34 @@ That is the plan-reuse path. The market history is fetched once, the replay plan
 
 `--variant-workers` runs those variants in separate worker processes. Use it on real research hardware, not on the same small VPS that is running live trading.
 
+For long runs, pin the horizon explicitly so the warmed cache and the backtest are talking about the same window:
+
+```bash
+python backtest.py \
+  --cycles 35040 \
+  --end-date 2026-04-11 \
+  --variant-workers 4 \
+  --grid-setting momentum_reference_mode=basket_relative,cluster_relative,hybrid_relative \
+  --grid-setting cluster_assignment_mode=dynamic,hybrid
+```
+
+The runner now prints blunt phase messages and cache/network stats while it works, so you can tell whether it is fetching history, building the replay plan, running variants, or exporting.
+
+For interrupted long grids, use checkpoint/resume:
+
+```bash
+python backtest.py \
+  --cycles 35040 \
+  --end-date 2026-04-11 \
+  --variant-workers 4 \
+  --export-dir ./year-grid \
+  --resume-variants \
+  --grid-setting hurst_cutoff=0.50,0.55,0.60 \
+  --grid-setting intraday_regime_min_pass_count=2,3
+```
+
+That resumes from `./year-grid/variant_summary.csv` and skips variants that already completed.
+
 For built-in stress testing, add one or more `--stress-profile` flags:
 
 ```bash
@@ -248,7 +276,47 @@ python reconcile.py \
   --tolerance-minutes 30
 ```
 
-The reconciliation output now includes precision, recall, average timestamp deltas, and exit-reason agreement, plus `matched_entries.csv` and `matched_exits.csv` alongside the unmatched rows.
+The reconciliation output now includes:
+
+- entry and exit precision / recall
+- average timestamp deltas
+- exit-reason agreement
+- unique-ticker precision / recall
+- `ticker_reconciliation.csv` for per-ticker mismatch diagnosis
+- `matched_entries.csv` and `matched_exits.csv` alongside the unmatched rows
+
+If you already want a normal exported backtest, `backtest.py` can run the reconciliation step directly:
+
+```bash
+python backtest.py \
+  --cycles 35040 \
+  --end-date 2026-04-11 \
+  --export-dir ./year-backtest \
+  --reconcile-telegram-html ./messages.html
+```
+
+For grid runs, the built-in reconciliation targets the current best variant and writes the result under `best_variant_reconciliation/`.
+
+For daily forward testing, use the shipped wrapper instead of assembling the command by hand:
+
+```bash
+./deploy/run_daily_forward_reconcile.sh
+```
+
+That defaults to:
+
+- previous UTC day
+- `signals.sqlite3` as both the live trade source and reconciliation log DB
+- `96` cycles
+- exports under `./reconciliation-daily/YYYY-MM-DD/`
+
+You can also pin a specific UTC day:
+
+```bash
+./deploy/run_daily_forward_reconcile.sh 2026-04-11
+```
+
+This is the sane cron/systemd entrypoint for end-of-day forward-vs-backtest checking. It does not touch the live trading loop.
 
 ## Universe Validation
 
@@ -290,7 +358,8 @@ The intended flow is:
 
 1. A local script at `deploy/sync_exports.sh` creates a safe SQLite backup on the VPS at `root@204.168.202.167`.
 2. The script pulls the backup down to the Mac and also captures the latest `systemctl status` and `journalctl` tail.
-3. `report.py --export-dir ...` then regenerates local CSVs for analysis from the pulled SQLite copy.
+3. The same sync also pulls the VPS `reconciliation-daily/` tree so forward-vs-backtest daily checks do not stay stranded on the server.
+4. `report.py --export-dir ...` then regenerates local CSVs for analysis from the pulled SQLite copy.
 
 The shipped launchd template is [deploy/model050426-export-sync.plist](deploy/model050426-export-sync.plist). It runs once per day at `09:00` local time and writes logs to `~/Library/Logs/model050426-export-sync.log` and `~/Library/Logs/model050426-export-sync.err`.
 
@@ -306,6 +375,7 @@ Default local output paths:
 
 - SQLite backup: `~/MODEL050426-sync/db/signals.sqlite3`
 - CSV exports: `~/MODEL050426-sync/exports/latest/`
+- daily reconciliation exports: `~/MODEL050426-sync/reconciliation-daily/`
 - rendered report text: `~/MODEL050426-sync/reports/latest.txt`
 - remote service status: `~/MODEL050426-sync/logs/vps-status.txt`
 - remote journal tail: `~/MODEL050426-sync/logs/journal-tail.log`

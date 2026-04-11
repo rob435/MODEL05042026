@@ -368,6 +368,36 @@ class SignalDatabase:
         )
         self._conn.execute(
             """
+            CREATE TABLE IF NOT EXISTS reconciliation_runs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                created_at TEXT NOT NULL,
+                window_date TEXT NOT NULL,
+                actual_source TEXT NOT NULL,
+                backtest_source TEXT NOT NULL,
+                actual_entries INTEGER NOT NULL DEFAULT 0,
+                backtest_entries INTEGER NOT NULL DEFAULT 0,
+                matched_entries INTEGER NOT NULL DEFAULT 0,
+                entry_precision REAL NOT NULL DEFAULT 0,
+                entry_recall REAL NOT NULL DEFAULT 0,
+                actual_exits INTEGER NOT NULL DEFAULT 0,
+                backtest_exits INTEGER NOT NULL DEFAULT 0,
+                matched_exits INTEGER NOT NULL DEFAULT 0,
+                exit_precision REAL NOT NULL DEFAULT 0,
+                exit_recall REAL NOT NULL DEFAULT 0,
+                matched_exit_reason_count INTEGER NOT NULL DEFAULT 0,
+                mismatched_exit_reason_count INTEGER NOT NULL DEFAULT 0,
+                actual_unique_tickers INTEGER NOT NULL DEFAULT 0,
+                backtest_unique_tickers INTEGER NOT NULL DEFAULT 0,
+                matched_unique_tickers INTEGER NOT NULL DEFAULT 0,
+                ticker_precision REAL NOT NULL DEFAULT 0,
+                ticker_recall REAL NOT NULL DEFAULT 0,
+                export_dir TEXT NOT NULL DEFAULT '',
+                notes TEXT NOT NULL DEFAULT ''
+            )
+            """
+        )
+        self._conn.execute(
+            """
             CREATE INDEX IF NOT EXISTS idx_signals_ticker_timestamp
             ON signals (ticker, timestamp)
             """
@@ -426,6 +456,12 @@ class SignalDatabase:
             """
             CREATE INDEX IF NOT EXISTS idx_runtime_events_run_time
             ON runtime_events (run_id, created_at)
+            """
+        )
+        self._conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_reconciliation_runs_window_time
+            ON reconciliation_runs (window_date, created_at)
             """
         )
         self._conn.commit()
@@ -1594,6 +1630,144 @@ class SignalDatabase:
             """,
             (run_id, limit),
         ).fetchall()
+
+    async def record_reconciliation_run(
+        self,
+        *,
+        created_at: str,
+        window_date: str,
+        actual_source: str,
+        backtest_source: str,
+        actual_entries: int,
+        backtest_entries: int,
+        matched_entries: int,
+        entry_precision: float,
+        entry_recall: float,
+        actual_exits: int,
+        backtest_exits: int,
+        matched_exits: int,
+        exit_precision: float,
+        exit_recall: float,
+        matched_exit_reason_count: int,
+        mismatched_exit_reason_count: int,
+        actual_unique_tickers: int,
+        backtest_unique_tickers: int,
+        matched_unique_tickers: int,
+        ticker_precision: float,
+        ticker_recall: float,
+        export_dir: str = "",
+        notes: str = "",
+    ) -> int:
+        return await asyncio.to_thread(
+            self._record_reconciliation_run_sync,
+            created_at,
+            window_date,
+            actual_source,
+            backtest_source,
+            actual_entries,
+            backtest_entries,
+            matched_entries,
+            entry_precision,
+            entry_recall,
+            actual_exits,
+            backtest_exits,
+            matched_exits,
+            exit_precision,
+            exit_recall,
+            matched_exit_reason_count,
+            mismatched_exit_reason_count,
+            actual_unique_tickers,
+            backtest_unique_tickers,
+            matched_unique_tickers,
+            ticker_precision,
+            ticker_recall,
+            export_dir,
+            notes,
+        )
+
+    def _record_reconciliation_run_sync(
+        self,
+        created_at: str,
+        window_date: str,
+        actual_source: str,
+        backtest_source: str,
+        actual_entries: int,
+        backtest_entries: int,
+        matched_entries: int,
+        entry_precision: float,
+        entry_recall: float,
+        actual_exits: int,
+        backtest_exits: int,
+        matched_exits: int,
+        exit_precision: float,
+        exit_recall: float,
+        matched_exit_reason_count: int,
+        mismatched_exit_reason_count: int,
+        actual_unique_tickers: int,
+        backtest_unique_tickers: int,
+        matched_unique_tickers: int,
+        ticker_precision: float,
+        ticker_recall: float,
+        export_dir: str,
+        notes: str,
+    ) -> int:
+        cursor = self._conn.execute(
+            """
+            INSERT INTO reconciliation_runs (
+                created_at,
+                window_date,
+                actual_source,
+                backtest_source,
+                actual_entries,
+                backtest_entries,
+                matched_entries,
+                entry_precision,
+                entry_recall,
+                actual_exits,
+                backtest_exits,
+                matched_exits,
+                exit_precision,
+                exit_recall,
+                matched_exit_reason_count,
+                mismatched_exit_reason_count,
+                actual_unique_tickers,
+                backtest_unique_tickers,
+                matched_unique_tickers,
+                ticker_precision,
+                ticker_recall,
+                export_dir,
+                notes
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                created_at,
+                window_date,
+                actual_source,
+                backtest_source,
+                actual_entries,
+                backtest_entries,
+                matched_entries,
+                entry_precision,
+                entry_recall,
+                actual_exits,
+                backtest_exits,
+                matched_exits,
+                exit_precision,
+                exit_recall,
+                matched_exit_reason_count,
+                mismatched_exit_reason_count,
+                actual_unique_tickers,
+                backtest_unique_tickers,
+                matched_unique_tickers,
+                ticker_precision,
+                ticker_recall,
+                export_dir,
+                notes,
+            ),
+        )
+        self._conn.commit()
+        return int(cursor.lastrowid)
 
     def close(self) -> None:
         self._conn.close()

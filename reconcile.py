@@ -1,12 +1,16 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import csv
 import html
 import re
+from collections import defaultdict
 from dataclasses import asdict, dataclass
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
+
+from database import SignalDatabase
 
 
 MESSAGE_RE = re.compile(
@@ -56,11 +60,32 @@ class ReconciliationSummary:
     avg_exit_delta_seconds: float | None
     matched_exit_reason_count: int
     mismatched_exit_reason_count: int
+    actual_unique_tickers: int
+    backtest_unique_tickers: int
+    matched_unique_tickers: int
+    ticker_precision: float
+    ticker_recall: float
+
+
+@dataclass(slots=True)
+class TickerReconciliationSummary:
+    ticker: str
+    actual_entries: int
+    backtest_entries: int
+    matched_entries: int
+    actual_exits: int
+    backtest_exits: int
+    matched_exits: int
+    avg_entry_delta_seconds: float | None
+    avg_exit_delta_seconds: float | None
+    matched_exit_reason_count: int
+    mismatched_exit_reason_count: int
 
 
 @dataclass(slots=True)
 class ReconciliationResult:
     summary: ReconciliationSummary
+    tickers: list[TickerReconciliationSummary]
     matched_entries: list[MatchedTradeEvent]
     matched_exits: list[MatchedTradeEvent]
     unmatched_actual_entries: list[ActualTradeEvent]
@@ -150,6 +175,61 @@ def load_backtest_trade_events(csv_path: str) -> list[ActualTradeEvent]:
     return events
 
 
+def previous_utc_date_label() -> str:
+    return (datetime.now(timezone.utc).date() - timedelta(days=1)).isoformat()
+
+
+def resolve_trade_date(trade_date: str | None) -> str:
+    return trade_date or previous_utc_date_label()
+
+
+def load_actual_trade_events_from_db(db_path: str, *, trade_date: str | None = None) -> list[ActualTradeEvent]:
+    resolved_trade_date = resolve_trade_date(trade_date)
+    database = SignalDatabase(str(Path(db_path).expanduser()))
+    try:
+        rows = database._conn.execute(
+            """
+            SELECT ticker, side, opened_at, closed_at, exit_reason
+            FROM trade_analytics
+            WHERE substr(opened_at, 1, 10) = ?
+               OR substr(closed_at, 1, 10) = ?
+            ORDER BY opened_at ASC, closed_at ASC, ticker ASC
+            """,
+            (resolved_trade_date, resolved_trade_date),
+        ).fetchall()
+    finally:
+        database.close()
+
+    events: list[ActualTradeEvent] = []
+    for row in rows:
+        ticker = str(row["ticker"]).strip()
+        side = str(row["side"]).strip().upper()
+        opened_at = str(row["opened_at"]).strip()
+        closed_at = str(row["closed_at"]).strip()
+        exit_reason = str(row["exit_reason"] or "").strip() or None
+        if ticker and opened_at.startswith(resolved_trade_date):
+            events.append(
+                ActualTradeEvent(
+                    timestamp=opened_at,
+                    ticker=ticker,
+                    event="entry",
+                    side=side,
+                    reason="entry",
+                )
+            )
+        if ticker and closed_at.startswith(resolved_trade_date):
+            events.append(
+                ActualTradeEvent(
+                    timestamp=closed_at,
+                    ticker=ticker,
+                    event="exit",
+                    side=side,
+                    reason=exit_reason,
+                )
+            )
+    return events
+
+
 def _match_events(
     actual: list[ActualTradeEvent],
     backtest: list[ActualTradeEvent],
@@ -228,6 +308,17 @@ def reconcile_trade_events(
     )
     matched_exit_reason_count = sum(1 for row in matched_exits if row.reason_match is True)
     mismatched_exit_reason_count = sum(1 for row in matched_exits if row.reason_match is False)
+    actual_tickers = {event.ticker for event in actual_events}
+    backtest_tickers = {event.ticker for event in backtest_events}
+    matched_tickers = {row.ticker for row in matched_entries} | {row.ticker for row in matched_exits}
+    ticker_rows = _summarize_tickers(
+        actual_entries=actual_entries,
+        backtest_entries=backtest_entries,
+        actual_exits=actual_exits,
+        backtest_exits=backtest_exits,
+        matched_entries=matched_entries,
+        matched_exits=matched_exits,
+    )
     return ReconciliationResult(
         summary=ReconciliationSummary(
             actual_entries=len(actual_entries),
@@ -252,7 +343,13 @@ def reconcile_trade_events(
             ),
             matched_exit_reason_count=matched_exit_reason_count,
             mismatched_exit_reason_count=mismatched_exit_reason_count,
+            actual_unique_tickers=len(actual_tickers),
+            backtest_unique_tickers=len(backtest_tickers),
+            matched_unique_tickers=len(matched_tickers),
+            ticker_precision=(len(matched_tickers) / len(backtest_tickers)) if backtest_tickers else 0.0,
+            ticker_recall=(len(matched_tickers) / len(actual_tickers)) if actual_tickers else 0.0,
         ),
+        tickers=ticker_rows,
         matched_entries=matched_entries,
         matched_exits=matched_exits,
         unmatched_actual_entries=unmatched_actual_entries,
@@ -260,6 +357,70 @@ def reconcile_trade_events(
         unmatched_actual_exits=unmatched_actual_exits,
         unmatched_backtest_exits=unmatched_backtest_exits,
     )
+
+
+def _summarize_tickers(
+    *,
+    actual_entries: list[ActualTradeEvent],
+    backtest_entries: list[ActualTradeEvent],
+    actual_exits: list[ActualTradeEvent],
+    backtest_exits: list[ActualTradeEvent],
+    matched_entries: list[MatchedTradeEvent],
+    matched_exits: list[MatchedTradeEvent],
+) -> list[TickerReconciliationSummary]:
+    entry_actual_counts: dict[str, int] = defaultdict(int)
+    entry_backtest_counts: dict[str, int] = defaultdict(int)
+    exit_actual_counts: dict[str, int] = defaultdict(int)
+    exit_backtest_counts: dict[str, int] = defaultdict(int)
+    matched_entry_rows: dict[str, list[MatchedTradeEvent]] = defaultdict(list)
+    matched_exit_rows: dict[str, list[MatchedTradeEvent]] = defaultdict(list)
+    for row in actual_entries:
+        entry_actual_counts[row.ticker] += 1
+    for row in backtest_entries:
+        entry_backtest_counts[row.ticker] += 1
+    for row in actual_exits:
+        exit_actual_counts[row.ticker] += 1
+    for row in backtest_exits:
+        exit_backtest_counts[row.ticker] += 1
+    for row in matched_entries:
+        matched_entry_rows[row.ticker].append(row)
+    for row in matched_exits:
+        matched_exit_rows[row.ticker].append(row)
+
+    tickers = sorted(
+        set(entry_actual_counts)
+        | set(entry_backtest_counts)
+        | set(exit_actual_counts)
+        | set(exit_backtest_counts)
+    )
+    rows: list[TickerReconciliationSummary] = []
+    for ticker in tickers:
+        ticker_matched_entries = matched_entry_rows.get(ticker, [])
+        ticker_matched_exits = matched_exit_rows.get(ticker, [])
+        rows.append(
+            TickerReconciliationSummary(
+                ticker=ticker,
+                actual_entries=entry_actual_counts.get(ticker, 0),
+                backtest_entries=entry_backtest_counts.get(ticker, 0),
+                matched_entries=len(ticker_matched_entries),
+                actual_exits=exit_actual_counts.get(ticker, 0),
+                backtest_exits=exit_backtest_counts.get(ticker, 0),
+                matched_exits=len(ticker_matched_exits),
+                avg_entry_delta_seconds=(
+                    sum(row.delta_seconds for row in ticker_matched_entries) / len(ticker_matched_entries)
+                    if ticker_matched_entries
+                    else None
+                ),
+                avg_exit_delta_seconds=(
+                    sum(row.delta_seconds for row in ticker_matched_exits) / len(ticker_matched_exits)
+                    if ticker_matched_exits
+                    else None
+                ),
+                matched_exit_reason_count=sum(1 for row in ticker_matched_exits if row.reason_match is True),
+                mismatched_exit_reason_count=sum(1 for row in ticker_matched_exits if row.reason_match is False),
+            )
+        )
+    return rows
 
 
 def format_reconciliation(result: ReconciliationResult) -> str:
@@ -294,7 +455,30 @@ def format_reconciliation(result: ReconciliationResult) -> str:
                 f"reason_mismatch={summary.mismatched_exit_reason_count}"
             )
         ),
+        (
+            f"  tickers: actual={summary.actual_unique_tickers} backtest={summary.backtest_unique_tickers} "
+            f"matched={summary.matched_unique_tickers} precision={summary.ticker_precision * 100:.1f}% "
+            f"recall={summary.ticker_recall * 100:.1f}%"
+        ),
     ]
+    if result.tickers:
+        lines.append("")
+        lines.append("Ticker summary")
+        ranked_tickers = sorted(
+            result.tickers,
+            key=lambda row: (
+                abs(row.actual_entries - row.backtest_entries) + abs(row.actual_exits - row.backtest_exits),
+                -(row.matched_entries + row.matched_exits),
+                row.ticker,
+            ),
+            reverse=True,
+        )
+        for row in ranked_tickers[:10]:
+            lines.append(
+                f"  {row.ticker}: "
+                f"entries actual/backtest/matched={row.actual_entries}/{row.backtest_entries}/{row.matched_entries} "
+                f"exits actual/backtest/matched={row.actual_exits}/{row.backtest_exits}/{row.matched_exits}"
+            )
     matched_sections = [
         ("Matched entries", result.matched_entries),
         ("Matched exits", result.matched_exits),
@@ -338,6 +522,23 @@ def export_reconciliation(result: ReconciliationResult, *, export_dir: str) -> N
         writer = csv.DictWriter(handle, fieldnames=list(asdict(result.summary)))
         writer.writeheader()
         writer.writerow(asdict(result.summary))
+    with (export_path / "ticker_reconciliation.csv").open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=list(asdict(result.tickers[0])) if result.tickers else [
+            "ticker",
+            "actual_entries",
+            "backtest_entries",
+            "matched_entries",
+            "actual_exits",
+            "backtest_exits",
+            "matched_exits",
+            "avg_entry_delta_seconds",
+            "avg_exit_delta_seconds",
+            "matched_exit_reason_count",
+            "mismatched_exit_reason_count",
+        ])
+        writer.writeheader()
+        for row in result.tickers:
+            writer.writerow(asdict(row))
     matched_sections = {
         "matched_entries.csv": result.matched_entries,
         "matched_exits.csv": result.matched_exits,
@@ -361,6 +562,49 @@ def export_reconciliation(result: ReconciliationResult, *, export_dir: str) -> N
             writer.writeheader()
             for row in rows:
                 writer.writerow(asdict(row))
+
+
+async def log_reconciliation_result(
+    *,
+    db_path: str,
+    result: ReconciliationResult,
+    window_date: str,
+    actual_source: str,
+    backtest_source: str,
+    export_dir: str | None = None,
+    notes: str = "",
+) -> int:
+    database = SignalDatabase(str(Path(db_path).expanduser()))
+    try:
+        await database.initialize()
+        summary = result.summary
+        return await database.record_reconciliation_run(
+            created_at=datetime.now(timezone.utc).isoformat(),
+            window_date=window_date,
+            actual_source=actual_source,
+            backtest_source=backtest_source,
+            actual_entries=summary.actual_entries,
+            backtest_entries=summary.backtest_entries,
+            matched_entries=summary.matched_entries,
+            entry_precision=summary.entry_precision,
+            entry_recall=summary.entry_recall,
+            actual_exits=summary.actual_exits,
+            backtest_exits=summary.backtest_exits,
+            matched_exits=summary.matched_exits,
+            exit_precision=summary.exit_precision,
+            exit_recall=summary.exit_recall,
+            matched_exit_reason_count=summary.matched_exit_reason_count,
+            mismatched_exit_reason_count=summary.mismatched_exit_reason_count,
+            actual_unique_tickers=summary.actual_unique_tickers,
+            backtest_unique_tickers=summary.backtest_unique_tickers,
+            matched_unique_tickers=summary.matched_unique_tickers,
+            ticker_precision=summary.ticker_precision,
+            ticker_recall=summary.ticker_recall,
+            export_dir=export_dir or "",
+            notes=notes,
+        )
+    finally:
+        database.close()
     sections = {
         "unmatched_actual_entries.csv": result.unmatched_actual_entries,
         "unmatched_backtest_entries.csv": result.unmatched_backtest_entries,
@@ -377,21 +621,44 @@ def export_reconciliation(result: ReconciliationResult, *, export_dir: str) -> N
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Compare actual Telegram trade events against backtest trade exports.")
-    parser.add_argument("--telegram-html", required=True, help="Path to the Telegram export HTML file.")
+    parser.add_argument("--telegram-html", default=None, help="Path to the Telegram export HTML file.")
+    parser.add_argument("--actual-db", default=None, help="Path to the live SQLite DB containing trade_analytics.")
+    parser.add_argument("--actual-date", default=None, help="UTC trade date in YYYY-MM-DD. Defaults to yesterday UTC for --actual-db.")
     parser.add_argument("--backtest-trades-csv", required=True, help="Path to backtest_trades.csv.")
     parser.add_argument("--tolerance-minutes", type=int, default=30, help="Timestamp match tolerance in minutes.")
     parser.add_argument("--export-dir", default=None, help="Optional export directory for reconciliation CSVs.")
+    parser.add_argument("--log-db", default=None, help="Optional SQLite DB path to persist reconciliation summary rows.")
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
-    telegram_html = Path(args.telegram_html).expanduser().read_text(encoding="utf-8")
-    actual = parse_telegram_trade_events(telegram_html)
+    if bool(args.telegram_html) == bool(args.actual_db):
+        raise ValueError("Use exactly one of --telegram-html or --actual-db")
+    if args.telegram_html:
+        telegram_html = Path(args.telegram_html).expanduser().read_text(encoding="utf-8")
+        actual = parse_telegram_trade_events(telegram_html)
+        actual_source = str(Path(args.telegram_html).expanduser())
+        window_date = "mixed"
+    else:
+        window_date = resolve_trade_date(args.actual_date)
+        actual = load_actual_trade_events_from_db(args.actual_db, trade_date=window_date)
+        actual_source = f"{Path(args.actual_db).expanduser()}:{window_date}"
     backtest = load_backtest_trade_events(args.backtest_trades_csv)
     result = reconcile_trade_events(actual, backtest, tolerance_minutes=args.tolerance_minutes)
     if args.export_dir:
         export_reconciliation(result, export_dir=args.export_dir)
+    if args.log_db:
+        asyncio.run(
+            log_reconciliation_result(
+                db_path=args.log_db,
+                result=result,
+                window_date=window_date,
+                actual_source=actual_source,
+                backtest_source=str(Path(args.backtest_trades_csv).expanduser()),
+                export_dir=args.export_dir,
+            )
+        )
     print(format_reconciliation(result))
 
 

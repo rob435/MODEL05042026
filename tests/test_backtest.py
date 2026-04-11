@@ -9,10 +9,12 @@ import pytest
 import backtest
 from backtest import (
     BacktestTrade,
+    BacktestVariantRunResult,
     BacktestVariantSummary,
     BacktestVariantSpec,
     HistoricalBacktestSimulator,
     MinuteReplayPlan,
+    export_variant_run_result,
     fetch_minute_replay_plan,
     parse_args,
     _build_stress_variant_specs,
@@ -48,6 +50,68 @@ def test_comprehensive_backtest_research_fast_skips_signal_rows(tmp_path: Path) 
 
 def test_comprehensive_backtest_variants_reuse_one_plan(tmp_path: Path) -> None:
     asyncio.run(_exercise_comprehensive_backtest_variants(tmp_path))
+
+
+def test_comprehensive_backtest_variants_can_resume_from_checkpoint(tmp_path: Path) -> None:
+    asyncio.run(_exercise_comprehensive_backtest_variant_resume(tmp_path))
+
+
+def test_export_variant_run_result_writes_ranked_outputs(tmp_path: Path) -> None:
+    db_path = tmp_path / "variant.sqlite3"
+    _seed_trade_analytics_db(db_path)
+    result = BacktestVariantRunResult(
+        variants=[
+            BacktestVariantSummary(
+                name="a",
+                database_path=str(db_path),
+                trade_count=3,
+                wins=2,
+                losses=1,
+                net_pnl_usd=200.0,
+                total_return_pct=0.02,
+                max_drawdown_pct=0.01,
+                profit_factor=1.5,
+                entry_ready_signals=5,
+                entries_filled=3,
+            ),
+            BacktestVariantSummary(
+                name="b",
+                database_path=str(db_path),
+                trade_count=2,
+                wins=1,
+                losses=1,
+                net_pnl_usd=50.0,
+                total_return_pct=0.005,
+                max_drawdown_pct=0.01,
+                profit_factor=1.1,
+                entry_ready_signals=4,
+                entries_filled=2,
+            ),
+        ],
+        best_variant=BacktestVariantSummary(
+            name="a",
+            database_path=str(db_path),
+            trade_count=3,
+            wins=2,
+            losses=1,
+            net_pnl_usd=200.0,
+            total_return_pct=0.02,
+            max_drawdown_pct=0.01,
+            profit_factor=1.5,
+            entry_ready_signals=5,
+            entries_filled=3,
+        ),
+        variants_requested=2,
+        variants_completed_now=2,
+        variants_resumed=0,
+    )
+
+    export_variant_run_result(result, export_dir=str(tmp_path / "variant-export"))
+
+    assert (tmp_path / "variant-export" / "variant_summary.csv").exists()
+    assert (tmp_path / "variant-export" / "variant_ranked_summary.csv").exists()
+    assert (tmp_path / "variant-export" / "variant_best_summary.csv").exists()
+    assert (tmp_path / "variant-export" / "best_variant_trades.csv").exists()
 
 
 def test_post_exit_tracking_populates_trade_follow_through_metrics() -> None:
@@ -175,6 +239,29 @@ def test_fetch_minute_replay_plan_uses_explicit_end_ms(monkeypatch: pytest.Monke
     )
     assert captured["replay_end_ms"] == 123_456_000
     assert result is sentinel
+
+
+def test_parse_args_accepts_resume_and_reconcile_flags(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "backtest.py",
+            "--grid-setting",
+            "hurst_cutoff=0.5,0.6",
+            "--resume-variants",
+            "--export-dir",
+            "out",
+            "--reconcile-telegram-html",
+            "telegram.html",
+            "--reconcile-tolerance-minutes",
+            "15",
+        ],
+    )
+    args = parse_args()
+    assert args.resume_variants is True
+    assert args.reconcile_telegram_html == "telegram.html"
+    assert args.reconcile_tolerance_minutes == 15
 
 
 def test_build_variant_specs_creates_cartesian_product() -> None:
@@ -690,6 +777,152 @@ async def _exercise_comprehensive_backtest_variants(tmp_path: Path) -> None:
         max_workers=2,
     )
 
-    assert [row.name for row in result.variants] == ["tp_2pct", "tp_4pct"]
+    assert {row.name for row in result.variants} == {"tp_2pct", "tp_4pct"}
     assert len(result.variants) == 2
     assert all(row.database_path.endswith(".sqlite3") for row in result.variants)
+    assert result.best_variant is not None
+
+
+async def _exercise_comprehensive_backtest_variant_resume(tmp_path: Path) -> None:
+    settings = Settings(
+        sqlite_path=str(tmp_path / "unused-variants-resume.sqlite3"),
+        universe=["AAAUSDT", "BBBUSDT", "CCCUSDT"],
+        state_window=24,
+        btc_daily_lookback=10,
+        btc_vol_lookback=5,
+        btcdom_history_lookback=8,
+        momentum_lookback=6,
+        momentum_skip=1,
+        curvature_ma_window=3,
+        curvature_signal_window=2,
+        hurst_window=24,
+        hurst_cutoff=-1.0,
+        top_n=1,
+        watchlist_top_n=3,
+        emerging_top_n=1,
+        entry_ready_top_n=1,
+        emerging_min_observations=1,
+        emerging_min_rank_improvement=0,
+        entry_ready_min_observations=1,
+        entry_ready_min_rank_improvement=0,
+        entry_ready_min_composite_gain=0.0,
+        regime_thresholds={0: None, 1: None, 2: None, 3: None},
+        emerging_cooldown_minutes=0,
+        watchlist_cooldown_minutes=0,
+        entry_ready_cooldown_minutes=0,
+        max_open_positions=1,
+        take_profit_pct=0.02,
+        stop_loss_pct=0.02,
+        risk_per_trade_pct=0.01,
+        intraday_regime_filter_enabled=False,
+        analytics_enabled=False,
+        backtest_intrabar_interval="1",
+        backtest_research_fast=True,
+    )
+    day_ms = interval_to_milliseconds("D")
+    minute_ms = interval_to_milliseconds("1")
+    base_ms = 96 * day_ms
+    total_cycles = settings.state_window + 1
+    timestamps = [base_ms + (idx * settings.ticker_interval_ms) for idx in range(total_cycles)]
+    history = {
+        "AAAUSDT": list(zip(timestamps, [100.0 + (idx * 0.6) for idx in range(total_cycles)])),
+        "BBBUSDT": list(zip(timestamps, [100.0 + (idx * 0.2) for idx in range(total_cycles)])),
+        "CCCUSDT": list(zip(timestamps, [100.0 - (idx * 0.1) for idx in range(total_cycles)])),
+        "BTCUSDT": list(zip(timestamps, [40_000.0 + (idx * 30.0) for idx in range(total_cycles)])),
+    }
+    btc_daily_history = [
+        (idx * day_ms, 20_000.0 + (idx * 15.0))
+        for idx in range(settings.btc_daily_lookback + 80)
+    ]
+    confirmed_plan = build_replay_plan(
+        history_by_symbol=history,
+        btc_daily_history=btc_daily_history,
+        state_window=settings.state_window,
+        replay_cycles=1,
+    )
+    bar_start_ms = confirmed_plan.replay_timestamps[0]
+    intrabar_by_symbol: dict[str, dict[int, list[HistoricalCandle]]] = {}
+    for symbol in settings.tracked_symbols:
+        last_close = history[symbol][-1][1]
+        candles = []
+        for minute_idx in range(settings.ticker_interval_ms // minute_ms):
+            close_price = last_close + (minute_idx * 0.02)
+            high_price = close_price
+            if symbol == "AAAUSDT" and minute_idx == 14:
+                high_price = last_close * 1.05
+            candles.append(
+                HistoricalCandle(
+                    start_time_ms=bar_start_ms + (minute_idx * minute_ms),
+                    open_price=close_price,
+                    high_price=high_price,
+                    low_price=close_price,
+                    close_price=close_price,
+                )
+            )
+        intrabar_by_symbol[symbol] = {bar_start_ms: candles}
+    btcdom_interval_ms = interval_to_milliseconds(settings.btcdom_interval)
+    btcdom_history = [
+        (idx * btcdom_interval_ms, 1_000.0 + idx)
+        for idx in range((base_ms // btcdom_interval_ms) + settings.btcdom_history_lookback + 4)
+    ]
+    plan = MinuteReplayPlan(
+        confirmed_plan=confirmed_plan,
+        intrabar_by_symbol=intrabar_by_symbol,
+        btc_daily_history=btc_daily_history,
+        btcdom_history=btcdom_history,
+    )
+    variants = [
+        BacktestVariantSpec(name="tp_2pct", overrides={"take_profit_pct": 0.02}),
+        BacktestVariantSpec(name="tp_4pct", overrides={"take_profit_pct": 0.04}),
+    ]
+    checkpoint_path = tmp_path / "resume" / "variant_summary.csv"
+    checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+    checkpoint_path.write_text(
+        "name,database_path,trade_count,wins,losses,net_pnl_usd,total_return_pct,max_drawdown_pct,profit_factor,entry_ready_signals,entries_filled\n"
+        "tp_2pct,/tmp/tp_2pct.sqlite3,1,1,0,10.0,0.001,0.002,1.5,2,1\n",
+        encoding="utf-8",
+    )
+
+    result = await run_comprehensive_backtest_variants(
+        settings,
+        plan=plan,
+        sqlite_path=str(tmp_path / "variants-resume.sqlite3"),
+        variants=variants,
+        max_workers=1,
+        checkpoint_path=str(checkpoint_path),
+    )
+
+    assert result.variants_requested == 2
+    assert result.variants_resumed == 1
+    assert result.variants_completed_now == 1
+    assert {row.name for row in result.variants} == {"tp_2pct", "tp_4pct"}
+    checkpoint_text = checkpoint_path.read_text(encoding="utf-8")
+    assert "tp_2pct" in checkpoint_text
+    assert "tp_4pct" in checkpoint_text
+
+
+def _seed_trade_analytics_db(path: Path) -> None:
+    import sqlite3
+
+    connection = sqlite3.connect(path)
+    try:
+        connection.execute(
+            """
+            CREATE TABLE trade_analytics (
+                ticker TEXT NOT NULL,
+                side TEXT NOT NULL,
+                opened_at TEXT NOT NULL,
+                closed_at TEXT NOT NULL,
+                exit_reason TEXT NOT NULL
+            )
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO trade_analytics (ticker, side, opened_at, closed_at, exit_reason)
+            VALUES ('AAAUSDT', 'LONG', '2026-04-11T00:00:00+00:00', '2026-04-11T01:00:00+00:00', 'take_profit')
+            """
+        )
+        connection.commit()
+    finally:
+        connection.close()

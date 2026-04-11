@@ -320,3 +320,37 @@
 - Reran targeted validation after the progress-message change:
   - `python3 -m py_compile backtest.py`
   - `python3 -m pytest -q tests/test_backtest.py` -> `13 passed`
+- Added the next real backtest/ops polish pass:
+  - `exchange.py` now tracks cache hits, misses, stored candles, and Bybit/Binance HTTP request counts
+  - prefetch and replay-plan phases now expose those cache/network stats instead of leaving operators to infer behavior from Wi-Fi graphs
+  - variant runs now support checkpoint/resume through `--resume-variants` and `variant_summary.csv`
+  - grid exports now include `variant_ranked_summary.csv`, `variant_best_summary.csv`, and `best_variant_trades.csv`
+  - `backtest.py` can now run Telegram-vs-backtest reconciliation directly via `--reconcile-telegram-html`
+- Updated docs so the new backtest operator flow is explicit in `README.md` and `BACKTEST_RESEARCH_PLAN.md`.
+- Reran verification after the polish pass:
+  - `python3 -m py_compile backtest.py exchange.py tests/test_backtest.py tests/test_exchange.py tests/test_reconcile.py`
+  - `python3 -m pytest -q tests/test_backtest.py tests/test_exchange.py tests/test_reconcile.py` -> `19 passed`
+  - `python3 -m pytest -q` -> `76 passed`
+- Strengthened live/backtest alignment diagnostics in `reconcile.py`:
+  - reconciliation summary now includes unique-ticker precision/recall in addition to raw event precision/recall
+  - added per-ticker breakdown rows (`ticker_reconciliation.csv`) so alignment failures can be diagnosed symbol by symbol instead of only from aggregate counts
+- Reran verification after the reconciliation upgrade:
+  - `python3 -m py_compile reconcile.py tests/test_reconcile.py`
+  - `python3 -m pytest -q tests/test_reconcile.py` -> `3 passed`
+  - `python3 -m pytest -q` -> `77 passed`
+- Added the first real end-of-day forward-vs-backtest workflow:
+  - `reconcile.py` can now load actual forward trade events directly from `trade_analytics` in the live SQLite DB for a specific UTC date instead of depending on Telegram HTML exports
+  - reconciliation summaries can now be persisted into a new `reconciliation_runs` table in SQLite
+  - `backtest.py` now accepts `--reconcile-live-db`, `--reconcile-date`, and `--log-reconciliation-db`
+  - added `deploy/run_daily_forward_reconcile.sh` as the blunt cron/systemd entrypoint for the previous UTC day
+- Updated docs so the daily wrapper and DB-backed reconciliation flow are discoverable in `README.md` and `BACKTEST_RESEARCH_PLAN.md`.
+- Reran verification after the forward-alignment automation pass:
+  - `bash -n deploy/run_daily_forward_reconcile.sh`
+  - `python3 -m py_compile backtest.py reconcile.py database.py tests/test_reconcile.py`
+  - `python3 -m pytest -q tests/test_reconcile.py tests/test_backtest.py` -> `21 passed`
+  - `python3 -m pytest -q` -> `79 passed`
+- Extended the VPS pull-sync path so daily reconciliation exports are not trapped on the server:
+  - `deploy/sync_exports.sh` now also rsyncs `${REMOTE_ROOT}/reconciliation-daily/` into `~/MODEL050426-sync/reconciliation-daily/` by default
+  - updated `README.md` to make the new local reconciliation path explicit instead of leaving it as an implicit side effect
+- Reran shell validation after the sync update:
+  - `bash -n deploy/sync_exports.sh`

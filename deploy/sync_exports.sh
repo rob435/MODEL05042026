@@ -9,11 +9,13 @@ REPORT_SCRIPT="${MODEL050426_REPORT_SCRIPT:-${REPO_ROOT}/report.py}"
 VPS_HOST="${MODEL050426_VPS_HOST:-root@204.168.202.167}"
 REMOTE_ROOT="${MODEL050426_REMOTE_ROOT:-/opt/MODEL05042026}"
 REMOTE_DB_PATH="${MODEL050426_REMOTE_DB_PATH:-${REMOTE_ROOT}/data/signals.sqlite3}"
+REMOTE_RECON_DIR="${MODEL050426_REMOTE_RECON_DIR:-${REMOTE_ROOT}/reconciliation-daily}"
 REMOTE_SERVICE_NAME="${MODEL050426_REMOTE_SERVICE_NAME:-model050426}"
 REMOTE_TMP_DIR="${MODEL050426_REMOTE_TMP_DIR:-/tmp}"
 LOCAL_SYNC_ROOT="${MODEL050426_LOCAL_SYNC_ROOT:-${HOME}/MODEL050426-sync}"
 LOCAL_DB_PATH="${MODEL050426_LOCAL_DB_PATH:-${LOCAL_SYNC_ROOT}/db/signals.sqlite3}"
 LOCAL_EXPORT_DIR="${MODEL050426_LOCAL_EXPORT_DIR:-${LOCAL_SYNC_ROOT}/exports/latest}"
+LOCAL_RECON_DIR="${MODEL050426_LOCAL_RECON_DIR:-${LOCAL_SYNC_ROOT}/reconciliation-daily}"
 LOCAL_REPORT_PATH="${MODEL050426_LOCAL_REPORT_PATH:-${LOCAL_SYNC_ROOT}/reports/latest.txt}"
 LOCAL_STATUS_PATH="${MODEL050426_LOCAL_STATUS_PATH:-${LOCAL_SYNC_ROOT}/logs/vps-status.txt}"
 LOCAL_JOURNAL_PATH="${MODEL050426_LOCAL_JOURNAL_PATH:-${LOCAL_SYNC_ROOT}/logs/journal-tail.log}"
@@ -42,6 +44,7 @@ fi
 mkdir -p \
     "$(dirname "${LOCAL_DB_PATH}")" \
     "${LOCAL_EXPORT_DIR}" \
+    "${LOCAL_RECON_DIR}" \
     "$(dirname "${LOCAL_REPORT_PATH}")" \
     "$(dirname "${LOCAL_STATUS_PATH}")" \
     "$(dirname "${LOCAL_JOURNAL_PATH}")"
@@ -88,6 +91,12 @@ ssh ${SSH_OPTIONS} "${VPS_HOST}" \
     "journalctl -u ${REMOTE_SERVICE_NAME} -n ${JOURNAL_LINES} --no-pager || true" \
     > "${LOCAL_JOURNAL_PATH}"
 
+echo "[sync] pulling daily reconciliation exports if present"
+rsync -az --delete --exclude '.DS_Store' \
+    "${VPS_HOST}:${REMOTE_RECON_DIR}/" \
+    "${LOCAL_RECON_DIR}/" \
+    >/dev/null 2>&1 || true
+
 if [[ -d "${LOCAL_EXPORT_DIR}" ]]; then
     find "${LOCAL_EXPORT_DIR}" -mindepth 1 -maxdepth 1 -exec rm -rf {} +
 fi
@@ -109,6 +118,7 @@ echo "${timestamp_utc}" > "${LOCAL_SYNC_ROOT}/last_sync_utc.txt"
 printf '%s\n' \
     "db=${LOCAL_DB_PATH}" \
     "exports=${LOCAL_EXPORT_DIR}" \
+    "reconciliation=${LOCAL_RECON_DIR}" \
     "report=${LOCAL_REPORT_PATH}" \
     "status=${LOCAL_STATUS_PATH}" \
     "journal=${LOCAL_JOURNAL_PATH}" \

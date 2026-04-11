@@ -8,6 +8,7 @@ import logging
 import math
 import os
 import pickle
+import sqlite3
 import tempfile
 from collections import defaultdict
 from concurrent.futures import ProcessPoolExecutor
@@ -23,11 +24,22 @@ from database import SignalDatabase
 from execution import ExecutionEngine
 from exchange import (
     BybitMarketDataClient,
+    CacheStats,
     HistoricalCandle,
     MissingCandlesError,
     interval_to_milliseconds,
 )
 from indicators import log_returns
+from reconcile import (
+    export_reconciliation,
+    format_reconciliation,
+    load_actual_trade_events_from_db,
+    load_backtest_trade_events,
+    log_reconciliation_result,
+    parse_telegram_trade_events,
+    reconcile_trade_events,
+    resolve_trade_date,
+)
 from replay import ReplayPlan, build_replay_plan, fetch_replay_plan
 from report import ReportSummary, format_report, load_report_summary
 from signal_engine import RankedSignal, SignalEngine
@@ -272,6 +284,11 @@ class PrefetchSummary:
     btc_daily_candles: int
     btcdom_candles: int
     cache_rows: int
+    cache_hits: int
+    cache_misses: int
+    cached_candles_stored: int
+    bybit_http_requests: int
+    binance_http_requests: int
 
 
 @dataclass(slots=True)
@@ -298,6 +315,10 @@ class BacktestVariantSummary:
 @dataclass(slots=True)
 class BacktestVariantRunResult:
     variants: list[BacktestVariantSummary]
+    best_variant: BacktestVariantSummary | None = None
+    variants_requested: int = 0
+    variants_completed_now: int = 0
+    variants_resumed: int = 0
 
 
 @dataclass(slots=True)
@@ -937,6 +958,7 @@ async def prefetch_backtest_cache(
             end_ms=end_ms,
         ),
     )
+    cache_stats = client.cache_stats_snapshot()
     return PrefetchSummary(
         cache_path=str(Path(settings.backtest_cache_path).expanduser()),
         lookback_days=lookback_days,
@@ -947,7 +969,12 @@ async def prefetch_backtest_cache(
         bybit_candles=sum(bybit_counts),
         btc_daily_candles=len(btc_daily_history),
         btcdom_candles=len(btcdom_history),
-        cache_rows=client.cached_candle_count(),
+        cache_rows=cache_stats.cache_rows,
+        cache_hits=cache_stats.cache_hits,
+        cache_misses=cache_stats.cache_misses,
+        cached_candles_stored=cache_stats.cached_candles_stored,
+        bybit_http_requests=cache_stats.bybit_http_requests,
+        binance_http_requests=cache_stats.binance_http_requests,
     )
 
 
@@ -965,6 +992,11 @@ def format_prefetch_summary(summary: PrefetchSummary) -> str:
             f"  btc_daily_candles={summary.btc_daily_candles}",
             f"  btcdom_candles={summary.btcdom_candles}",
             f"  cache_rows={summary.cache_rows}",
+            f"  cache_hits={summary.cache_hits}",
+            f"  cache_misses={summary.cache_misses}",
+            f"  cached_candles_stored={summary.cached_candles_stored}",
+            f"  bybit_http_requests={summary.bybit_http_requests}",
+            f"  binance_http_requests={summary.binance_http_requests}",
         ]
     )
 
@@ -1462,6 +1494,173 @@ def _write_csv(path: Path, rows: list[dict]) -> None:
         writer.writerows(rows)
 
 
+def _load_csv_dict_rows(path: Path) -> list[dict[str, str]]:
+    if not path.exists():
+        return []
+    with path.open("r", encoding="utf-8", newline="") as handle:
+        return list(csv.DictReader(handle))
+
+
+def _cache_stats_line(stats: CacheStats) -> str:
+    return (
+        f"cache_rows={stats.cache_rows} cache_hits={stats.cache_hits} "
+        f"cache_misses={stats.cache_misses} stored_candles={stats.cached_candles_stored} "
+        f"bybit_http={stats.bybit_http_requests} binance_http={stats.binance_http_requests}"
+    )
+
+
+def _variant_profit_factor_text(value: float | None) -> str:
+    if value == float("inf"):
+        return "inf"
+    if value is None:
+        return "n/a"
+    return f"{value:.2f}"
+
+
+def _variant_win_rate(row: BacktestVariantSummary) -> float | None:
+    total = row.wins + row.losses
+    if total <= 0:
+        return None
+    return row.wins / total
+
+
+def _variant_fill_rate(row: BacktestVariantSummary) -> float | None:
+    if row.entry_ready_signals <= 0:
+        return None
+    return row.entries_filled / row.entry_ready_signals
+
+
+def _variant_expectancy_usd(row: BacktestVariantSummary) -> float | None:
+    if row.trade_count <= 0:
+        return None
+    return row.net_pnl_usd / row.trade_count
+
+
+def _variant_return_over_drawdown(row: BacktestVariantSummary) -> float | None:
+    if row.max_drawdown_pct <= 0:
+        return None
+    return row.total_return_pct / row.max_drawdown_pct
+
+
+def _variant_ranked_rows(rows: list[BacktestVariantSummary]) -> list[dict]:
+    ranked = _rank_variants(rows)
+    output: list[dict] = []
+    for rank, row in enumerate(ranked, start=1):
+        output.append(
+            {
+                "rank": rank,
+                "name": row.name,
+                "database_path": row.database_path,
+                "trade_count": row.trade_count,
+                "wins": row.wins,
+                "losses": row.losses,
+                "win_rate": _variant_win_rate(row),
+                "net_pnl_usd": row.net_pnl_usd,
+                "total_return_pct": row.total_return_pct,
+                "max_drawdown_pct": row.max_drawdown_pct,
+                "return_over_drawdown": _variant_return_over_drawdown(row),
+                "profit_factor": row.profit_factor,
+                "entry_ready_signals": row.entry_ready_signals,
+                "entries_filled": row.entries_filled,
+                "fill_rate": _variant_fill_rate(row),
+                "expectancy_usd": _variant_expectancy_usd(row),
+            }
+        )
+    return output
+
+
+def _load_variant_checkpoint(path: Path) -> list[BacktestVariantSummary]:
+    rows = _load_csv_dict_rows(path)
+    loaded: list[BacktestVariantSummary] = []
+    for row in rows:
+        profit_factor_raw = str(row.get("profit_factor") or "").strip().lower()
+        if profit_factor_raw in {"", "n/a"}:
+            profit_factor = None
+        elif profit_factor_raw == "inf":
+            profit_factor = float("inf")
+        else:
+            profit_factor = float(profit_factor_raw)
+        loaded.append(
+            BacktestVariantSummary(
+                name=str(row["name"]),
+                database_path=str(row["database_path"]),
+                trade_count=int(row["trade_count"]),
+                wins=int(row["wins"]),
+                losses=int(row["losses"]),
+                net_pnl_usd=float(row["net_pnl_usd"]),
+                total_return_pct=float(row["total_return_pct"]),
+                max_drawdown_pct=float(row["max_drawdown_pct"]),
+                profit_factor=profit_factor,
+                entry_ready_signals=int(row["entry_ready_signals"]),
+                entries_filled=int(row["entries_filled"]),
+            )
+        )
+    return loaded
+
+
+def _write_variant_checkpoint(path: Path, rows: list[BacktestVariantSummary]) -> None:
+    _write_csv(path, [asdict(row) for row in rows])
+
+
+def _export_backtest_trade_events_from_db(database_path: str, output_csv: Path) -> None:
+    connection = sqlite3.connect(Path(database_path).expanduser())
+    connection.row_factory = sqlite3.Row
+    try:
+        rows = connection.execute(
+            """
+            SELECT
+                ticker,
+                side,
+                opened_at,
+                closed_at,
+                exit_reason
+            FROM trade_analytics
+            ORDER BY closed_at ASC, ticker ASC
+            """
+        ).fetchall()
+    finally:
+        connection.close()
+    _write_csv(output_csv, [dict(row) for row in rows])
+
+
+def _run_export_reconciliation(
+    *,
+    telegram_html_path: str | None,
+    actual_db_path: str | None,
+    actual_date: str | None,
+    log_db_path: str | None,
+    backtest_trades_csv: Path,
+    export_dir: Path,
+    tolerance_minutes: int,
+) -> str:
+    if bool(telegram_html_path) == bool(actual_db_path):
+        raise ValueError("Use exactly one reconciliation source: telegram HTML or actual DB")
+    if telegram_html_path:
+        telegram_html = Path(telegram_html_path).expanduser().read_text(encoding="utf-8")
+        actual = parse_telegram_trade_events(telegram_html)
+        actual_source = str(Path(telegram_html_path).expanduser())
+        window_date = "mixed"
+    else:
+        window_date = resolve_trade_date(actual_date)
+        actual = load_actual_trade_events_from_db(actual_db_path, trade_date=window_date)
+        actual_source = f"{Path(actual_db_path).expanduser()}:{window_date}"
+    backtest = load_backtest_trade_events(str(backtest_trades_csv))
+    result = reconcile_trade_events(actual, backtest, tolerance_minutes=tolerance_minutes)
+    export_reconciliation(result, export_dir=str(export_dir))
+    if log_db_path:
+        asyncio.run(
+            log_reconciliation_result(
+                db_path=log_db_path,
+                result=result,
+                window_date=window_date,
+                actual_source=actual_source,
+                backtest_source=str(backtest_trades_csv.expanduser()),
+                export_dir=str(export_dir),
+            )
+        )
+    return format_reconciliation(result)
+
+
 def export_comprehensive_backtest(
     result: ComprehensiveBacktestResult,
     *,
@@ -1836,6 +2035,7 @@ async def fetch_and_run_comprehensive_backtest(
                 replay_cycles,
                 replay_end_ms=_resolve_end_ms(settings, end_date),
             )
+            _progress(f"[backtest] replay plan ready: {_cache_stats_line(client.cache_stats_snapshot())}")
         finally:
             client.close_cache()
     return await run_comprehensive_backtest_plan(
@@ -1956,28 +2156,66 @@ def export_sweep_comparison(result: SweepComparisonResult, *, export_dir: str) -
 
 
 def format_variant_run_result(result: BacktestVariantRunResult) -> str:
-    lines = ["Backtest variants"]
-    for row in result.variants:
-        profit_factor = (
-            "inf"
-            if row.profit_factor == float("inf")
-            else f"{row.profit_factor:.2f}"
-            if row.profit_factor is not None
-            else "n/a"
+    lines = [
+        "Backtest variants",
+        f"  requested={result.variants_requested or len(result.variants)}",
+        f"  completed_now={result.variants_completed_now}",
+        f"  resumed={result.variants_resumed}",
+    ]
+    if result.best_variant is not None:
+        lines.append(
+            "  best_variant="
+            f"{result.best_variant.name} net_pnl_usd={result.best_variant.net_pnl_usd:.2f} "
+            f"return_pct={result.best_variant.total_return_pct * 100:.2f}% "
+            f"max_drawdown_pct={result.best_variant.max_drawdown_pct * 100:.2f}% "
+            f"pf={_variant_profit_factor_text(result.best_variant.profit_factor)}"
         )
+    for row in result.variants:
         lines.append(
             f"  {row.name}: trades={row.trade_count} wins={row.wins} losses={row.losses} "
             f"net_pnl_usd={row.net_pnl_usd:.2f} return_pct={row.total_return_pct * 100:.2f}% "
-            f"max_drawdown_pct={row.max_drawdown_pct * 100:.2f}% pf={profit_factor} "
-            f"entry_ready_signals={row.entry_ready_signals} filled={row.entries_filled}"
+            f"max_drawdown_pct={row.max_drawdown_pct * 100:.2f}% "
+            f"pf={_variant_profit_factor_text(row.profit_factor)} "
+            f"entry_ready_signals={row.entry_ready_signals} filled={row.entries_filled} "
+            f"win_rate={(_variant_win_rate(row) or 0.0) * 100:.1f}%"
         )
     return "\n".join(lines)
 
 
-def export_variant_run_result(result: BacktestVariantRunResult, *, export_dir: str) -> None:
+def export_variant_run_result(
+    result: BacktestVariantRunResult,
+    *,
+    export_dir: str,
+    telegram_html_path: str | None = None,
+    actual_db_path: str | None = None,
+    actual_date: str | None = None,
+    log_db_path: str | None = None,
+    reconcile_tolerance_minutes: int = 30,
+) -> None:
     export_path = Path(export_dir).expanduser()
     export_path.mkdir(parents=True, exist_ok=True)
     _write_csv(export_path / "variant_summary.csv", [asdict(row) for row in result.variants])
+    ranked_rows = _variant_ranked_rows(result.variants)
+    _write_csv(export_path / "variant_ranked_summary.csv", ranked_rows)
+    best_variant = result.best_variant or (_select_best_variant(result.variants) if result.variants else None)
+    if best_variant is not None:
+        _write_csv(export_path / "variant_best_summary.csv", [asdict(best_variant)])
+        best_trades_csv = export_path / "best_variant_trades.csv"
+        best_database_path = Path(best_variant.database_path).expanduser()
+        if best_database_path.exists():
+            _export_backtest_trade_events_from_db(str(best_database_path), best_trades_csv)
+        if (telegram_html_path or actual_db_path) and best_database_path.exists():
+            reconciliation_dir = export_path / "best_variant_reconciliation"
+            summary_text = _run_export_reconciliation(
+                telegram_html_path=telegram_html_path,
+                actual_db_path=actual_db_path,
+                actual_date=actual_date,
+                log_db_path=log_db_path,
+                backtest_trades_csv=best_trades_csv,
+                export_dir=reconciliation_dir,
+                tolerance_minutes=reconcile_tolerance_minutes,
+            )
+            (reconciliation_dir / "reconciliation.txt").write_text(summary_text, encoding="utf-8")
 
 
 def _select_best_variant(rows: list[BacktestVariantSummary]) -> BacktestVariantSummary:
@@ -2164,22 +2402,32 @@ async def run_comprehensive_backtest_variants(
     sqlite_path: str,
     variants: list[BacktestVariantSpec],
     max_workers: int | None = None,
+    checkpoint_path: str | None = None,
 ) -> BacktestVariantRunResult:
+    checkpoint_file = Path(checkpoint_path).expanduser() if checkpoint_path else None
+    resumed_rows = _load_variant_checkpoint(checkpoint_file) if checkpoint_file is not None else []
+    resumed_by_name = {row.name: row for row in resumed_rows}
+    pending_variants = [variant for variant in variants if variant.name not in resumed_by_name]
+    if resumed_rows:
+        _progress(f"[variants] resuming {len(resumed_rows)} completed variants from {checkpoint_file}")
     workers = (
         settings.backtest_variant_workers
         if max_workers is None
         else max_workers
     )
     workers = max(1, workers)
-    if workers == 1 or len(variants) <= 1:
-        rows = []
-        for index, variant in enumerate(variants, start=1):
-            _progress(f"[variants] running {index}/{len(variants)}: {variant.name}")
+    rows = list(resumed_rows)
+    if workers == 1 or len(pending_variants) <= 1:
+        for index, variant in enumerate(pending_variants, start=1):
+            _progress(f"[variants] running {index}/{len(pending_variants)} pending: {variant.name}")
             variant_settings = replace(settings, **variant.overrides)
             result = await run_comprehensive_backtest_plan(
                 variant_settings,
                 plan,
-                sqlite_path=_safe_db_path(sqlite_path, f"variant-{index:02d}"),
+                sqlite_path=_safe_db_path(
+                    sqlite_path,
+                    f"variant-{variants.index(variant) + 1:02d}",
+                ),
             )
             rows.append(
                 BacktestVariantSummary(
@@ -2196,10 +2444,28 @@ async def run_comprehensive_backtest_variants(
                     entries_filled=result.summary.entries_filled,
                 )
             )
-        return BacktestVariantRunResult(variants=rows)
+            if checkpoint_file is not None:
+                _write_variant_checkpoint(checkpoint_file, _rank_variants(rows))
+        ranked_rows = _rank_variants(rows)
+        return BacktestVariantRunResult(
+            variants=ranked_rows,
+            best_variant=_select_best_variant(ranked_rows) if ranked_rows else None,
+            variants_requested=len(variants),
+            variants_completed_now=len(pending_variants),
+            variants_resumed=len(resumed_rows),
+        )
+    if not pending_variants:
+        ranked_rows = _rank_variants(rows)
+        return BacktestVariantRunResult(
+            variants=ranked_rows,
+            best_variant=_select_best_variant(ranked_rows) if ranked_rows else None,
+            variants_requested=len(variants),
+            variants_completed_now=0,
+            variants_resumed=len(resumed_rows),
+        )
     loop = asyncio.get_running_loop()
     _progress(
-        f"[variants] snapshotting replay plan for {len(variants)} variants across {workers} workers"
+        f"[variants] snapshotting replay plan for {len(pending_variants)} pending variants across {workers} workers"
     )
     plan_path = _write_plan_snapshot(plan)
     executor = ProcessPoolExecutor(max_workers=workers)
@@ -2210,12 +2476,19 @@ async def run_comprehensive_backtest_variants(
                 _run_variant_from_plan_path_sync,
                 settings,
                 plan_path,
-                _safe_db_path(sqlite_path, f"variant-{index:02d}"),
+                _safe_db_path(
+                    sqlite_path,
+                    f"variant-{variants.index(variant) + 1:02d}",
+                ),
                 variant,
             )
-            for index, variant in enumerate(variants, start=1)
+            for variant in pending_variants
         ]
-        rows = list(await asyncio.gather(*tasks))
+        for task in asyncio.as_completed(tasks):
+            row = await task
+            rows.append(row)
+            if checkpoint_file is not None:
+                _write_variant_checkpoint(checkpoint_file, _rank_variants(rows))
     finally:
         executor.shutdown(wait=True)
         try:
@@ -2223,7 +2496,14 @@ async def run_comprehensive_backtest_variants(
         except FileNotFoundError:
             pass
     _progress("[variants] all variants completed")
-    return BacktestVariantRunResult(variants=rows)
+    ranked_rows = _rank_variants(rows)
+    return BacktestVariantRunResult(
+        variants=ranked_rows,
+        best_variant=_select_best_variant(ranked_rows) if ranked_rows else None,
+        variants_requested=len(variants),
+        variants_completed_now=len(pending_variants),
+        variants_resumed=len(resumed_rows),
+    )
 
 
 async def run_comprehensive_backtest_sweep(
@@ -2498,6 +2778,11 @@ def parse_args() -> argparse.Namespace:
         help="Number of worker processes for --grid-setting runs. Defaults to BACKTEST_VARIANT_WORKERS.",
     )
     parser.add_argument(
+        "--resume-variants",
+        action="store_true",
+        help="Resume a grid run from export_dir/variant_summary.csv if it already exists.",
+    )
+    parser.add_argument(
         "--stress-profile",
         action="append",
         default=[],
@@ -2575,6 +2860,36 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Optional UTC anchor date for ordinary intrabar runs in YYYY-MM-DD. Defaults to now.",
     )
+    parser.add_argument(
+        "--reconcile-telegram-html",
+        type=str,
+        default=None,
+        help="Optional Telegram export HTML to reconcile against exported backtest trades.",
+    )
+    parser.add_argument(
+        "--reconcile-live-db",
+        type=str,
+        default=None,
+        help="Optional live SQLite DB path to reconcile against exported backtest trades.",
+    )
+    parser.add_argument(
+        "--reconcile-date",
+        type=str,
+        default=None,
+        help="UTC trade date in YYYY-MM-DD for --reconcile-live-db. Defaults to yesterday UTC.",
+    )
+    parser.add_argument(
+        "--reconcile-tolerance-minutes",
+        type=int,
+        default=30,
+        help="Timestamp tolerance in minutes for backtest reconciliation.",
+    )
+    parser.add_argument(
+        "--log-reconciliation-db",
+        type=str,
+        default=None,
+        help="Optional SQLite DB path to persist reconciliation summary rows.",
+    )
     return parser.parse_args()
 
 
@@ -2587,6 +2902,12 @@ def main() -> None:
     settings = load_settings()
     if args.research_fast:
         settings = replace(settings, backtest_research_fast=True)
+    if args.resume_variants and not args.export_dir:
+        raise ValueError("--resume-variants requires --export-dir")
+    if (args.reconcile_telegram_html or args.reconcile_live_db) and not args.export_dir:
+        raise ValueError("Reconciliation exports require --export-dir")
+    if args.reconcile_telegram_html and args.reconcile_live_db:
+        raise ValueError("Use only one reconciliation source: --reconcile-telegram-html or --reconcile-live-db")
     db_path = str(Path(args.db).expanduser())
     grid_specs = _build_variant_specs(settings, args.grid_setting)
     stress_specs = _build_stress_variant_specs(settings, args.stress_profile)
@@ -2758,6 +3079,7 @@ def main() -> None:
                         args.cycles,
                         replay_end_ms=_resolve_end_ms(settings, args.end_date),
                     )
+                    _progress(f"[compare] replay plan ready: {_cache_stats_line(client.cache_stats_snapshot())}")
                 finally:
                     client.close_cache()
             filter_on = await run_comprehensive_backtest_plan(
@@ -2783,6 +3105,22 @@ def main() -> None:
             _progress(f"[compare] exporting results to {export_root}")
             export_comprehensive_backtest(filter_on, export_dir=str(export_root / "filter-on"))
             export_comprehensive_backtest(filter_off, export_dir=str(export_root / "filter-off"))
+            if args.reconcile_telegram_html or args.reconcile_live_db:
+                reconcile_root = export_root / "filter-on" / "reconciliation"
+                _progress(
+                    f"[compare] reconciling filter-on trades against "
+                    f"{Path(args.reconcile_telegram_html).expanduser() if args.reconcile_telegram_html else Path(args.reconcile_live_db).expanduser()}"
+                )
+                summary_text = _run_export_reconciliation(
+                    telegram_html_path=args.reconcile_telegram_html,
+                    actual_db_path=args.reconcile_live_db,
+                    actual_date=args.reconcile_date,
+                    log_db_path=args.log_reconciliation_db,
+                    backtest_trades_csv=export_root / "filter-on" / "backtest_trades.csv",
+                    export_dir=reconcile_root,
+                    tolerance_minutes=args.reconcile_tolerance_minutes,
+                )
+                (reconcile_root / "reconciliation.txt").write_text(summary_text, encoding="utf-8")
         print(_format_comprehensive_comparison(filter_on, filter_off))
         print("\nFilter on report\n")
         print(format_comprehensive_backtest(filter_on))
@@ -2805,6 +3143,7 @@ def main() -> None:
                         args.cycles,
                         replay_end_ms=_resolve_end_ms(settings, args.end_date),
                     )
+                    _progress(f"[grid] replay plan ready: {_cache_stats_line(client.cache_stats_snapshot())}")
                 finally:
                     client.close_cache()
             return await run_comprehensive_backtest_variants(
@@ -2813,12 +3152,25 @@ def main() -> None:
                 sqlite_path=db_path,
                 variants=variant_specs,
                 max_workers=args.variant_workers,
+                checkpoint_path=(
+                    str(Path(args.export_dir).expanduser() / "variant_summary.csv")
+                    if args.resume_variants and args.export_dir
+                    else None
+                ),
             )
 
         result = asyncio.run(_run_variants())
         if args.export_dir:
             _progress(f"[grid] exporting results to {Path(args.export_dir).expanduser()}")
-            export_variant_run_result(result, export_dir=args.export_dir)
+            export_variant_run_result(
+                result,
+                export_dir=args.export_dir,
+                telegram_html_path=args.reconcile_telegram_html,
+                actual_db_path=args.reconcile_live_db,
+                actual_date=args.reconcile_date,
+                log_db_path=args.log_reconciliation_db,
+                reconcile_tolerance_minutes=args.reconcile_tolerance_minutes,
+            )
         print(format_variant_run_result(result))
         return
 
@@ -2840,6 +3192,22 @@ def main() -> None:
     if args.export_dir:
         _progress(f"[backtest] exporting results to {Path(args.export_dir).expanduser()}")
         export_comprehensive_backtest(result, export_dir=args.export_dir)
+        if args.reconcile_telegram_html or args.reconcile_live_db:
+            reconcile_root = Path(args.export_dir).expanduser() / "reconciliation"
+            _progress(
+                f"[backtest] reconciling trades against "
+                f"{Path(args.reconcile_telegram_html).expanduser() if args.reconcile_telegram_html else Path(args.reconcile_live_db).expanduser()}"
+            )
+            summary_text = _run_export_reconciliation(
+                telegram_html_path=args.reconcile_telegram_html,
+                actual_db_path=args.reconcile_live_db,
+                actual_date=args.reconcile_date,
+                log_db_path=args.log_reconciliation_db,
+                backtest_trades_csv=Path(args.export_dir).expanduser() / "backtest_trades.csv",
+                export_dir=reconcile_root,
+                tolerance_minutes=args.reconcile_tolerance_minutes,
+            )
+            (reconcile_root / "reconciliation.txt").write_text(summary_text, encoding="utf-8")
     print(format_comprehensive_backtest(result))
 
 

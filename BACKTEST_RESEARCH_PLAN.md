@@ -225,6 +225,15 @@ python backtest.py \
   --export-dir ./research/baseline-sweep
 ```
 
+For full-year or overnight work, pin the horizon explicitly:
+
+```bash
+python backtest.py \
+  --cycles 35040 \
+  --end-date 2026-04-11 \
+  --export-dir ./research/year-baseline
+```
+
 Purpose:
 
 - prove the current default still behaves sanely
@@ -285,6 +294,19 @@ python backtest.py \
 ```
 
 Keep only the top two or three candidates from each family.
+
+If a large grid is interrupted, resume it instead of rerunning everything:
+
+```bash
+python backtest.py \
+  --cycles 35040 \
+  --end-date 2026-04-11 \
+  --variant-workers 4 \
+  --export-dir ./research/year-grid \
+  --resume-variants \
+  --grid-setting momentum_reference_mode=basket_relative,cluster_relative,hybrid_relative \
+  --grid-setting cluster_assignment_mode=dynamic,hybrid
+```
 
 ### Phase 2: Interaction Checks
 
@@ -387,7 +409,16 @@ Recommended final protocol:
 4. Run a continuous 180-day test.
 5. Run the full 1-year test on finalists only.
 6. Run walk-forward validation and keep `walk_forward_candidates.csv`.
-7. Run `reconcile.py` against any known forward-trade windows.
+7. Run `reconcile.py` or `backtest.py --reconcile-telegram-html ...` against any known forward-trade windows.
+8. Inspect `ticker_reconciliation.csv`, not just the aggregate summary, before trusting the alignment story.
+
+For live forward-testing operations, prefer the daily wrapper:
+
+```bash
+./deploy/run_daily_forward_reconcile.sh
+```
+
+That keeps daily alignment checks outside the trading loop and persists the summary into the live SQLite DB.
 8. Keep one untouched holdout period for the final decision.
 
 ## One-At-A-Time Optimization: When It Is Right And When It Is Wrong

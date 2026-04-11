@@ -61,6 +61,16 @@ class BootstrapPayload:
 
 
 @dataclass(slots=True)
+class CacheStats:
+    cache_rows: int
+    cache_hits: int
+    cache_misses: int
+    cached_candles_stored: int
+    bybit_http_requests: int
+    binance_http_requests: int
+
+
+@dataclass(slots=True)
 class InstrumentSpec:
     symbol: str
     qty_step: Decimal
@@ -330,10 +340,16 @@ class BybitMarketDataClient:
         self.settings = settings
         self._rest_timeout = aiohttp.ClientTimeout(total=20)
         self._cache_conn: sqlite3.Connection | None = None
+        self._cache_hits = 0
+        self._cache_misses = 0
+        self._cached_candles_stored = 0
+        self._bybit_http_requests = 0
+        self._binance_http_requests = 0
 
     async def _get_json(self, path: str, params: dict[str, str | int]) -> dict:
         url = f"{self.settings.bybit_rest_base_url.rstrip('/')}{path}"
         for attempt in range(self.settings.rate_limit_retries + 1):
+            self._bybit_http_requests += 1
             async with self.session.get(url, params=params, timeout=self._rest_timeout) as response:
                 response.raise_for_status()
                 payload = await response.json()
@@ -358,6 +374,7 @@ class BybitMarketDataClient:
         url = f"{self.settings.binance_futures_base_url.rstrip('/')}{path}"
         retry_statuses = {418, 429}
         for attempt in range(self.settings.rate_limit_retries + 1):
+            self._binance_http_requests += 1
             async with self.session.get(url, params=params, timeout=self._rest_timeout) as response:
                 if response.status in retry_statuses and attempt < self.settings.rate_limit_retries:
                     delay = self.settings.rate_limit_backoff_seconds * (2 ** attempt)
@@ -424,6 +441,16 @@ class BybitMarketDataClient:
         row = connection.execute("SELECT COUNT(*) FROM historical_candles").fetchone()
         return int(row[0]) if row is not None else 0
 
+    def cache_stats_snapshot(self) -> CacheStats:
+        return CacheStats(
+            cache_rows=self.cached_candle_count(),
+            cache_hits=self._cache_hits,
+            cache_misses=self._cache_misses,
+            cached_candles_stored=self._cached_candles_stored,
+            bybit_http_requests=self._bybit_http_requests,
+            binance_http_requests=self._binance_http_requests,
+        )
+
     def _cache_expected_starts(
         self,
         *,
@@ -472,10 +499,13 @@ class BybitMarketDataClient:
             (source, category, symbol, interval, start_ms, end_ms),
         ).fetchall()
         if len(rows) != len(expected_starts):
+            self._cache_misses += 1
             return None
         starts = [int(row[0]) for row in rows]
         if starts != expected_starts:
+            self._cache_misses += 1
             return None
+        self._cache_hits += 1
         return [
             HistoricalCandle(
                 start_time_ms=int(row[0]),
@@ -524,6 +554,7 @@ class BybitMarketDataClient:
             ],
         )
         connection.commit()
+        self._cached_candles_stored += len(candles)
 
     async def fetch_closed_klines(
         self,

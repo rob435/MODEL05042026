@@ -6,7 +6,9 @@ import logging
 import signal
 import ssl
 from contextlib import suppress
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
+from datetime import datetime, timezone
+from pathlib import Path
 
 import aiohttp
 import certifi
@@ -17,6 +19,13 @@ from config import load_settings
 from database import SignalDatabase
 from exchange import BybitMarketDataClient, BybitTradeClient, MissingCandlesError
 from execution import ExecutionEngine, SimulatedExecutionClient
+from runtime_monitor import (
+    RuntimeTracker,
+    build_run_manifest,
+    drift_monitor_loop,
+    health_snapshot_loop,
+)
+from runtime_validation import raise_for_invalid_runtime_settings
 from signal_engine import SignalEngine
 from state import CandleGapError, MarketState
 
@@ -68,6 +77,29 @@ async def apply_bootstrap(client: BybitMarketDataClient, state: MarketState, sta
     LOGGER.info("Bootstrap complete")
 
 
+async def log_runtime_event(
+    database: SignalDatabase,
+    *,
+    run_id: str | None,
+    severity: str,
+    component: str,
+    event_type: str,
+    detail: str,
+    stage: str | None = None,
+    ticker: str | None = None,
+) -> None:
+    await database.log_runtime_event(
+        run_id=run_id,
+        created_at=datetime.now(timezone.utc).isoformat(),
+        severity=severity,
+        component=component,
+        event_type=event_type,
+        detail=detail,
+        stage=stage,
+        ticker=ticker,
+    )
+
+
 def enqueue_cycle(
     queue: asyncio.Queue[int],
     cycle_time_ms: int,
@@ -90,6 +122,8 @@ async def refresh_macro_state_loop(
     state: MarketState,
     stop_event: asyncio.Event,
     stats: RuntimeStats,
+    tracker: RuntimeTracker,
+    database: SignalDatabase,
 ) -> None:
     while not stop_event.is_set():
         try:
@@ -107,9 +141,18 @@ async def refresh_macro_state_loop(
             )
             state.replace_btcdom_history(btcdom_candles)
             stats.macro_refreshes += 1
+            tracker.note_macro_refresh()
             LOGGER.info("Refreshed BTC daily and BTCDOM macro state")
         except Exception:
             LOGGER.exception("Failed refreshing BTC daily and BTCDOM macro state")
+            await log_runtime_event(
+                database,
+                run_id=tracker.run_id,
+                severity="error",
+                component="macro_refresh",
+                event_type="loop_failure",
+                detail="Failed refreshing BTC daily and BTCDOM macro state",
+            )
         try:
             await asyncio.wait_for(
                 stop_event.wait(),
@@ -129,6 +172,8 @@ async def queue_consumer_loop(
     settle_seconds: float,
     min_cycle_spacing_seconds: float,
     stats: RuntimeStats,
+    tracker: RuntimeTracker,
+    database: SignalDatabase,
 ) -> None:
     loop = asyncio.get_running_loop()
     next_eligible_at = 0.0
@@ -157,7 +202,13 @@ async def queue_consumer_loop(
                 break
         try:
             async with process_lock:
-                signals = await engine.process(cycle_time_ms=cycle_time_ms, stage=stage)
+                signals: list[RankedSignal]
+                ranking_summary = ""
+                if stage == "emerging":
+                    signals = await engine.process(cycle_time_ms=cycle_time_ms, stage=stage)
+                    ranking_summary = engine.format_top_rankings(stage=stage)
+                else:
+                    signals = []
                 execution_actions = []
                 if execution_engine is not None:
                     execution_actions = await execution_engine.process_cycle(
@@ -165,12 +216,12 @@ async def queue_consumer_loop(
                         cycle_time_ms=cycle_time_ms,
                         ranked_signals=signals,
                     )
-                ranking_summary = engine.format_top_rankings(stage=stage)
             stats.processed_cycles += 1
             if stage == "confirmed":
                 stats.processed_confirmed_cycles += 1
             else:
                 stats.processed_emerging_cycles += 1
+            tracker.note_processed_cycle(stage)
             LOGGER.info("Processed %s cycle at %s with %s ranked signals", stage, cycle_time_ms, len(signals))
             if ranking_summary:
                 LOGGER.info("Top %s rankings: %s", stage, ranking_summary)
@@ -198,32 +249,18 @@ async def queue_consumer_loop(
                     ranked_signal.alerted,
                     ranked_signal.regime_score,
                 )
-            if (
-                stage == "confirmed"
-                and engine.settings.telegram_summary_enabled
-                and engine.notifier.enabled
-            ):
-                if await engine.database.record_summary_cycle(stage=stage, cycle_time_ms=cycle_time_ms):
-                    summary_payload = engine.build_summary_payload(
-                        stage=stage,
-                        cycle_time_ms=cycle_time_ms,
-                        ranked_signals=signals,
-                    )
-                    if summary_payload is not None:
-                        try:
-                            await engine.notifier.send_summary(summary_payload)
-                            LOGGER.info(
-                                "Sent confirmed summary with top=%s bottom=%s",
-                                len(summary_payload.top_rankings),
-                                len(summary_payload.bottom_rankings),
-                            )
-                        except Exception:
-                            LOGGER.exception("Confirmed cycle summary delivery failed")
-                else:
-                    LOGGER.info("Skipping duplicate confirmed summary for cycle %s", cycle_time_ms)
             next_eligible_at = loop.time() + min_cycle_spacing_seconds
         except Exception:
             LOGGER.exception("%s signal engine processing failed", stage)
+            await log_runtime_event(
+                database,
+                run_id=tracker.run_id,
+                severity="error",
+                component="queue_consumer",
+                event_type="cycle_failure",
+                detail=f"{stage} processing failed",
+                stage=stage,
+            )
 
 
 async def websocket_supervisor_loop(
@@ -233,11 +270,15 @@ async def websocket_supervisor_loop(
     confirmed_queue: asyncio.Queue[int],
     stop_event: asyncio.Event,
     stats: RuntimeStats,
+    tracker: RuntimeTracker,
+    database: SignalDatabase,
 ) -> None:
     def on_emerging_event(cycle_time_ms: int) -> None:
+        tracker.note_websocket_event(confirmed=False)
         enqueue_cycle(emerging_queue, cycle_time_ms, stats, "emerging")
 
     def on_confirmed_event(cycle_time_ms: int) -> None:
+        tracker.note_websocket_event(confirmed=True)
         enqueue_cycle(confirmed_queue, cycle_time_ms, stats, "confirmed")
 
     delay = state.settings.reconnect_base_delay
@@ -258,8 +299,17 @@ async def websocket_supervisor_loop(
         except Exception:
             stats.websocket_failures += 1
             LOGGER.exception("WebSocket stream failed; reloading state and reconnecting")
+            await log_runtime_event(
+                database,
+                run_id=tracker.run_id,
+                severity="error",
+                component="websocket",
+                event_type="stream_failure",
+                detail="WebSocket stream failed; attempting bootstrap recovery",
+            )
             try:
                 await apply_bootstrap(client, state, stats)
+                tracker.note_bootstrap()
                 for symbol in state.settings.universe:
                     enqueue_cycle(
                         confirmed_queue,
@@ -312,6 +362,10 @@ def parse_args() -> argparse.Namespace:
 async def run(run_seconds: float | None = None, disable_telegram: bool = False) -> RuntimeStats:
     settings = load_settings()
     configure_logging(settings.log_level)
+    validation_messages = raise_for_invalid_runtime_settings(
+        settings,
+        disable_telegram=disable_telegram,
+    )
     LOGGER.info("Starting MODEL050426 with %s universe symbols", len(settings.universe))
 
     emerging_queue: asyncio.Queue[int] = asyncio.Queue(maxsize=settings.queue_maxsize)
@@ -319,6 +373,12 @@ async def run(run_seconds: float | None = None, disable_telegram: bool = False) 
     stop_event = asyncio.Event()
     stats = RuntimeStats()
     process_lock = asyncio.Lock()
+    manifest = build_run_manifest(
+        settings,
+        disable_telegram=disable_telegram,
+        cwd=str(Path(__file__).resolve().parent),
+    )
+    tracker = RuntimeTracker(run_id=manifest.run_id)
 
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGINT, signal.SIGTERM):
@@ -330,6 +390,18 @@ async def run(run_seconds: float | None = None, disable_telegram: bool = False) 
     async with build_client_session() as session:
         database = SignalDatabase(settings.sqlite_path)
         await database.initialize()
+        await database.log_run_manifest(**asdict(manifest))
+        await log_runtime_event(
+            database,
+            run_id=manifest.run_id,
+            severity="info",
+            component="runtime",
+            event_type="run_started",
+            detail=(
+                f"git_commit={manifest.git_commit} "
+                f"config_fingerprint={manifest.config_fingerprint}"
+            ),
+        )
 
         state = MarketState(settings=settings)
         client = BybitMarketDataClient(session=session, settings=settings)
@@ -356,8 +428,22 @@ async def run(run_seconds: float | None = None, disable_telegram: bool = False) 
             notifier=notifier,
             client=execution_client,
         )
+        execution_engine.set_runtime_run_id(manifest.run_id)
+
+        for message in validation_messages:
+            log_fn = LOGGER.warning if message.level == "warning" else LOGGER.info
+            log_fn("Runtime config %s: %s", message.code, message.message)
+            await log_runtime_event(
+                database,
+                run_id=manifest.run_id,
+                severity=message.level,
+                component="runtime_validation",
+                event_type=message.code,
+                detail=message.message,
+            )
 
         await apply_bootstrap(client, state, stats)
+        tracker.note_bootstrap()
         for symbol in settings.universe:
             enqueue_cycle(
                 confirmed_queue,
@@ -377,6 +463,8 @@ async def run(run_seconds: float | None = None, disable_telegram: bool = False) 
                 settings.cycle_settle_seconds,
                 0.0,
                 stats,
+                tracker,
+                database,
             )
         )
         emerging_consumer_task = asyncio.create_task(
@@ -390,6 +478,8 @@ async def run(run_seconds: float | None = None, disable_telegram: bool = False) 
                 settings.emerging_settle_seconds,
                 settings.emerging_interval_seconds,
                 stats,
+                tracker,
+                database,
             )
         )
         websocket_task = asyncio.create_task(
@@ -400,17 +490,69 @@ async def run(run_seconds: float | None = None, disable_telegram: bool = False) 
                 confirmed_queue,
                 stop_event,
                 stats,
+                tracker,
+                database,
             )
         )
-        macro_task = asyncio.create_task(refresh_macro_state_loop(client, state, stop_event, stats))
+        macro_task = asyncio.create_task(
+            refresh_macro_state_loop(client, state, stop_event, stats, tracker, database)
+        )
+        health_task = (
+            asyncio.create_task(
+                health_snapshot_loop(
+                    database=database,
+                    tracker=tracker,
+                    stats=stats,
+                    confirmed_queue=confirmed_queue,
+                    emerging_queue=emerging_queue,
+                    stop_event=stop_event,
+                    settings=settings,
+                )
+            )
+            if settings.runtime_health_snapshot_enabled
+            else None
+        )
+        drift_task = (
+            asyncio.create_task(
+                drift_monitor_loop(
+                    database=database,
+                    execution_engine=execution_engine,
+                    tracker=tracker,
+                    stop_event=stop_event,
+                    settings=settings,
+                )
+            )
+            if settings.runtime_drift_check_enabled
+            else None
+        )
 
         await stop_event.wait()
 
-        for task in (confirmed_consumer_task, emerging_consumer_task, websocket_task, macro_task):
+        tasks = [
+            confirmed_consumer_task,
+            emerging_consumer_task,
+            websocket_task,
+            macro_task,
+            health_task,
+            drift_task,
+        ]
+        for task in tasks:
+            if task is None:
+                continue
             task.cancel()
-        for task in (confirmed_consumer_task, emerging_consumer_task, websocket_task, macro_task):
+        for task in tasks:
+            if task is None:
+                continue
             with suppress(asyncio.CancelledError):
                 await task
+        await log_runtime_event(
+            database,
+            run_id=manifest.run_id,
+            severity="info",
+            component="runtime",
+            event_type="run_stopped",
+            detail=format_runtime_summary(stats),
+        )
         database.close()
     LOGGER.info("Runtime summary: %s", format_runtime_summary(stats))
     return stats

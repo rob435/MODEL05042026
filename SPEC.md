@@ -9,12 +9,11 @@ The system is a live crypto momentum and breakout detector for a manual universe
 - maintain rolling 15-minute market state
 - rank the full universe cross-sectionally
 - emit intrabar early-warning alerts for strengthening names
-- expose a trader-facing `entry_ready` middle tier between `emerging` and `confirmed`
-- emit close-confirmed alerts on completed 15-minute candles
+- expose a trader-facing `entry_ready` tradeable tier above broad `emerging` context
 - log all evaluated rows to SQLite
 - record stubbed order and position state for demo-trading evaluation
 - send Telegram updates when the bot enters or exits a position
-- send Telegram event alerts and 15-minute confirmed summaries
+- support research-grade backtesting, walk-forward validation, and reconciliation against actual Telegram trade logs
 
 This is not a literal copy of the original project brief. It is the current operational spec after implementation and live testing.
 
@@ -26,20 +25,21 @@ Included:
 - Bybit public WebSocket ingestion for provisional and confirmed 15-minute candles
 - Binance futures BTCDOM history as the BTC-dominance proxy input
 - BTC daily regime scoring
-- intrabar and confirmed cross-sectional ranking
+- intrabar cross-sectional ranking
 - SQLite persistence
 - execution scaffolding with SQLite-backed orders and positions
+- risk-based live position sizing
 - simple TP/SL position handling
 - real Bybit demo-account private order submission when enabled
-- Telegram event alerts and confirmed-cycle summaries
+- Telegram event alerts
 - replay, smoke, benchmark, report, and universe validation tooling
+- minute-aware backtesting, walk-forward validation, stress variants, and Telegram-vs-backtest reconciliation
+- startup config validation, runtime manifests, health snapshots, and venue-drift monitoring
 
 Excluded:
 
 - shorting
-- portfolio/risk sizing
 - trailing stops
-- PnL attribution
 - fee ledger
 - automatic universe discovery
 - literal spot market-cap BTC dominance
@@ -114,8 +114,8 @@ Main components:
 - bootstrap loader
 - WebSocket supervisor
 - macro refresh loop
-- confirmed-cycle consumer
 - emerging-cycle consumer
+- closed-bar consumer
 - SQLite logger
 - execution engine
 - Telegram notifier
@@ -146,13 +146,15 @@ For each WebSocket update:
 
 ### 6.3 Consumer loops
 
-Confirmed and emerging cycles are processed by separate consumers, but only one scoring pass runs at a time via a shared lock.
+Closed-bar and emerging cycles are processed by separate consumers, but only one scoring pass runs at a time via a shared lock.
 
-Confirmed consumer:
+Closed-bar consumer:
 
 - drains queued confirmed timestamps
 - waits `CYCLE_SETTLE_SECONDS`
-- runs one full confirmed ranking pass
+- advances confirmed history only
+- updates analytics / snapshots
+- does not produce tradeable or Telegram signal tiers
 
 Emerging consumer:
 
@@ -163,8 +165,30 @@ Emerging consumer:
 
 Execution handling:
 
-- if execution is enabled, `entry_ready` can open a short position
-- confirmed cycles can upgrade that position to confirmed / confirmed-strong state
+- if execution is enabled, `entry_ready` can open a long position
+- `entry_ready` promotion is additionally gated by an intraday tradeability filter built from:
+  - equal-weight alt-basket drift over the recent lookback
+  - equal-weight basket trend efficiency
+  - positive-return breadth across the ranked universe
+  - recent intrabar leadership persistence of the current leaders
+- the intraday regime filter only blocks `entry_ready`; it does not suppress broader watchlist / emerging logging
+- momentum ranking is residual by default:
+  - `MOMENTUM_REFERENCE_MODE=absolute` uses raw symbol momentum
+  - `MOMENTUM_REFERENCE_MODE=btc_relative` uses symbol/BTC relative momentum
+  - `MOMENTUM_REFERENCE_MODE=basket_relative` uses symbol-vs-rest-of-basket relative momentum
+  - `MOMENTUM_REFERENCE_MODE=cluster_relative` uses symbol-vs-recent-correlation-cluster relative momentum
+  - `MOMENTUM_REFERENCE_MODE=hybrid_relative` blends BTC-relative and basket-relative references
+- cluster labels can come from:
+  - `CLUSTER_ASSIGNMENT_MODE=manual`
+  - `CLUSTER_ASSIGNMENT_MODE=dynamic`
+  - `CLUSTER_ASSIGNMENT_MODE=hybrid`
+- concentration is constrained both by total open positions and by current cluster labels:
+  - `MAX_OPEN_POSITIONS`
+  - `MAX_POSITIONS_PER_CLUSTER`
+- runtime controls also include:
+  - `OPERATOR_PAUSE_NEW_ENTRIES`
+  - periodic health snapshots
+  - periodic venue-drift checks
 - if `EXECUTION_SUBMIT_ORDERS=true`, the bot:
   - submits a real market order to Bybit demo trading
   - waits for the resulting position to appear
@@ -176,7 +200,6 @@ Execution handling:
   - target notional = `risk budget / stop distance`
   - quantity is rounded down to Bybit `qtyStep`
 - if `EXECUTION_SUBMIT_ORDERS=false`, the bot falls back to local simulated fills and local TP/SL handling
-- if `EXIT_ON_LOST_CONFIRMED=true`, a later confirmed cycle with no qualifying confirmed signal can also close the position
 
 ### 6.4 Recovery
 
@@ -191,7 +214,7 @@ If the WebSocket fails:
 
 In-memory state is maintained in [state.py](state.py).
 
-Confirmed ticker state:
+Closed-bar ticker state:
 
 - rolling close prices per tracked symbol
 - rolling close timestamps per tracked symbol
@@ -204,10 +227,6 @@ Intrabar signal state:
 
 - current intrabar state per universe symbol
 - recent intrabar observations of rank and composite score
-
-Confirmed persistence state:
-
-- recent confirmed observations of rank, composite score, and qualification status
 
 Global macro state:
 
@@ -245,6 +264,11 @@ Constraints:
 
 - if volatility is below `MIN_VOLATILITY`, use the floor instead
 - if the required lookback is unavailable, the ticker is skipped for that cycle
+- if `MOMENTUM_REFERENCE_MODE` is not `absolute`, momentum is computed on a relative-strength series instead of raw price:
+  - `btc_relative`: symbol price divided by BTC price
+  - `basket_relative`: symbol price divided by the equal-weight normalized basket of the rest of the universe
+  - `cluster_relative`: symbol price divided by the equal-weight normalized basket of recent correlation-cluster peers
+  - `hybrid_relative`: weighted blend of BTC-relative and basket-relative references
 
 ### 8.3 Curvature
 
@@ -312,6 +336,8 @@ For each universe symbol:
 - `curvature_raw`
 - `hurst`
 - current price
+- cluster label
+- momentum reference label
 
 Tickers with invalid momentum, curvature, or Hurst are excluded from that cycle.
 
@@ -347,21 +373,7 @@ Default weights:
 - momentum: `0.85`
 - curvature: `0.15`
 
-### 9.5 Confirmed stability bonus
-
-Confirmed ranking includes an additional persistence bonus:
-
-```text
-stability_bonus = CONFIRMED_STABILITY_WEIGHT * (qualified_hits / CONFIRMED_PERSISTENCE_WINDOW)
-```
-
-This bonus is applied only to confirmed cycles.
-
-Default:
-
-- `CONFIRMED_STABILITY_WEIGHT = 0.25`
-
-### 9.6 Final ordering
+### 9.5 Final ordering
 
 Tickers are sorted descending by composite score.
 
@@ -412,8 +424,7 @@ Notably:
 
 ## 12. Signal Stages
 
-The system has two processing stages and five trader-facing signal kinds.
-These signal kinds are the trader-facing vocabulary for the intrabar and close-confirmed lifecycle; they are not separate processing loops.
+The system has two processing stages but only one tradeable signal ladder.
 
 ### 12.1 Processing stages
 
@@ -426,8 +437,6 @@ These signal kinds are the trader-facing vocabulary for the intrabar and close-c
 - `watchlist`
 - `emerging`
 - `entry_ready`
-- `confirmed`
-- `confirmed_strong`
 
 ## 13. Emerging Stage Specification
 
@@ -453,16 +462,23 @@ A ticker becomes `emerging` if:
 
 ### 13.3 Entry-Ready Tier
 
-`entry_ready` is the trader-facing midpoint between `emerging` and `confirmed`.
-It is the primary early-actionable intrabar tier.
+`entry_ready` is the primary actionable tier.
 
 It represents the strongest intrabar candidate:
 
 - the setup is already strengthening
 - the rank/composite shape is good enough to consider early entry before the close
-- it is more selective than broad `emerging` context, but earlier than close-confirmed `confirmed`
+- it is more selective than broad `emerging` context
 
 The current runtime emits it directly from the intrabar signal path using stricter thresholds than broad `emerging`.
+
+Each emitted `entry_ready` row also carries entry diagnostics describing why it passed, including:
+
+- reference mode / reference label
+- current cluster label
+- intraday regime pass count
+- recent rank gain
+- recent composite-score gain
 
 Default values:
 
@@ -480,9 +496,7 @@ Operator-facing guidance:
 
 - `watchlist` is broad context only
 - `emerging` is the developing intrabar setup
-- `entry_ready` is the midpoint entry candidate you would consider for earlier swing-style execution
-- `confirmed` is the close-confirmed breakout
-- `confirmed_strong` is the persistence-upgraded close-confirmed breakout
+- `entry_ready` is the only tradeable candidate
 
 ### 13.4 Intrabar reset
 
@@ -497,54 +511,40 @@ then its intrabar state and intrabar observations are reset to neutral.
 
 The confirmed stage uses confirmed history only.
 
-### 14.1 Base confirmed qualification
+Its job is deliberately narrow:
 
-A ticker becomes `confirmed`-eligible if:
+- append the newly closed bar into rolling state
+- refresh analytics / portfolio snapshots
+- keep the next intrabar cycle honest by advancing the closed-bar baseline
 
-- it passes the core filter
-- its rank is within `TOP_N`
+It does not emit tradeable signal kinds, Telegram alerts, or confirmation upgrades.
 
-Default:
+## 15. Research Tooling
 
-- `TOP_N = 3`
+The repo includes first-class research tooling around the live engine:
 
-### 14.2 Confirmed persistence
+- minute-aware intrabar backtests in `backtest.py`
+- reusable replay-plan grids via `--grid-setting`
+- bounded worker-process parallelism via `--variant-workers`
+- built-in stress variants via `--stress-profile`
+- walk-forward validation with exported candidate leaderboards
+- Telegram-vs-backtest reconciliation in `reconcile.py`
 
-For persistence accounting, a ticker is marked as persistence-qualified when:
+The intended research discipline is documented in `BACKTEST_RESEARCH_PLAN.md`.
 
-- it passes the core filter
-- its rank is within `CONFIRMED_PERSISTENCE_RANK`
-
-Default:
-
-- `CONFIRMED_PERSISTENCE_RANK = 3`
-
-### 14.3 Confirmed strong upgrade
-
-A confirmed ticker upgrades to `confirmed_strong` if its recent confirmed observation window contains at least `CONFIRMED_PERSISTENCE_MIN_HITS` qualified observations.
-
-Defaults:
-
-- `CONFIRMED_PERSISTENCE_WINDOW = 3`
-- `CONFIRMED_PERSISTENCE_MIN_HITS = 2`
-
-The first valid confirmed breakout is not blocked by persistence. Persistence upgrades confidence; it does not delay the first confirmed signal.
-
-## 15. Alerting Rules
+## 16. Alerting Rules
 
 Telegram alerting is handled by [alerting.py](alerting.py).
 
-### 15.1 Event alerts
+### 16.1 Event alerts
 
 Event alerts are sent for:
 
 - `watchlist`, only if enabled
 - `emerging`
 - `entry_ready`
-- `confirmed`
-- `confirmed_strong`
 
-### 15.2 Watchlist Telegram suppression
+### 16.2 Watchlist Telegram suppression
 
 `watchlist` Telegram sends are controlled by:
 
@@ -573,44 +573,15 @@ An emerging-stage event only alerts when:
 - the ticker newly transitions into a different intrabar state
 - its cooldown for that `(ticker, signal_kind)` pair has expired
 
-### 15.4 Confirmed cooldowns
-
-Confirmed cooldowns are keyed by `(ticker, signal_kind)`.
-
-Default:
-
-- `12` hours
-
-### 15.5 Success semantics
+### 15.4 Success semantics
 
 Cooldown state is updated only after a notifier send succeeds.
 
-## 16. Confirmed Summary Specification
-
-Every confirmed 15-minute cycle may send a summary Telegram message.
-
-The confirmed summary includes:
-
-- cycle time
-- BTC regime score
-- BTCDOM state
-- BTCDOM percent change
-- qualified confirmed signals for that cycle
-- top `SUMMARY_TOP_N` ranked names
-- bottom `SUMMARY_BOTTOM_N` ranked names
-
-Defaults:
-
-- top `5`
-- bottom `5`
-
-Duplicate confirmed summaries are suppressed by `(stage, cycle_time_ms)` persistence in SQLite.
-
-## 17. Logging And Persistence
+## 16. Logging And Persistence
 
 SQLite persistence is handled by [database.py](database.py).
 
-### 17.1 Signal row logging
+### 16.1 Signal row logging
 
 Every evaluated ticker row is logged, even if:
 
@@ -637,11 +608,7 @@ Stored fields include:
 - `dom_state`
 - `dom_change_pct`
 
-### 17.2 Summary dedupe
-
-The `summary_cycles` table is used to prevent duplicate summary sends after restarts.
-
-## 18. Runtime Counters
+## 17. Runtime Counters
 
 The service maintains runtime counters for:
 
@@ -657,6 +624,38 @@ The service maintains runtime counters for:
 - emerging queue drops
 
 A runtime summary is emitted on shutdown.
+
+The runtime also persists a lightweight control plane to SQLite:
+
+- `run_manifests`
+- `runtime_health_snapshots`
+- `runtime_events`
+
+These are intended for operations and risk visibility, not alpha research.
+
+## 18. Monitoring And Controls
+
+Startup validation:
+
+- invalid live config raises before the service starts
+- warnings are logged and also persisted as runtime events once the DB is available
+
+Live control plane:
+
+- `run_manifests` stores git commit, config fingerprint, and basic execution mode
+- `runtime_health_snapshots` stores queue depth, last activity timestamps, open-position count, and daily stop-loss count
+- `runtime_events` stores control blocks, startup/shutdown events, and drift findings
+
+Operator controls:
+
+- `OPERATOR_PAUSE_NEW_ENTRIES=true` blocks fresh entries without shutting the process down
+- `MAX_DAILY_STOP_LOSSES` blocks new entries after enough stop losses in the UTC day
+- `MAX_OPEN_POSITIONS`, `MAX_POSITIONS_PER_CLUSTER`, and `MAX_ENTRIES_PER_REBALANCE` remain live guardrails
+
+Position drift monitoring:
+
+- when live venue mode is enabled, the runtime periodically compares local open positions against Bybit venue state
+- mismatches are logged as runtime events
 
 ## 19. Rate Limits And Failure Handling
 
@@ -677,6 +676,7 @@ Operator tooling shipped with the repo:
 - [smoke.py](smoke.py): short validation run
 - [benchmark.py](benchmark.py): cycle latency benchmark
 - [report.py](report.py): SQLite reporting
+- [monitor.py](monitor.py): runtime manifest / health / event inspection
 - [universe_validator.py](universe_validator.py): live universe check
 
 ## 21. Known Compromises

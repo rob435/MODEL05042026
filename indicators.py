@@ -89,6 +89,80 @@ def realized_volatility(returns: np.ndarray, annualization: float = 365.0) -> fl
     return float(np.std(returns, ddof=1) * math.sqrt(annualization))
 
 
+def path_efficiency(prices: np.ndarray) -> float:
+    prices = np.asarray(prices, dtype=float)
+    if prices.size < 2 or np.any(prices <= 0):
+        return float("nan")
+    returns = log_returns(prices)
+    if returns.size == 0:
+        return float("nan")
+    total_path = float(np.sum(np.abs(returns)))
+    if not math.isfinite(total_path) or total_path == 0.0:
+        return 0.0
+    net_move = abs(float(np.log(prices[-1] / prices[0])))
+    return float(np.clip(net_move / total_path, 0.0, 1.0))
+
+
+def correlation_cluster_labels(
+    price_history_by_symbol: dict[str, np.ndarray],
+    *,
+    lookback_bars: int,
+    threshold: float,
+) -> dict[str, str]:
+    symbols = sorted(price_history_by_symbol)
+    if len(symbols) < 2:
+        return {symbol: f"solo:{symbol}" for symbol in symbols}
+    returns_by_symbol: dict[str, np.ndarray] = {}
+    for symbol in symbols:
+        prices = np.asarray(price_history_by_symbol[symbol], dtype=float)
+        if prices.size < lookback_bars + 1 or np.any(prices <= 0):
+            returns_by_symbol[symbol] = np.array([], dtype=float)
+            continue
+        returns_by_symbol[symbol] = log_returns(prices[-(lookback_bars + 1) :])
+    adjacency: dict[str, set[str]] = {symbol: set() for symbol in symbols}
+    for idx, left in enumerate(symbols):
+        left_returns = returns_by_symbol[left]
+        if left_returns.size < 3 or float(np.std(left_returns, ddof=0)) < 1e-12:
+            continue
+        for right in symbols[idx + 1 :]:
+            right_returns = returns_by_symbol[right]
+            if (
+                right_returns.size != left_returns.size
+                or right_returns.size < 3
+                or float(np.std(right_returns, ddof=0)) < 1e-12
+            ):
+                continue
+            correlation = float(np.corrcoef(left_returns, right_returns)[0, 1])
+            if not math.isfinite(correlation):
+                continue
+            if correlation >= threshold:
+                adjacency[left].add(right)
+                adjacency[right].add(left)
+    labels: dict[str, str] = {}
+    visited: set[str] = set()
+    for symbol in symbols:
+        if symbol in visited:
+            continue
+        stack = [symbol]
+        component: list[str] = []
+        while stack:
+            current = stack.pop()
+            if current in visited:
+                continue
+            visited.add(current)
+            component.append(current)
+            stack.extend(neighbor for neighbor in adjacency[current] if neighbor not in visited)
+        component.sort()
+        if len(component) == 1:
+            labels[component[0]] = f"solo:{component[0]}"
+            continue
+        leader = component[0]
+        label = f"corr:{leader}"
+        for member in component:
+            labels[member] = label
+    return labels
+
+
 def btc_regime_score(
     btc_daily_closes: np.ndarray,
     vol_lookback: int,
@@ -126,18 +200,21 @@ def hurst_exponent(prices: np.ndarray, min_window: int = 8) -> float:
         chunk_count = profile.size // window
         if chunk_count < 2:
             continue
-        t = np.arange(window, dtype=float)
-        rms_values = []
-        for idx in range(chunk_count):
-            chunk = profile[idx * window : (idx + 1) * window]
-            coeff = np.polyfit(t, chunk, 1)
-            trend = np.polyval(coeff, t)
-            residual = chunk - trend
-            rms = float(np.sqrt(np.mean(residual**2)))
-            if math.isfinite(rms) and rms > 0:
-                rms_values.append(rms)
-        if rms_values:
-            fluctuation_points.append((window, float(np.mean(rms_values))))
+        samples = profile[: chunk_count * window].reshape(chunk_count, window)
+        x = np.arange(window, dtype=float)
+        x_centered = x - x.mean()
+        denominator = float(np.dot(x_centered, x_centered))
+        if denominator == 0.0:
+            continue
+        sample_means = samples.mean(axis=1, keepdims=True)
+        centered_samples = samples - sample_means
+        slopes = centered_samples @ x_centered / denominator
+        trend = sample_means + (slopes[:, None] * x_centered[None, :])
+        residuals = samples - trend
+        rms_values = np.sqrt(np.mean(residuals**2, axis=1))
+        finite_rms = rms_values[np.isfinite(rms_values) & (rms_values > 0.0)]
+        if finite_rms.size > 0:
+            fluctuation_points.append((window, float(np.mean(finite_rms))))
     if len(fluctuation_points) < 2:
         return float("nan")
     window_logs = np.log(np.asarray([point[0] for point in fluctuation_points], dtype=float))

@@ -57,14 +57,27 @@ class Settings:
     execution_submit_orders: bool = False
     bybit_api_key: str | None = None
     bybit_api_secret: str | None = None
+    backtest_mode: bool = False
+    backtest_starting_equity_usd: float = 100_000.0
+    backtest_fee_rate: float = 0.00055
+    backtest_slippage_bps: float = 2.0
+    backtest_max_gross_exposure_multiple: float = 1.5
+    backtest_intrabar_interval: str = "1"
+    backtest_cache_enabled: bool = True
+    backtest_cache_path: str = ".cache/backtest_candles.sqlite3"
+    backtest_research_fast: bool = False
+    backtest_variant_workers: int = 1
+    backtest_universe_policy: str = "window_available"
+    backtest_min_active_universe: int = 1
     entry_notional_usd: float = 100.0
     risk_per_trade_pct: float = 0.01
     max_open_positions: int = 3
+    max_positions_per_cluster: int = 1
     max_entries_per_rebalance: int = 0
-    take_profit_pct: float = 0.03
+    take_profit_pct: float = 0.02
     stop_loss_pct: float = 0.02
     max_daily_stop_losses: int = 0
-    exit_on_lost_confirmed: bool = False
+    operator_pause_new_entries: bool = False
     bybit_recv_window: int = 5000
     trade_fill_poll_attempts: int = 10
     trade_fill_poll_delay_seconds: float = 0.5
@@ -82,28 +95,33 @@ class Settings:
     btcdom_neutral_threshold_pct: float = 0.002
     momentum_lookback: int = 48
     momentum_skip: int = 4
+    momentum_reference_mode: str = "cluster_relative"
+    momentum_reference_blend_btc_weight: float = 0.35
     curvature_ma_window: int = 8
     curvature_signal_window: int = 6
     hurst_window: int = 96
     hurst_cutoff: float = 0.55
     top_n: int = 3
+    cluster_assignment_mode: str = "dynamic"
+    cluster_correlation_lookback_bars: int = 48
+    cluster_correlation_threshold: float = 0.7
+    intraday_regime_filter_enabled: bool = True
+    intraday_regime_lookback_bars: int = 16
+    intraday_regime_top_n: int = 3
+    intraday_regime_min_breadth: float = 0.55
+    intraday_regime_min_efficiency: float = 0.35
+    intraday_regime_min_basket_return: float = 0.0
+    intraday_regime_min_leadership_persistence: float = 0.25
+    intraday_regime_min_pass_count: int = 3
     watchlist_top_n: int = 8
     emerging_top_n: int = 5
     entry_ready_top_n: int = 4
-    confirmed_persistence_window: int = 3
-    confirmed_persistence_min_hits: int = 2
-    confirmed_persistence_rank: int = 3
     ranking_log_top_n: int = 5
     telegram_signal_alerts_enabled: bool = True
-    telegram_summary_enabled: bool = True
-    summary_top_n: int = 5
-    summary_bottom_n: int = 5
     momentum_weight: float = 0.85
     curvature_weight: float = 0.15
     momentum_z_clip: float = 3.0
     curvature_z_clip: float = 2.5
-    confirmed_stability_weight: float = 0.25
-    cooldown_hours: int = 12
     emerging_cooldown_minutes: int = 60
     watchlist_cooldown_minutes: int = 30
     entry_ready_cooldown_minutes: int = 15
@@ -132,6 +150,10 @@ class Settings:
     analytics_log_portfolio_snapshots: bool = True
     analytics_portfolio_snapshot_on_emerging: bool = False
     analytics_post_exit_bars: int = 24
+    runtime_health_snapshot_enabled: bool = True
+    runtime_health_snapshot_seconds: float = 60.0
+    runtime_drift_check_enabled: bool = True
+    runtime_drift_check_seconds: float = 120.0
     telegram_bot_token: str | None = None
     telegram_chat_id: str | None = None
     log_level: str = "INFO"
@@ -179,14 +201,33 @@ def load_settings() -> Settings:
         execution_submit_orders=_get_bool("EXECUTION_SUBMIT_ORDERS", False),
         bybit_api_key=os.getenv("BYBIT_API_KEY"),
         bybit_api_secret=os.getenv("BYBIT_API_SECRET"),
+        backtest_mode=_get_bool("BACKTEST_MODE", False),
+        backtest_starting_equity_usd=_get_float("BACKTEST_STARTING_EQUITY_USD", 100_000.0),
+        backtest_fee_rate=_get_float("BACKTEST_FEE_RATE", 0.00055),
+        backtest_slippage_bps=_get_float("BACKTEST_SLIPPAGE_BPS", 2.0),
+        backtest_max_gross_exposure_multiple=_get_float(
+            "BACKTEST_MAX_GROSS_EXPOSURE_MULTIPLE",
+            1.5,
+        ),
+        backtest_intrabar_interval=os.getenv("BACKTEST_INTRABAR_INTERVAL", "1"),
+        backtest_cache_enabled=_get_bool("BACKTEST_CACHE_ENABLED", True),
+        backtest_cache_path=os.getenv(
+            "BACKTEST_CACHE_PATH",
+            ".cache/backtest_candles.sqlite3",
+        ),
+        backtest_research_fast=_get_bool("BACKTEST_RESEARCH_FAST", False),
+        backtest_variant_workers=_get_int("BACKTEST_VARIANT_WORKERS", 1),
+        backtest_universe_policy=os.getenv("BACKTEST_UNIVERSE_POLICY", "window_available").strip().lower(),
+        backtest_min_active_universe=_get_int("BACKTEST_MIN_ACTIVE_UNIVERSE", 1),
         entry_notional_usd=_get_float("ENTRY_NOTIONAL_USD", 100.0),
         risk_per_trade_pct=_get_float("RISK_PER_TRADE_PCT", 0.01),
         max_open_positions=_get_int("MAX_OPEN_POSITIONS", 3),
+        max_positions_per_cluster=_get_int("MAX_POSITIONS_PER_CLUSTER", 1),
         max_entries_per_rebalance=_get_int("MAX_ENTRIES_PER_REBALANCE", 0),
-        take_profit_pct=_get_float("TAKE_PROFIT_PCT", 0.03),
+        take_profit_pct=_get_float("TAKE_PROFIT_PCT", 0.02),
         stop_loss_pct=_get_float("STOP_LOSS_PCT", 0.02),
         max_daily_stop_losses=_get_int("MAX_DAILY_STOP_LOSSES", 0),
-        exit_on_lost_confirmed=_get_bool("EXIT_ON_LOST_CONFIRMED", False),
+        operator_pause_new_entries=_get_bool("OPERATOR_PAUSE_NEW_ENTRIES", False),
         bybit_recv_window=_get_int("BYBIT_RECV_WINDOW", 5000),
         trade_fill_poll_attempts=_get_int("TRADE_FILL_POLL_ATTEMPTS", 10),
         trade_fill_poll_delay_seconds=_get_float("TRADE_FILL_POLL_DELAY_SECONDS", 0.5),
@@ -206,28 +247,36 @@ def load_settings() -> Settings:
         btcdom_neutral_threshold_pct=_get_float("BTCDOM_NEUTRAL_THRESHOLD_PCT", 0.002),
         momentum_lookback=_get_int("MOMENTUM_LOOKBACK", 48),
         momentum_skip=_get_int("MOMENTUM_SKIP", 4),
+        momentum_reference_mode=os.getenv("MOMENTUM_REFERENCE_MODE", "cluster_relative").strip().lower(),
+        momentum_reference_blend_btc_weight=_get_float("MOMENTUM_REFERENCE_BLEND_BTC_WEIGHT", 0.35),
         curvature_ma_window=_get_int("CURVATURE_MA_WINDOW", 8),
         curvature_signal_window=_get_int("CURVATURE_SIGNAL_WINDOW", 6),
         hurst_window=_get_int("HURST_WINDOW", 96),
         hurst_cutoff=_get_float("HURST_CUTOFF", 0.55),
         top_n=_get_int("TOP_N", 3),
+        cluster_assignment_mode=os.getenv("CLUSTER_ASSIGNMENT_MODE", "dynamic").strip().lower(),
+        cluster_correlation_lookback_bars=_get_int("CLUSTER_CORRELATION_LOOKBACK_BARS", 48),
+        cluster_correlation_threshold=_get_float("CLUSTER_CORRELATION_THRESHOLD", 0.7),
+        intraday_regime_filter_enabled=_get_bool("INTRADAY_REGIME_FILTER_ENABLED", True),
+        intraday_regime_lookback_bars=_get_int("INTRADAY_REGIME_LOOKBACK_BARS", 16),
+        intraday_regime_top_n=_get_int("INTRADAY_REGIME_TOP_N", 3),
+        intraday_regime_min_breadth=_get_float("INTRADAY_REGIME_MIN_BREADTH", 0.55),
+        intraday_regime_min_efficiency=_get_float("INTRADAY_REGIME_MIN_EFFICIENCY", 0.35),
+        intraday_regime_min_basket_return=_get_float("INTRADAY_REGIME_MIN_BASKET_RETURN", 0.0),
+        intraday_regime_min_leadership_persistence=_get_float(
+            "INTRADAY_REGIME_MIN_LEADERSHIP_PERSISTENCE",
+            0.25,
+        ),
+        intraday_regime_min_pass_count=_get_int("INTRADAY_REGIME_MIN_PASS_COUNT", 3),
         watchlist_top_n=_get_int("WATCHLIST_TOP_N", 8),
         emerging_top_n=_get_int("EMERGING_TOP_N", 5),
         entry_ready_top_n=_get_int("ENTRY_READY_TOP_N", 4),
-        confirmed_persistence_window=_get_int("CONFIRMED_PERSISTENCE_WINDOW", 3),
-        confirmed_persistence_min_hits=_get_int("CONFIRMED_PERSISTENCE_MIN_HITS", 2),
-        confirmed_persistence_rank=_get_int("CONFIRMED_PERSISTENCE_RANK", 3),
         ranking_log_top_n=_get_int("RANKING_LOG_TOP_N", 5),
         telegram_signal_alerts_enabled=_get_bool("TELEGRAM_SIGNAL_ALERTS_ENABLED", True),
-        telegram_summary_enabled=_get_bool("TELEGRAM_SUMMARY_ENABLED", True),
-        summary_top_n=_get_int("SUMMARY_TOP_N", 5),
-        summary_bottom_n=_get_int("SUMMARY_BOTTOM_N", 5),
         momentum_weight=_get_float("MOMENTUM_WEIGHT", 0.85),
         curvature_weight=_get_float("CURVATURE_WEIGHT", 0.15),
         momentum_z_clip=_get_float("MOMENTUM_Z_CLIP", 3.0),
         curvature_z_clip=_get_float("CURVATURE_Z_CLIP", 2.5),
-        confirmed_stability_weight=_get_float("CONFIRMED_STABILITY_WEIGHT", 0.25),
-        cooldown_hours=_get_int("COOLDOWN_HOURS", 12),
         emerging_cooldown_minutes=_get_int("EMERGING_COOLDOWN_MINUTES", 60),
         watchlist_cooldown_minutes=_get_int("WATCHLIST_COOLDOWN_MINUTES", 30),
         entry_ready_cooldown_minutes=_get_int("ENTRY_READY_COOLDOWN_MINUTES", 15),
@@ -259,6 +308,10 @@ def load_settings() -> Settings:
             False,
         ),
         analytics_post_exit_bars=_get_int("ANALYTICS_POST_EXIT_BARS", 24),
+        runtime_health_snapshot_enabled=_get_bool("RUNTIME_HEALTH_SNAPSHOT_ENABLED", True),
+        runtime_health_snapshot_seconds=_get_float("RUNTIME_HEALTH_SNAPSHOT_SECONDS", 60.0),
+        runtime_drift_check_enabled=_get_bool("RUNTIME_DRIFT_CHECK_ENABLED", True),
+        runtime_drift_check_seconds=_get_float("RUNTIME_DRIFT_CHECK_SECONDS", 120.0),
         telegram_bot_token=os.getenv("TELEGRAM_BOT_TOKEN"),
         telegram_chat_id=os.getenv("TELEGRAM_CHAT_ID"),
         log_level=os.getenv("LOG_LEVEL", "INFO").upper(),

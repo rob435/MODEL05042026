@@ -12,8 +12,10 @@ from alerting import ExecutionPayload, TelegramNotifier
 from config import Settings
 from database import SignalDatabase
 from exchange import BybitTradeClient, WalletBalance, round_decimal
+from indicators import correlation_cluster_labels
 from signal_engine import RankedSignal
 from state import MarketState
+from universe import ticker_cluster
 
 LOGGER = logging.getLogger(__name__)
 
@@ -77,13 +79,17 @@ class ExecutionEngine:
         self.database = database
         self.notifier = notifier
         self.client = client or SimulatedExecutionClient(settings)
+        self.runtime_run_id: str | None = None
+
+    def set_runtime_run_id(self, run_id: str | None) -> None:
+        self.runtime_run_id = run_id
 
     def _using_live_venue(self) -> bool:
         enabled = getattr(self.client, "enabled", None)
         return bool(self.settings.execution_submit_orders and callable(enabled) and enabled())
 
     def _now(self, cycle_time_ms: int | None, stage: str) -> datetime:
-        if cycle_time_ms is not None and stage == "confirmed":
+        if cycle_time_ms is not None and (stage == "confirmed" or self.settings.backtest_mode):
             return datetime.fromtimestamp(cycle_time_ms / 1000, tz=timezone.utc)
         return datetime.now(timezone.utc)
 
@@ -115,11 +121,11 @@ class ExecutionEngine:
         return f"{lifecycle}-{ticker.lower()}-{uuid4().hex[:12]}"
 
     def _infer_exit_event(self, entry_price: float, exit_price: float) -> str:
-        tp_price = entry_price * (1 - self.settings.take_profit_pct)
-        sl_price = entry_price * (1 + self.settings.stop_loss_pct)
-        if exit_price <= tp_price:
+        tp_price = entry_price * (1 + self.settings.take_profit_pct)
+        sl_price = entry_price * (1 - self.settings.stop_loss_pct)
+        if exit_price >= tp_price:
             return "take_profit_exit"
-        if exit_price >= sl_price:
+        if exit_price <= sl_price:
             return "stop_loss_exit"
         return "exchange_exit"
 
@@ -148,6 +154,65 @@ class ExecutionEngine:
         if returns.size < 2:
             return None
         return float(np.std(returns, ddof=1))
+
+    def _current_cluster_labels(self, stage: str) -> dict[str, str]:
+        if self.settings.cluster_assignment_mode == "manual":
+            return {
+                symbol: f"manual:{ticker_cluster(symbol)}"
+                for symbol in self.settings.universe
+            }
+        include_provisional = stage == "emerging"
+        price_history_by_symbol = {
+            symbol: self.state.get_prices(symbol, include_provisional=include_provisional)
+            for symbol in self.settings.universe
+            if self.state.get_prices(symbol, include_provisional=include_provisional).size
+            >= max(self.settings.cluster_correlation_lookback_bars + 1, 4)
+        }
+        labels = correlation_cluster_labels(
+            price_history_by_symbol,
+            lookback_bars=max(self.settings.cluster_correlation_lookback_bars, 3),
+            threshold=self.settings.cluster_correlation_threshold,
+        )
+        if self.settings.cluster_assignment_mode == "dynamic":
+            return labels
+        if self.settings.cluster_assignment_mode == "hybrid":
+            resolved: dict[str, str] = {}
+            for symbol in self.settings.universe:
+                label = labels.get(symbol)
+                if label is None or label.startswith("solo:"):
+                    resolved[symbol] = f"manual:{ticker_cluster(symbol)}"
+                else:
+                    resolved[symbol] = label
+            return resolved
+        raise ValueError(f"Unsupported CLUSTER_ASSIGNMENT_MODE: {self.settings.cluster_assignment_mode}")
+
+    async def _log_runtime_event(
+        self,
+        *,
+        severity: str,
+        event_type: str,
+        detail: str,
+        stage: str | None = None,
+        ticker: str | None = None,
+    ) -> None:
+        await self.database.log_runtime_event(
+            run_id=self.runtime_run_id,
+            created_at=datetime.now(timezone.utc).isoformat(),
+            severity=severity,
+            component="execution",
+            event_type=event_type,
+            detail=detail,
+            stage=stage,
+            ticker=ticker,
+        )
+
+    def _open_cluster_counts(self, open_positions: dict[str, dict], *, stage: str) -> dict[str, int]:
+        cluster_labels = self._current_cluster_labels(stage)
+        counts: dict[str, int] = {}
+        for ticker in open_positions:
+            cluster = cluster_labels.get(str(ticker), f"manual:{ticker_cluster(str(ticker))}")
+            counts[cluster] = counts.get(cluster, 0) + 1
+        return counts
 
     async def _record_position_mark(
         self,
@@ -232,6 +297,25 @@ class ExecutionEngine:
                 phase="open",
             )
 
+    async def detect_position_drift(self) -> tuple[str, str]:
+        if not self._using_live_venue():
+            return ("disabled", "live venue not enabled")
+        local_open = {str(row["ticker"]) for row in await self.database.list_open_positions()}
+        venue_open: set[str] = set()
+        for symbol in self.settings.universe:
+            position = await self.client.get_position(symbol)
+            if position is not None and position.size > 0:
+                venue_open.add(symbol)
+        local_only = sorted(local_open - venue_open)
+        venue_only = sorted(venue_open - local_open)
+        if not local_only and not venue_only:
+            return ("ok", f"aligned local={len(local_open)} venue={len(venue_open)}")
+        detail = (
+            f"local_only={','.join(local_only) if local_only else 'none'} "
+            f"venue_only={','.join(venue_only) if venue_only else 'none'}"
+        )
+        return ("mismatch", detail)
+
     async def _record_trade_analytics(
         self,
         *,
@@ -310,6 +394,7 @@ class ExecutionEngine:
             entry_momentum_z=position["entry_momentum_z"],
             entry_curvature=position["entry_curvature"],
             entry_hurst=position["entry_hurst"],
+            notes=str(position["notes"] or ""),
             post_exit_bars_target=max(self.settings.analytics_post_exit_bars, 0),
             post_exit_bars_observed=0,
             post_exit_completed=int(self.settings.analytics_post_exit_bars <= 0),
@@ -341,14 +426,12 @@ class ExecutionEngine:
     ) -> None:
         if not self.settings.analytics_enabled or self.settings.analytics_post_exit_bars <= 0:
             return
-        if stage != "confirmed":
-            return
         trackers = await self.database.list_pending_post_exit_analytics()
         if not trackers:
             return
         timestamp_iso = self._now(cycle_time_ms=cycle_time_ms, stage=stage).isoformat()
         for tracker in trackers:
-            price = self._latest_price(str(tracker["ticker"]), stage="confirmed")
+            price = self._latest_price(str(tracker["ticker"]), stage=stage)
             if price is None:
                 continue
             side = str(tracker["side"])
@@ -490,7 +573,7 @@ class ExecutionEngine:
                 ExecutionPayload(
                     event=event,
                     ticker=ticker,
-                    side="SHORT",
+                    side="LONG",
                     stage=stage,
                     signal_kind=signal_kind,
                     quantity=quantity,
@@ -518,7 +601,7 @@ class ExecutionEngine:
         quantity = float(position["quantity"])
         submission = await self.client.submit_market_order(
             ticker=ticker,
-            side="Buy",
+            side="Sell",
             quantity=quantity,
             price_hint=exit_price,
             reduce_only=True,
@@ -526,7 +609,7 @@ class ExecutionEngine:
         order_id = await self.database.create_order(
             client_order_id=self._client_order_id("exit", ticker),
             ticker=ticker,
-            side="Buy",
+            side="Sell",
             order_type="Market",
             lifecycle="exit",
             status=submission.status,
@@ -545,7 +628,7 @@ class ExecutionEngine:
             notes=submission.notes,
         )
         realized_price = float(submission.fill_price or exit_price)
-        pnl_pct = 1.0 - (realized_price / float(position["entry_price"]))
+        pnl_pct = (realized_price / float(position["entry_price"])) - 1.0
         exit_event = self._infer_exit_event(float(position["entry_price"]), realized_price)
         await self.database.close_position(
             int(position["id"]),
@@ -577,7 +660,7 @@ class ExecutionEngine:
         )
         return ExecutionAction(
             ticker=ticker,
-            action="exit_short",
+            action="exit_long",
             signal_kind=signal_kind,
             detail=exit_reason,
             order_id=order_id,
@@ -599,7 +682,7 @@ class ExecutionEngine:
             if current_price is None:
                 continue
             entry_price = float(position["entry_price"])
-            pnl_pct = 1.0 - (current_price / entry_price)
+            pnl_pct = (current_price / entry_price) - 1.0
             if pnl_pct >= self.settings.take_profit_pct:
                 actions.append(
                     await self._submit_simulated_exit(
@@ -650,11 +733,11 @@ class ExecutionEngine:
             now_iso = datetime.fromtimestamp(closed.updated_time_ms / 1000, tz=timezone.utc).isoformat()
             exit_price = float(closed.avg_exit_price)
             entry_price = float(position["entry_price"])
-            pnl_pct = 1.0 - (exit_price / entry_price) if entry_price > 0 else None
+            pnl_pct = (exit_price / entry_price) - 1.0 if entry_price > 0 else None
             order_id = await self.database.create_order(
                 client_order_id=self._client_order_id("exit-sync", ticker),
                 ticker=ticker,
-                side="Buy",
+                side="Sell",
                 order_type="Market",
                 lifecycle="exit",
                 status="filled_sync",
@@ -751,13 +834,8 @@ class ExecutionEngine:
             )
             return actions
         if stage == "confirmed":
-            stage_actions = await self._process_confirmed(
-                cycle_time_ms=cycle_time_ms,
-                ranked_signals=ranked_signals,
-                blocked_tickers=closed_tickers,
-            )
             await self._update_post_exit_analytics(stage=stage, cycle_time_ms=cycle_time_ms)
-            actions = sync_actions + stage_actions
+            actions = sync_actions
             await self._maybe_log_portfolio_snapshot(
                 stage=stage,
                 cycle_time_ms=cycle_time_ms,
@@ -786,6 +864,7 @@ class ExecutionEngine:
         open_positions = {
             row["ticker"]: row for row in await self.database.list_open_positions()
         }
+        cluster_counts = self._open_cluster_counts(open_positions, stage="emerging")
         daily_stop_loss_count = 0
         if self.settings.max_daily_stop_losses > 0:
             daily_stop_loss_count = await self.database.count_trade_exit_events_for_day(
@@ -795,38 +874,99 @@ class ExecutionEngine:
         candidates = [signal for signal in ranked_signals if signal.signal_kind == "entry_ready"]
         candidates.sort(key=lambda signal: signal.rank)
         for signal in candidates:
-            if (
-                self.settings.max_open_positions > 0
-                and len(open_positions) >= self.settings.max_open_positions
-            ):
+            if self.settings.operator_pause_new_entries:
+                detail = "operator_pause_new_entries"
                 actions.append(
                     ExecutionAction(
                         ticker=signal.ticker,
                         action="skip_entry",
                         signal_kind=signal.signal_kind,
-                        detail=(
-                            "max_open_positions_reached "
-                            f"count={len(open_positions)} "
-                            f"limit={self.settings.max_open_positions}"
-                        ),
+                        detail=detail,
                     )
+                )
+                await self._log_runtime_event(
+                    severity="warning",
+                    event_type="entry_blocked",
+                    detail=detail,
+                    stage="emerging",
+                    ticker=signal.ticker,
+                )
+                continue
+            if (
+                self.settings.max_open_positions > 0
+                and len(open_positions) >= self.settings.max_open_positions
+            ):
+                detail = (
+                    "max_open_positions_reached "
+                    f"count={len(open_positions)} "
+                    f"limit={self.settings.max_open_positions}"
+                )
+                actions.append(
+                    ExecutionAction(
+                        ticker=signal.ticker,
+                        action="skip_entry",
+                        signal_kind=signal.signal_kind,
+                        detail=detail,
+                    )
+                )
+                await self._log_runtime_event(
+                    severity="warning",
+                    event_type="entry_blocked",
+                    detail=detail,
+                    stage="emerging",
+                    ticker=signal.ticker,
                 )
                 continue
             if (
                 self.settings.max_entries_per_rebalance > 0
                 and entered_this_rebalance >= self.settings.max_entries_per_rebalance
             ):
+                detail = (
+                    "max_entries_per_rebalance_reached "
+                    f"count={entered_this_rebalance} "
+                    f"limit={self.settings.max_entries_per_rebalance}"
+                )
                 actions.append(
                     ExecutionAction(
                         ticker=signal.ticker,
                         action="skip_entry",
                         signal_kind=signal.signal_kind,
-                        detail=(
-                            "max_entries_per_rebalance_reached "
-                            f"count={entered_this_rebalance} "
-                            f"limit={self.settings.max_entries_per_rebalance}"
-                        ),
+                        detail=detail,
                     )
+                )
+                await self._log_runtime_event(
+                    severity="warning",
+                    event_type="entry_blocked",
+                    detail=detail,
+                    stage="emerging",
+                    ticker=signal.ticker,
+                )
+                continue
+            cluster = signal.cluster_label or f"manual:{ticker_cluster(signal.ticker)}"
+            if (
+                self.settings.max_positions_per_cluster > 0
+                and cluster_counts.get(cluster, 0) >= self.settings.max_positions_per_cluster
+            ):
+                detail = (
+                    "max_positions_per_cluster_reached "
+                    f"cluster={cluster} "
+                    f"count={cluster_counts.get(cluster, 0)} "
+                    f"limit={self.settings.max_positions_per_cluster}"
+                )
+                actions.append(
+                    ExecutionAction(
+                        ticker=signal.ticker,
+                        action="skip_entry",
+                        signal_kind=signal.signal_kind,
+                        detail=detail,
+                    )
+                )
+                await self._log_runtime_event(
+                    severity="warning",
+                    event_type="entry_blocked",
+                    detail=detail,
+                    stage="emerging",
+                    ticker=signal.ticker,
                 )
                 continue
             if signal.ticker in blocked_tickers:
@@ -854,16 +994,24 @@ class ExecutionEngine:
                 self.settings.max_daily_stop_losses > 0
                 and daily_stop_loss_count >= self.settings.max_daily_stop_losses
             ):
+                detail = (
+                    "max_daily_stop_losses_reached "
+                    f"count={daily_stop_loss_count} limit={self.settings.max_daily_stop_losses}"
+                )
                 actions.append(
                     ExecutionAction(
                         ticker=signal.ticker,
                         action="skip_entry",
                         signal_kind=signal.signal_kind,
-                        detail=(
-                            "max_daily_stop_losses_reached "
-                            f"count={daily_stop_loss_count} limit={self.settings.max_daily_stop_losses}"
-                        ),
+                        detail=detail,
                     )
+                )
+                await self._log_runtime_event(
+                    severity="warning",
+                    event_type="entry_blocked",
+                    detail=detail,
+                    stage="emerging",
+                    ticker=signal.ticker,
                 )
                 continue
 
@@ -906,19 +1054,19 @@ class ExecutionEngine:
                 try:
                     ack = await self.client.place_market_order(
                         symbol=signal.ticker,
-                        side="Sell",
+                        side="Buy",
                         quantity=qty,
                         order_link_id=order_link_id,
                     )
                     venue_position = await self.client.wait_for_position(signal.ticker)
                     entry_price = venue_position.avg_price
                     tp_price = round_decimal(
-                        entry_price * Decimal(str(1 - self.settings.take_profit_pct)),
+                        entry_price * Decimal(str(1 + self.settings.take_profit_pct)),
                         spec.tick_size,
                         ROUND_HALF_UP,
                     )
                     sl_price = round_decimal(
-                        entry_price * Decimal(str(1 + self.settings.stop_loss_pct)),
+                        entry_price * Decimal(str(1 - self.settings.stop_loss_pct)),
                         spec.tick_size,
                         ROUND_HALF_UP,
                     )
@@ -932,7 +1080,7 @@ class ExecutionEngine:
                     order_id = await self.database.create_order(
                         client_order_id=order_link_id,
                         ticker=signal.ticker,
-                        side="Sell",
+                        side="Buy",
                         order_type="Market",
                         lifecycle="entry",
                         status="rejected",
@@ -962,12 +1110,12 @@ class ExecutionEngine:
                 notes = (
                     f"Bybit live demo order placed. Risk={self.settings.risk_per_trade_pct * 100:.2f}% "
                     f"of available balance. Venue TP={format(tp_price.normalize(), 'f')} "
-                    f"SL={format(sl_price.normalize(), 'f')}."
+                    f"SL={format(sl_price.normalize(), 'f')}. {signal.entry_diagnostics}"
                 )
                 order_id = await self.database.create_order(
                     client_order_id=order_link_id,
                     ticker=signal.ticker,
-                    side="Sell",
+                    side="Buy",
                     order_type="Market",
                     lifecycle="entry",
                     status="filled_live",
@@ -987,7 +1135,7 @@ class ExecutionEngine:
                 )
                 position_id = await self.database.open_position(
                     ticker=signal.ticker,
-                    side="SHORT",
+                    side="LONG",
                     opened_at=now_iso,
                     updated_at=now_iso,
                     entry_order_id=order_id,
@@ -1015,7 +1163,7 @@ class ExecutionEngine:
                 actions.append(
                     ExecutionAction(
                         ticker=signal.ticker,
-                        action="enter_short",
+                        action="enter_long",
                         signal_kind=signal.signal_kind,
                         detail=notes,
                         order_id=order_id,
@@ -1023,7 +1171,7 @@ class ExecutionEngine:
                     )
                 )
                 await self._send_execution_notification(
-                    event="enter_short",
+                    event="enter_long",
                     ticker=signal.ticker,
                     stage=signal.stage,
                     signal_kind=signal.signal_kind,
@@ -1036,7 +1184,7 @@ class ExecutionEngine:
                     position={
                         "id": position_id,
                         "ticker": signal.ticker,
-                        "side": "SHORT",
+                        "side": "LONG",
                         "entry_price": float(entry_price),
                     },
                     stage=signal.stage,
@@ -1052,7 +1200,7 @@ class ExecutionEngine:
             try:
                 submission = await self.client.submit_market_order(
                     ticker=signal.ticker,
-                    side="Sell",
+                    side="Buy",
                     quantity=quantity,
                     price_hint=signal.current_price,
                     reduce_only=False,
@@ -1061,7 +1209,7 @@ class ExecutionEngine:
                 order_id = await self.database.create_order(
                     client_order_id=self._client_order_id("entry", signal.ticker),
                     ticker=signal.ticker,
-                    side="Sell",
+                    side="Buy",
                     order_type="Market",
                     lifecycle="entry",
                     status="rejected",
@@ -1091,7 +1239,7 @@ class ExecutionEngine:
             order_id = await self.database.create_order(
                 client_order_id=self._client_order_id("entry", signal.ticker),
                 ticker=signal.ticker,
-                side="Sell",
+                side="Buy",
                 order_type="Market",
                 lifecycle="entry",
                 status=submission.status,
@@ -1107,7 +1255,16 @@ class ExecutionEngine:
                 fill_price=submission.fill_price,
                 external_order_id=submission.external_order_id,
                 filled_at=now_iso if submission.fill_price is not None else None,
-                notes=submission.notes,
+                notes=(
+                    submission.notes
+                    if not signal.entry_diagnostics
+                    else f"{submission.notes} {signal.entry_diagnostics}"
+                ),
+            )
+            submission_note = (
+                submission.notes
+                if not signal.entry_diagnostics
+                else f"{submission.notes} {signal.entry_diagnostics}"
             )
             if submission.fill_price is None:
                 actions.append(
@@ -1115,7 +1272,7 @@ class ExecutionEngine:
                         ticker=signal.ticker,
                         action="entry_order_recorded",
                         signal_kind=signal.signal_kind,
-                        detail=submission.notes,
+                        detail=submission_note,
                         order_id=order_id,
                     )
                 )
@@ -1123,7 +1280,7 @@ class ExecutionEngine:
 
             position_id = await self.database.open_position(
                 ticker=signal.ticker,
-                side="SHORT",
+                side="LONG",
                 opened_at=now_iso,
                 updated_at=now_iso,
                 entry_order_id=order_id,
@@ -1146,33 +1303,33 @@ class ExecutionEngine:
                 entry_momentum_z=signal.momentum_z,
                 entry_curvature=signal.curvature,
                 entry_hurst=signal.hurst,
-                notes=submission.notes,
+                notes=submission_note,
             )
             actions.append(
                 ExecutionAction(
                     ticker=signal.ticker,
-                    action="enter_short",
+                    action="enter_long",
                     signal_kind=signal.signal_kind,
-                    detail=submission.notes,
+                    detail=submission_note,
                     order_id=order_id,
                     position_id=position_id,
                 )
             )
             await self._send_execution_notification(
-                event="enter_short",
+                event="enter_long",
                 ticker=signal.ticker,
                 stage=signal.stage,
                 signal_kind=signal.signal_kind,
                 quantity=quantity,
                 entry_price=submission.fill_price,
                 current_price=submission.fill_price,
-                notes=submission.notes,
+                notes=submission_note,
             )
             await self._record_position_mark(
                 position={
                     "id": position_id,
                     "ticker": signal.ticker,
-                    "side": "SHORT",
+                    "side": "LONG",
                     "entry_price": submission.fill_price,
                 },
                 stage=signal.stage,
@@ -1181,71 +1338,6 @@ class ExecutionEngine:
                 phase="open",
             )
             open_positions[signal.ticker] = {"id": position_id}
+            cluster_counts[cluster] = cluster_counts.get(cluster, 0) + 1
             entered_this_rebalance += 1
-        return actions
-
-    async def _process_confirmed(
-        self,
-        *,
-        cycle_time_ms: int | None,
-        ranked_signals: list[RankedSignal],
-        blocked_tickers: set[str],
-    ) -> list[ExecutionAction]:
-        actions: list[ExecutionAction] = []
-        now = self._now(cycle_time_ms=cycle_time_ms, stage="confirmed")
-        now_iso = now.isoformat()
-        confirmed_signals = {
-            signal.ticker: signal
-            for signal in ranked_signals
-            if signal.signal_kind in {"confirmed", "confirmed_strong"}
-        }
-        for position in await self.database.list_open_positions():
-            ticker = str(position["ticker"])
-            if ticker in blocked_tickers:
-                continue
-            if ticker in confirmed_signals:
-                signal = confirmed_signals[ticker]
-                if position["confirmation_signal_kind"] != signal.signal_kind:
-                    await self.database.confirm_position(
-                        int(position["id"]),
-                        confirmation_signal_kind=signal.signal_kind,
-                        confirmed_at=now_iso,
-                        updated_at=now_iso,
-                        notes=f"confirmed at rank={signal.rank} score={signal.composite_score:.2f}",
-                    )
-                    actions.append(
-                        ExecutionAction(
-                            ticker=ticker,
-                            action="confirm_position",
-                            signal_kind=signal.signal_kind,
-                            detail=f"rank={signal.rank} score={signal.composite_score:.2f}",
-                            position_id=int(position["id"]),
-                        )
-                    )
-                continue
-
-            if self._using_live_venue() or not self.settings.exit_on_lost_confirmed:
-                continue
-            latest_price = self._latest_price(ticker, stage="confirmed")
-            if latest_price is None:
-                actions.append(
-                    ExecutionAction(
-                        ticker=ticker,
-                        action="skip_exit",
-                        signal_kind="none",
-                        detail="no_market_price_available",
-                        position_id=int(position["id"]),
-                    )
-                )
-                continue
-            actions.append(
-                await self._submit_simulated_exit(
-                    position=position,
-                    ticker=ticker,
-                    stage="confirmed",
-                    now_iso=now_iso,
-                    exit_price=latest_price,
-                    exit_reason="lost_confirmed_signal",
-                )
-            )
         return actions

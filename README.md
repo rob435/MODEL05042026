@@ -1,6 +1,6 @@
 # MODEL050426
 
-Real-time crypto breakout detector built around Bybit V5 candle streams, volatility-adjusted momentum, return curvature, BTC regime scoring, and cross-sectional ranking.
+Real-time crypto momentum trader built around Bybit V5 candle streams, intrabar `entry_ready` selection, residual momentum ranking, and research-grade backtesting.
 
 ## Canonical Spec
 
@@ -11,26 +11,25 @@ Use that document for the actual runtime contract. This README is now an operato
 
 - Bootstraps 15m history for a manual universe of midcap USDT contracts plus `BTCUSDT`.
 - Subscribes to Bybit public `kline.15` WebSocket updates and processes both intrabar updates and confirmed candle closes.
-- Recomputes cross-sectional scores on two stages:
-  - `emerging`: intrabar ranking off provisional current-candle prices
-  - `confirmed`: full 15m close ranking off confirmed history only
-- Differentiates intrabar states instead of treating every top-ranked provisional move the same:
+- Recomputes cross-sectional scores on intrabar `emerging` cycles off provisional current-candle prices.
+- Uses a simple intrabar state ladder for live decisions:
   - `WATCHLIST`: ticker enters the broad intrabar leaders
   - `EMERGING`: ticker is strengthening across recent intrabar observations
-  - `ENTRY_READY`: trader-facing midpoint entry tier for the strongest intrabar candidate before the close
-  - `CONFIRMED`: ticker qualifies on the closed 15m candle
-  - `CONFIRMED_STRONG`: ticker qualifies on the closed 15m candle and has also held confirmed leadership across recent confirmed bars
+  - `ENTRY_READY`: the only tradeable signal tier
 - Uses a short settle delay before each processing cycle so ranking runs on a mostly complete 15m snapshot instead of the first symbol that arrives.
 - Throttles `emerging` processing with a minimum interval so intrabar updates stay event-driven without recalculating on every raw WebSocket packet.
-- Carries candle timestamps through the queue path for `confirmed` cycles; `emerging` rows use wall-clock detection time because intrabar alerts happen before the candle is final.
 - Uses BTC daily regime as a threshold modulator, not a hard block.
+- Uses a separate intraday tradeability gate on top of the BTC macro score so `entry_ready` is blocked on weak breadth / low-efficiency / anti-momentum sessions instead of pretending every day is a momentum day.
+- Uses residual momentum by default (`MOMENTUM_REFERENCE_MODE=cluster_relative`) so the ranking is less likely to collapse into raw alt beta.
+- Supports `absolute`, `btc_relative`, `basket_relative`, `cluster_relative`, and `hybrid_relative` momentum-reference modes.
+- Uses dynamic correlation clusters by default, so both residual momentum and the cluster-exposure cap can react to recent co-movement instead of only a static hand-maintained map.
 - Uses Binance BTCDOM futures history as the dominance rotation signal, normalized into `falling / neutral / rising` with a `+-0.2%` neutral zone.
 - Logs every evaluated ticker on each cycle to SQLite and optionally sends Telegram alerts with cooldown control.
-- Sends a separate Telegram summary on every confirmed 15m cycle with the top and bottom ranked names, so you can see what the engine is seeing even when no fresh signal transition fires.
 - Logs the top-ranked names each cycle so you can see the leaders even when no symbol passes the final alert filters.
-- Keeps provisional intrabar prices isolated from the confirmed 15m history so early alerts do not contaminate the close-confirmed signal path.
-- Executes the current signal stack as a short-only strategy: sell to open, buy to cover, TP at `3%` down, SL at `2%` up.
-- Persists analytics for closed trades, open-position marks, post-exit follow-through, and portfolio snapshots so TP/SL and capacity can be studied from real runtime data instead of screenshots.
+- Keeps provisional intrabar prices isolated from the confirmed 15m history so early alerts do not contaminate the closed-bar history used for the next intrabar cycle.
+- Executes the current signal stack as a momentum long strategy: buy to open, sell to exit, TP at `2%` up, SL at `2%` down.
+- Caps correlated pile-up with cluster-level exposure control as well as raw position count.
+- Persists analytics for closed trades, open-position marks, post-exit follow-through, portfolio snapshots, and richer entry diagnostics so TP/SL and capacity can be studied from real runtime data instead of screenshots.
 
 ## Current Position
 
@@ -39,14 +38,11 @@ Use that document for the actual runtime contract. This README is now an operato
 
 ## Next Tuning Pass
 
-The 1-day Telegram review showed that the engine is still too reactive for a 3-7 day momentum objective. The current tuning priorities are:
+The current tuning priorities are:
 
-- Observe the Binance BTCDOM replacement in live conditions and decide whether the dominance adjustment is still too strong or too weak.
-- Keep curvature capped at `0.15` so it behaves like a timing aid, not a rank driver.
-- Keep log-momentum normalization so cross-sectional comparisons are less distorted by nominal price level.
-- Keep confirmed ranking slightly persistence-biased so one-bar spikes stop dominating the 15m summary.
-- Disable watchlist Telegram by config if the feed becomes too noisy; keep confirmed summaries and stronger event alerts on Telegram.
-- Keep duplicate confirmed-summary suppression keyed by cycle time so restarts do not resend the same digest.
+- Validate the simpler `entry_ready`-only live path before making it more complex again.
+- Tune residual momentum, the intraday regime gate, and entry selectivity before touching exits.
+- Use walk-forward and reconciliation tooling instead of trusting pretty in-sample runs.
 
 ## Layout
 
@@ -58,6 +54,9 @@ The 1-day Telegram review showed that the engine is still too reactive for a 3-7
 - `signal_engine.py`: ranking, signal generation, cooldown, logging, alert dispatch
 - `database.py`: SQLite persistence
 - `alerting.py`: Telegram output
+- `runtime_validation.py`: startup config checks for the live service
+- `runtime_monitor.py`: run manifests, health snapshots, and drift monitoring
+- `monitor.py`: read-only CLI for recent runtime manifests, snapshots, and events
 - `main.py`: process wiring and supervision
 
 ## Run
@@ -76,6 +75,22 @@ python main.py
 pytest
 ```
 
+## Live Runtime
+
+Before the live service starts, it now runs explicit config validation instead of blindly trusting `.env`.
+
+The runtime also writes a lightweight control plane into SQLite:
+
+- `run_manifests`: one row per service run with git commit and config fingerprint
+- `runtime_health_snapshots`: periodic liveness / queue / position summaries
+- `runtime_events`: startup, shutdown, control-block, and drift events
+
+Inspect that data with:
+
+```bash
+python monitor.py --db signals.sqlite3
+```
+
 ## Replay
 
 Use the replay harness to drive the production engine over recent Bybit history without waiting days for live validation:
@@ -85,6 +100,117 @@ python replay.py --cycles 96 --db replay-signals.sqlite3
 ```
 
 This warms state with the first `STATE_WINDOW` candles, then replays the remaining cycles in market-event time.
+
+## Backtest
+
+Use the backtest harness to drive the live signal engine over historical candles and compare filter-on vs filter-off behavior on the same sample:
+
+```bash
+python backtest.py --cycles 192 --db backtest.sqlite3 --compare-intraday-regime-filter
+```
+
+The default mode is a minute-aware intrabar replay:
+
+- it warms state with real closed 15m history
+- it replays each future 15m bar minute by minute using historical `1m` OHLC
+- `emerging` / `entry_ready` logic sees a provisional 15m close that evolves through the bar
+- existing positions can hit TP/SL on historical minute highs and lows before the next entry decision
+- portfolio sizing is equity-based, with configurable fees, slippage, and gross exposure caps
+
+The fallback mode is still available if you only want a lightweight plumbing check:
+
+```bash
+python backtest.py --mode close-proxy --cycles 192 --db backtest.sqlite3
+```
+
+The minute-aware mode is materially more honest, but it is still a candle replay, not order-book reconstruction. Same-minute TP/SL conflicts are resolved conservatively, fees and slippage are model assumptions, and live fill quality can still differ.
+
+For longer research, use sweep mode to sample repeated windows through time and compare the intraday regime filter on vs off:
+
+```bash
+python backtest.py \
+  --cycles 96 \
+  --sweep-lookback-days 365 \
+  --sweep-step-days 90 \
+  --compare-intraday-regime-filter \
+  --export-dir ./backtest-sweep
+```
+
+That runs multiple disjoint minute-aware windows, prints which side won each window, and exports sweep summaries plus CSVs. Older windows may be skipped if parts of the current universe were not listed yet.
+
+For repeated research, warm the on-disk historical candle cache first:
+
+```bash
+python backtest.py --prefetch-lookback-days 365 --prefetch-end-date 2026-04-10
+```
+
+That downloads and stores the current universe's required `15m`, intrabar, BTC daily, and BTCDOM series into `BACKTEST_CACHE_PATH`. Brutally honest caveat: a full year of `1m` candles across the whole universe is large. It saves repeated network time, but it will consume real disk space.
+
+For wide parameter sweeps, use the explicit fast-research mode:
+
+```bash
+python backtest.py --cycles 96 --research-fast --compare-intraday-regime-filter
+```
+
+That keeps the trade and equity simulation intact but skips signal-row persistence and report SQL so repeated sweeps spend less time on audit-grade bookkeeping. Use full mode again before trusting a shortlisted configuration.
+
+For generic variable sweeps, use `--grid-setting`. This fetches and builds one replay plan, then runs every variant against that same in-memory history:
+
+```bash
+python backtest.py \
+  --cycles 96 \
+  --research-fast \
+  --variant-workers 4 \
+  --grid-setting hurst_cutoff=0.45,0.50,0.55 \
+  --grid-setting take_profit_pct=0.02,0.03
+```
+
+That is the plan-reuse path. The market history is fetched once, the replay plan is built once, and only the settings vary between runs. Brutally honest caveat: this removes repeated setup churn, but each variant still pays for its own full replay loop.
+
+`--variant-workers` runs those variants in separate worker processes. Use it on real research hardware, not on the same small VPS that is running live trading.
+
+For built-in stress testing, add one or more `--stress-profile` flags:
+
+```bash
+python backtest.py \
+  --cycles 96 \
+  --research-fast \
+  --stress-profile costly \
+  --stress-profile hostile
+```
+
+Available profiles are:
+
+- `costly`: worse fees and slippage
+- `liquidity_crunch`: worse costs plus tighter exposure assumptions
+- `hostile`: the harshest bundled cost/liquidity stress
+
+For the actual optimization workflow, read [BACKTEST_RESEARCH_PLAN.md](/Users/jhbvdnsbkvnsd/Desktop/MODEL050426/BACKTEST_RESEARCH_PLAN.md). That document is the repo's explicit research discipline for parameter pruning, interaction checks, TP/SL tuning, and final validation.
+
+For walk-forward validation on shortlisted variants:
+
+```bash
+python backtest.py \
+  --walk-forward-lookback-days 365 \
+  --walk-forward-train-days 90 \
+  --walk-forward-test-days 30 \
+  --research-fast \
+  --variant-workers 4 \
+  --grid-setting hurst_cutoff=0.50,0.55,0.60
+```
+
+Walk-forward exports now also include `walk_forward_candidates.csv`, so the full train-window leaderboard is preserved instead of only the final selected variant.
+
+For live-vs-backtest reconciliation against a Telegram export plus `backtest_trades.csv`:
+
+```bash
+python reconcile.py \
+  --telegram-html "/path/to/messages.html" \
+  --backtest-trades-csv ./exports/backtest_trades.csv \
+  --tolerance-minutes 30
+```
+
+The reconciliation output now includes precision, recall, average timestamp deltas, and exit-reason agreement, plus `matched_entries.csv` and `matched_exits.csv` alongside the unmatched rows.
 
 ## Universe Validation
 
@@ -104,12 +230,12 @@ Summarize a replay or live SQLite log without hand-writing SQL:
 python report.py --db replay-signals.sqlite3 --top 10
 ```
 
-The report now includes a stage and signal-kind breakdown so you can see how much of the log came from `watchlist`, `emerging`, `entry_ready`, `confirmed`, and `confirmed_strong` activity.
+The report includes a stage and signal-kind breakdown so you can see how much of the log came from `watchlist`, `emerging`, `entry_ready`, and inert non-trade rows.
 
 It also summarizes:
 
 - daily trade results with wins, losses, stop-loss count, take-profit count, and net PnL
-- closed-trade analytics such as holding time, MFE, MAE, post-exit follow-through, and volatility
+- closed-trade analytics such as holding time, MFE, MAE, post-exit follow-through, volatility, and preserved entry diagnostics in `notes`
 - portfolio snapshots with open-position count, gross notional, balance-based capacity estimates, and daily stop-loss totals
 
 Export CSVs for VPS retrieval:
@@ -199,18 +325,21 @@ For the first VPS validation run, use [SOAK_RUN.md](deploy/SOAK_RUN.md) and star
 - The WebSocket connection will drop eventually. The supervisor reconnects, reboots state through REST, and resumes the stream.
 - Intrabar cycles will fire repeatedly during an open 15m candle whenever Bybit pushes provisional kline updates. That is intentional; alert sends are transition-gated into `WATCHLIST` and `EMERGING` states instead of firing on every pass.
 - `EMERGING` requires strengthening, not just presence. The intrabar state machine looks for repeated watchlist observations with improving rank and rising composite score before promoting a ticker from `WATCHLIST` to `EMERGING`.
-- `ENTRY_READY` is the midpoint signal kind between `EMERGING` and `CONFIRMED`. It is the trader-oriented label for the strongest intrabar candidate and should be read as "this is close enough to trade, but still intrabar."
-- `ENTRY_READY` has explicit tuning knobs in the env templates: `ENTRY_READY_TOP_N`, `ENTRY_READY_COOLDOWN_MINUTES`, `ENTRY_READY_MIN_OBSERVATIONS`, `ENTRY_READY_MIN_RANK_IMPROVEMENT`, and `ENTRY_READY_MIN_COMPOSITE_GAIN`. Use those to keep the midpoint tighter than `EMERGING` without turning it into another close-based filter.
-- Execution is currently short-only. The strategy direction changed, but the ranking engine did not; the current run is explicitly testing the inverted bias rather than claiming a new alpha model.
+- `ENTRY_READY` is the only tradeable signal kind. It is the trader-oriented label for the strongest intrabar candidate and should be read as "this is strong enough to trade now."
+- `ENTRY_READY` has explicit tuning knobs in the env templates: `ENTRY_READY_TOP_N`, `ENTRY_READY_COOLDOWN_MINUTES`, `ENTRY_READY_MIN_OBSERVATIONS`, `ENTRY_READY_MIN_RANK_IMPROVEMENT`, and `ENTRY_READY_MIN_COMPOSITE_GAIN`. Use those to keep the live entry tier tighter than `EMERGING` without adding another fake confirmation stage.
+- Execution is currently aligned with the momentum ranking again. The bot buys the strongest `entry_ready` names, then exits them at `+2%` take profit or `-2%` stop loss.
+- `INTRADAY_REGIME_*` is now the practical no-trade layer. It only blocks `entry_ready` promotion; the engine still logs broad intrabar context on bad days so you can see what it wanted to do without actually entering.
 - `MAX_OPEN_POSITIONS` is back as a blunt portfolio safety net. It caps the total number of simultaneously open positions, while `MAX_ENTRIES_PER_REBALANCE` separately caps how many new names one rebalance pass may add.
+- `MAX_POSITIONS_PER_CLUSTER` is the more useful anti-pileup control. It stops the book from filling with multiple names from the same current cluster even when raw position count still looks safe.
 - `MAX_ENTRIES_PER_REBALANCE` is now the clean way to cap how many fresh positions one `emerging` rebalance pass may open. It does not change ranking; it just limits how many top-ranked `entry_ready` names are allowed through in that batch.
-- `TELEGRAM_SIGNAL_ALERTS_ENABLED=false` is the clean execution-only Telegram mode. With that off and `TELEGRAM_SUMMARY_ENABLED=false`, chat can be reduced to entry/exit execution messages only.
-- `CONFIRMED_STRONG` is not a hard gate. The first valid confirmed bar can still alert as `CONFIRMED`; the signal upgrades to `CONFIRMED_STRONG` when recent confirmed-bar history also supports it.
+- `TELEGRAM_SIGNAL_ALERTS_ENABLED=false` is the clean execution-only Telegram mode. With that off, chat can be reduced to entry/exit execution messages only.
+- `OPERATOR_PAUSE_NEW_ENTRIES=true` is the blunt manual brake. The bot keeps running, logging, and snapshotting, but it will stop opening new positions.
+- `monitor.py` is the fast way to check whether the service is actually alive, drifting from venue state, or repeatedly blocking entries for control reasons without reading raw logs.
 - If a candle gap is detected mid-stream, the supervisor falls back to a fresh REST bootstrap instead of pretending state is intact.
 - Cooldown only advances after a successful alert send; a failed Telegram request does not silently suppress the next valid signal.
-- `emerging` and `confirmed` alerts use separate cooldown state, so an early watchlist alert does not block the later close-confirmed alert for the same ticker.
-- Confirmed-cycle summaries are separate from event alerts. They are a routine operator digest, not a signal trigger, and default to the top 5 plus bottom 5 names.
+- The confirmed-cycle consumer still exists because closed bars still need to advance state cleanly. It no longer emits tradeable or operator-facing confirmed tiers.
 - Analytics env knobs now include `MAX_DAILY_STOP_LOSSES`, `ANALYTICS_POST_EXIT_BARS`, `ANALYTICS_LOG_POSITION_MARKS`, and `ANALYTICS_LOG_PORTFOLIO_SNAPSHOTS`.
+- Runtime control knobs now include `RUNTIME_HEALTH_SNAPSHOT_*` and `RUNTIME_DRIFT_CHECK_*`, which govern the SQLite control-plane cadence rather than alpha logic.
 - Execution throttles now include `MAX_ENTRIES_PER_REBALANCE` for per-batch entry control and `MAX_DAILY_STOP_LOSSES` for the UTC-day kill switch.
 - For VPS analysis, prefer pulling the SQLite backup to the Mac and regenerating CSVs locally rather than grepping raw logs. Example:
 

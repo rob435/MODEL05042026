@@ -40,24 +40,23 @@ def _analytics_settings_ready(settings: Settings) -> bool:
     return hasattr(settings, "analytics_enabled")
 
 
-def test_short_trade_logs_analytics_and_followthrough(tmp_path: Path) -> None:
-    asyncio.run(_exercise_short_trade_analytics(tmp_path))
+def test_long_trade_logs_analytics_and_followthrough(tmp_path: Path) -> None:
+    asyncio.run(_exercise_long_trade_analytics(tmp_path))
 
 
-def test_daily_stop_loss_limit_blocks_new_short_entry(tmp_path: Path) -> None:
+def test_daily_stop_loss_limit_blocks_new_long_entry(tmp_path: Path) -> None:
     asyncio.run(_exercise_daily_stop_loss_guard(tmp_path))
 
 
-async def _exercise_short_trade_analytics(tmp_path: Path) -> None:
+async def _exercise_long_trade_analytics(tmp_path: Path) -> None:
     settings = Settings(
         sqlite_path=str(tmp_path / "analytics.db"),
         universe=["AAAUSDT"],
         execution_enabled=True,
         demo_mode=True,
         execution_submit_orders=False,
-        take_profit_pct=0.03,
+        take_profit_pct=0.02,
         stop_loss_pct=0.02,
-        exit_on_lost_confirmed=False,
     )
     if not _analytics_settings_ready(settings):
         pytest.skip("analytics settings not implemented yet")
@@ -104,10 +103,10 @@ async def _exercise_short_trade_analytics(tmp_path: Path) -> None:
         ],
     )
     assert [(action.action, action.ticker) for action in entry_actions] == [
-        ("enter_short", "AAAUSDT")
+        ("enter_long", "AAAUSDT")
     ]
 
-    assert state.update_provisional("AAAUSDT", settings.ticker_interval_ms * 2, 97.50) is True
+    assert state.update_provisional("AAAUSDT", settings.ticker_interval_ms * 2, 103.10) is True
     assert state.update_provisional("BTCUSDT", settings.ticker_interval_ms * 2, 20_200.0) is True
 
     exit_actions = await execution.process_cycle(
@@ -116,10 +115,10 @@ async def _exercise_short_trade_analytics(tmp_path: Path) -> None:
         ranked_signals=[],
     )
     assert [(action.action, action.ticker) for action in exit_actions] == [
-        ("exit_short", "AAAUSDT")
+        ("exit_long", "AAAUSDT")
     ]
 
-    follow_through_prices = (99.2, 96.0, 95.6, 96.4)
+    follow_through_prices = (101.4, 104.2, 104.6, 103.8)
     for offset, price in enumerate(follow_through_prices, start=2):
         assert state.append_close("AAAUSDT", settings.ticker_interval_ms * offset, price) is True
         assert state.append_close(
@@ -179,9 +178,8 @@ async def _exercise_daily_stop_loss_guard(tmp_path: Path) -> None:
         execution_enabled=True,
         demo_mode=True,
         execution_submit_orders=False,
-        take_profit_pct=0.03,
+        take_profit_pct=0.02,
         stop_loss_pct=0.02,
-        exit_on_lost_confirmed=False,
     )
     if not _analytics_settings_ready(settings):
         pytest.skip("analytics settings not implemented yet")
@@ -228,10 +226,10 @@ async def _exercise_daily_stop_loss_guard(tmp_path: Path) -> None:
         ],
     )
     assert [(action.action, action.ticker) for action in first_entry] == [
-        ("enter_short", "AAAUSDT")
+        ("enter_long", "AAAUSDT")
     ]
 
-    assert state.update_provisional("AAAUSDT", settings.ticker_interval_ms * 2, 103.10) is True
+    assert state.update_provisional("AAAUSDT", settings.ticker_interval_ms * 2, 98.90) is True
     assert state.update_provisional("BTCUSDT", settings.ticker_interval_ms * 2, 20_200.0) is True
 
     first_exit = await execution.process_cycle(
@@ -240,7 +238,7 @@ async def _exercise_daily_stop_loss_guard(tmp_path: Path) -> None:
         ranked_signals=[],
     )
     assert [(action.action, action.ticker) for action in first_exit] == [
-        ("exit_short", "AAAUSDT")
+        ("exit_long", "AAAUSDT")
     ]
 
     follow_up = await execution.process_cycle(
@@ -265,7 +263,7 @@ async def _exercise_daily_stop_loss_guard(tmp_path: Path) -> None:
     )
 
     assert not any(
-        action.action == "enter_short" and action.ticker == "BBBUSDT"
+        action.action == "enter_long" and action.ticker == "BBBUSDT"
         for action in follow_up
     )
 

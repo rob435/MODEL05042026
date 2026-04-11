@@ -13,3 +13,6 @@ signals.sqlite3-shm
 signals.sqlite3-wal
 replay-signals.sqlite3
 smoke-replay.sqlite3
+.cache/
+backtest.sqlite3
+backtest-*.sqlite3

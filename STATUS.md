@@ -3,9 +3,16 @@
 ## Current
 
 - Core implementation exists.
-- The live engine now supports both intrabar and close-confirmed cycles, with intrabar signals differentiated into `watchlist`, `emerging`, and `entry_ready`, and confirmed signals able to upgrade into `confirmed_strong`.
+- The live engine now supports two processing stages but only one tradeable signal ladder: `watchlist`, `emerging`, and `entry_ready`. Confirmed bars still advance state, but they no longer create tradeable or operator-facing confirmed tiers.
 - Tests exist for indicator math, gap detection, and signal-engine behavior.
 - Replay tooling exists for recent-candle validation through the production engine path.
+- A minute-aware historical backtest harness now exists in `backtest.py`. It reuses the live `SignalEngine`, replays historical `1m` OHLC inside each `15m` bar, models fees/slippage/exposure caps, and can compare the intraday regime filter on vs off over the same sample.
+- The backtest fetch path now supports an on-disk SQLite candle cache plus explicit prefetch warming through `python backtest.py --prefetch-lookback-days ...`.
+- The backtest now also has an explicit `--research-fast` mode that skips signal-row persistence and post-run signal-summary SQL while keeping trade and equity simulation intact for parameter sweeps.
+- The backtest now also supports generic plan-reuse grids through `--grid-setting KEY=v1,v2,...`, so one fetched `MinuteReplayPlan` can drive many parameter variants without rebuilding the same replay input every time.
+- Variant grids can now also use bounded worker-process parallelism through `--variant-workers` / `BACKTEST_VARIANT_WORKERS`, with each worker loading the same serialized replay-plan snapshot and writing to its own SQLite output.
+- Comprehensive backtests now also record bounded post-exit follow-through per trade (`post_exit_best_pct`, `post_exit_worst_pct`, `volatility_pct`) plus corresponding summary averages, so TP/SL research can use actual modeled after-close behavior instead of only in-trade excursion stats.
+- `BACKTEST_RESEARCH_PLAN.md` now exists and defines the repo's testing workflow for parameter pruning, interaction checks, TP/SL tuning, portfolio-throttle tuning, and final long-horizon validation.
 - Universe validation tooling exists for checking the manual symbol list against Bybit’s current instruments.
 - SQLite reporting tooling exists for quick inspection of replay and live signal logs.
 - One-command smoke validation exists to chain universe validation, replay, and reporting.
@@ -13,7 +20,7 @@
 - `main.py` supports bounded live runs with runtime counters for soak validation.
 - Deployment docs now include a dedicated soak-run guide and production env template.
 - Deployment scaffold exists for `systemd`.
-- Local verification is green: `26` tests passing.
+- Local verification is green: `69` tests passing.
 - Cycle processing now batches DB writes and waits briefly for the WebSocket close wave before scoring.
 - Confirmed logs and cooldown are tied to candle event time; emerging alerts use wall-clock detection time because they fire before candle close.
 - Default universe was live-validated against Bybit; `FETUSDT` and `FTMUSDT` were removed after failing validation.
@@ -21,21 +28,20 @@
 - The actual service startup path was exercised against live Bybit endpoints: REST bootstrap, BTC macro refresh, WebSocket subscribe, and bootstrap-cycle processing all completed without runtime errors.
 - A post-refactor live run completed successfully against Bybit with both stage paths active: one bootstrap `confirmed` cycle followed by repeated intrabar `emerging` cycles, with `websocket_failures=0`.
 - The intrabar path now requires strengthening before promotion to `emerging`; it no longer equates “currently top-ranked” with “emerging breakout.”
-- Confirmed-bar persistence is now tracked so repeated confirmed leadership is visible as `confirmed_strong` instead of being buried inside generic confirmed rows.
-- Confirmed 15m cycles now emit a routine Telegram summary with the top and bottom ranked names so operators can distinguish "no alerts" from "no activity."
+- Confirmed bars still matter only as state advancement and analytics checkpoints. The confirmed-summary and confirmed-upgrade messaging path has been removed from the live strategy contract.
 - BTCDOM macro state now comes from Binance futures history on `1h`, using a tri-state `falling / neutral / rising` dominance readout with `+-0.2%` neutral band and compatibility retention for the old boolean dominance field.
 - Momentum now uses log-return normalization and curvature weight has been reduced to `0.15`, which should make the ranking less sensitive to absolute price scale and short-lived curvature spikes.
+- A configurable intraday tradeability gate now sits on top of the BTC macro score. It blocks `entry_ready` when too few of breadth, basket drift, trend efficiency, and leader persistence pass, instead of assuming every session is suitable for long momentum.
 - A first 1-day live Telegram review is now documented in `TELEGRAM_TEST_REPORT_2026-04-04.md`; the main validated risk is excessive confirmed-rank churn, with multiple symbols spanning from top 5 to bottom 5 over short windows.
 - `SPEC.md` now exists as the canonical source-of-truth specification for the current runtime behavior.
 - A second Telegram review is now documented in `TELEGRAM_TEST_REPORT_2026-04-05.md`; the immediate top-to-bottom flip problem appears largely fixed in that window, but BTC regime stayed flat at `1` and some symbols still hit both extremes over the full day.
-- The operator surface now exposes `entry_ready` as the midpoint intrabar entry tier, with explicit `ENTRY_READY_*` knobs and report/Telegram wording that distinguishes it from both broad `emerging` context and close-confirmed `confirmed` signals.
+- The operator surface now exposes `entry_ready` as the only tradeable intrabar entry tier, with explicit `ENTRY_READY_*` knobs for rank, cooldown, observation count, rank improvement, and composite-gain gating.
 - Repo hygiene is improved: ignore rules now cover common local junk, report output sections render in the correct order, and the stale `alerts.py` compatibility shim has been removed.
 - A minimal execution scaffold now exists:
   - `execution.py` can open a simulated long on `entry_ready`
-  - confirmed cycles can mark that position as confirmed / confirmed-strong
   - TP at `+2%` and SL at `-2%` can close the position and persist the exit in SQLite
 - SQLite now stores `orders` and `positions` in addition to raw `signals`, so demo-trading behavior can be inspected after a run instead of guessed from Telegram.
-- Config now exposes explicit execution toggles for enable/disable, demo mode, simulated-vs-submitted behavior, entry notional, max open positions, TP, SL, and optional confirmed-loss exits.
+- Config now exposes explicit execution toggles for enable/disable, demo mode, simulated-vs-submitted behavior, entry notional, max open positions, TP, SL, and cluster / batch safety caps.
 - Telegram now reports actual position entry plus TP/SL exit events, not just signal candidates and confirmed summaries.
 - Real Bybit demo-order submission now exists when `EXECUTION_SUBMIT_ORDERS=true`:
   - signed private V5 requests
@@ -43,11 +49,12 @@
   - position-fill polling
   - exchange-native TP/SL via `Set Trading Stop`
   - local exit reconciliation via closed-PnL sync
-- The execution layer is now short-only. The signal engine still ranks the same way, but live and simulated trades now enter short, buy to cover on exit, target `+3%` on downside moves, and stop at `-2%` on upside moves.
+- The execution layer is long again and aligned with the ranking engine. Live and simulated trades now buy `entry_ready` names, sell to exit, target `+2%`, and stop at `-2%`.
 - Execution analytics now persist closed-trade summaries, open-position marks, post-exit follow-through, and portfolio snapshots directly into SQLite.
 - `MAX_DAILY_STOP_LOSSES` is now a live execution guard; once the UTC-day stop-loss count reaches the configured limit, new entries are skipped for the rest of that day.
 - `MAX_ENTRIES_PER_REBALANCE` is now a live execution guard; once an emerging cycle has opened the configured number of fresh positions, lower-ranked `entry_ready` candidates are skipped for that rebalance pass.
 - `MAX_OPEN_POSITIONS` is now back as a live execution guard; once the total open-position count reaches the configured cap, fresh entries are skipped until something closes.
+- `MAX_POSITIONS_PER_CLUSTER` is now a live execution guard; once the configured count for the current cluster label is already open, additional names from that cluster are skipped even if raw portfolio slots remain.
 - `report.py` can now summarize trade analytics and export CSVs for `signals`, `trades`, `trade_daily_summary`, and `portfolio_snapshots`.
 - Live-entry safety now checks both local SQLite and current Bybit venue state, so the bot will not intentionally double-enter the same ticker if the venue already has an open position.
 - `.env` loading now overrides stale inherited shell variables, so local credential edits actually take effect without restarting the whole environment.
@@ -56,24 +63,76 @@
 - Dead config surface has been trimmed: `ANALYTICS_EXPORT_DIR` was removed because it no longer affected live behavior.
 - The production env template is now grouped by operational impact, with Telegram, execution/risk, and high-impact signal-quality controls separated into clearer sections.
 - Telegram control now includes a signal-alert master switch, so the bot can run in execution-only chat mode without still sending `confirmed` or `entry_ready` candidate alerts.
-- Local verification is green again: `37` tests passing.
 - This checkout now has a real repo-root `.env` again, with Bybit demo execution enabled and `SQLITE_PATH` pointed at the local workspace database instead of the VPS example path.
 - Telegram is still not configured in this checkout because no local `TELEGRAM_BOT_TOKEN` or `TELEGRAM_CHAT_ID` were available to write into `.env`.
 - The local `signals.sqlite3` has been confirmed stale relative to the exported Telegram session. It is valid local state, but it is not the DB that produced the observed `entry_ready` alerts and `SOLUSDT` demo entry in chat.
-- A macOS pull-sync path is now documented: a local `launchd` job can run `deploy/sync_exports.sh` every 30 minutes, fetch the VPS analytics export bundle, and write logs under `~/Library/Logs/`.
+- A macOS pull-sync path is now documented: a local `launchd` job can run `deploy/sync_exports.sh` once per day, fetch the VPS analytics export bundle, and write logs under `~/Library/Logs/`.
+- Backtest config now has explicit env knobs for starting equity, fee rate, slippage, gross exposure cap, and intrabar replay interval, and the production env template documents them in a dedicated research section.
+- The first minute-aware filter comparison is mildly encouraging:
+  - latest `96` confirmed bars with filter `on`: `6` trades, `+$1,418.66` net, `+1.42%`, `1.79%` max drawdown
+  - same window with filter `off`: `7` trades, `+$945.72` net, `+0.95%`, `1.69%` max drawdown
+  - the gate cut `entry_ready` candidates from `14` to `7`
+- Sweep mode now exists in `backtest.py`, so repeated historical windows can be run across months or years with exported summaries instead of one-off single-window comparisons.
+- Sampled sweep results are now stronger than the first one-day anecdote:
+  - 1-year quarterly sweep, `96` cycles per window: filter `on` won `3 / 4` windows, average net PnL `+$626.61` vs `-$500.73`, average max drawdown `2.89%` vs `4.58%`
+  - 2-year semiannual sweep, `96` cycles per window: `4` completed windows and `1` skipped old window, filter `on` won `2 / 4`, average net PnL `+$783.63` vs `+$297.88`, average max drawdown `2.23%` vs `3.80%`
+- The default universe has been narrowed again:
+  - removed `NOTUSDT`, `BLURUSDT`, `POPCATUSDT`, and `STGUSDT`
+  - retained `JASMYUSDT`, `1000PEPEUSDT`, `1000BONKUSDT`, `1000FLOKIUSDT`, and `RENDERUSDT` by user choice
+- The live ranking now supports residual momentum modes:
+  - `absolute`
+  - `btc_relative`
+  - `basket_relative`
+  - `cluster_relative` (default)
+  - `hybrid_relative`
+- Cluster assignment now supports:
+  - `manual`
+  - `dynamic` (default)
+  - `hybrid`
+- Dynamic cluster labels now feed both residual-momentum ranking and `MAX_POSITIONS_PER_CLUSTER`, so concentration control is no longer tied only to the static manual map.
+- Backtesting now has a real universe-history policy plus additional research tooling:
+  - `BACKTEST_UNIVERSE_POLICY`
+  - `BACKTEST_MIN_ACTIVE_UNIVERSE`
+  - walk-forward validation in `backtest.py`
+  - Telegram-vs-backtest reconciliation in `reconcile.py`
+- Backtesting now also has built-in stress variants (`--stress-profile`) and richer walk-forward exports, including `walk_forward_candidates.csv`.
+- Reconciliation now reports precision/recall, timestamp deltas, exit-reason agreement, and matched-entry / matched-exit CSVs instead of only a raw overlap count.
+- Trade analytics exports now preserve live entry diagnostics in `trade_analytics.notes`, so later TP/SL or filter reviews can see why a trade passed.
+- Dead config surface has been trimmed again: confirmed-only lifecycle knobs and Telegram summary knobs were removed instead of being left as inert env theater.
+- The live runtime now has a real control plane:
+  - startup config validation in `runtime_validation.py`
+  - `run_manifests`, `runtime_health_snapshots`, and `runtime_events` in SQLite
+  - periodic health snapshots and venue-drift checks in `runtime_monitor.py`
+  - a read-only `monitor.py` CLI for recent runtime state
+- `OPERATOR_PAUSE_NEW_ENTRIES` now exists as a blunt manual brake. The service keeps running and logging, but fresh entries are skipped explicitly.
+- A safe bounded run from a clean working directory proved the new control plane works:
+  - run manifest recorded git commit and config fingerprint
+  - runtime start/stop events landed in SQLite
+  - with snapshot interval forced to `1s`, health snapshots also landed and were readable through `monitor.py`
 
 ## Remaining risks
 
 - No sustained live WebSocket soak across multiple candle closes or systemd deployment run has been executed yet.
 - The BTC dominance component is Binance BTCDOM futures history, not true market-cap dominance. It is still a relative-strength proxy, not literal BTC market-cap dominance.
 - The manual universe may include symbols that are not currently listed on the chosen Bybit environment.
-- Intrabar `watchlist` and `emerging` processing are intentionally noisier than the close-confirmed path and still need real-world observation before anyone should trust their alert quality.
-- The confirmed ranking stack appears too reactive for a 3-7 day momentum capture objective. Curvature and hard dominance gating are currently the main suspects.
+- Intrabar `watchlist` and `emerging` processing are intentionally noisier than the live entry tier and still need real-world observation before anyone should trust them as directional evidence.
+- The live path is now intentionally intrabar-first. That is simpler, but it also means signal quality lives or dies on `entry_ready` selectivity rather than on any later confirmation stage.
+- The new intraday gate is still a first-pass heuristic. It should reduce obvious chop entries, but the thresholds are not yet proven across a long sample.
+- The backtest is still a candle replay, not an order-book replay. It is materially better than the old close-proxy harness, but fee/slippage assumptions and minute-bar TP/SL logic can still differ from live fills.
+- The first minute-aware filter result is only a short-window indication, not proof of robustness. The gate improved net PnL on `96` bars, but that is still too short and too recent to trust without longer out-of-sample runs.
+- The sampled sweeps are useful, but they are still sparse windows, not a continuous year-by-year portfolio simulation.
+- Multi-year full-universe replay is constrained by listing history. Older windows will fail or need to be skipped when newer symbols in the current universe did not exist yet.
+- Keeping `RENDERUSDT` means the oldest `2024-04` full-universe sweep window is still invalid, even after removing `NOTUSDT`.
+- A fully warmed 1-year `1m` cache across the whole universe will consume meaningful disk space. The new cache makes repeated research less wasteful, but it does not make the replay loop cheap.
+- The replay loop is still the main cost even after optimization. The biggest hotspot was Hurst, and that has been reduced materially, but large multi-window sweeps are still CPU-heavy.
 - The next tuning pass is now mostly about observing the Binance BTCDOM replacement in live conditions, then deciding whether the dominance adjustment is still too strong or too weak for the 3-7 day momentum objective.
 - BTC regime may now be too low-information to be useful operationally if it continues to stay fixed at `1` across full live windows.
 - Some symbols still span both top and bottom summary extremes over longer live windows, even though the immediate flip problem appears much better than before.
 - `entry_ready` is now a real emitted intrabar signal kind between `emerging` and `confirmed`, with its own tighter rank, cooldown, observation, and composite-gain gates.
 - Risk sizing still rounds quantity down to Bybit `qtyStep`, and it still assumes the configured stop distance is the true realized loss bound. A fast move through the stop can make realized risk worse than the nominal 1% target.
+- Dynamic clustering is still threshold-based and correlation-on-returns is still a blunt proxy. It is better than the old static-only map, but it can still group badly in noisy regimes or miss nonlinear relationships.
+- The new drift monitor is periodic and symbol-by-symbol. It is good enough for a first control layer, but it is not a private-websocket reconciliation engine.
+- The runtime control plane is now real, but it is still SQLite-based and local-process based. That is appropriate for this repo; it is not the same thing as institutional monitoring infrastructure.
 - TP/SL is checked only when the runtime processes a cycle. There is no separate sub-second price watcher, so a violent move can still gap through the exact configured threshold.
 - Venue exit reconciliation is polling-based, not websocket-based. Telegram exit messages and SQLite close state will lag until the next engine cycle sees that Bybit has already closed the position.
 - A real demo smoke entry was executed successfully on `SOLUSDT`; the venue accepted the order and TP/SL were installed. There is now a live demo position unless it has already exited on Bybit.
@@ -82,16 +141,36 @@
 ## Next validation steps
 
 - Run the engine on testnet or a compliant mainnet host for 5 to 7 days.
-- Verify the new `orders` and `positions` tables against a multi-day demo run and check that entry, confirm, and exit transitions line up with the signal logs.
+- Verify the new `orders` and `positions` tables against a multi-day demo run and check that entry and exit transitions line up with the signal logs.
 - Observe whether `1%` risk sizing with a `2%` stop produces acceptable notional sizes on the actual demo balance, or whether an additional leverage/notional cap is needed.
 - Replace polling-based venue reconciliation with private websocket order/position streams if exit-notification latency becomes annoying.
 - Verify that Telegram position messages are not too noisy once the bot is running intrabar for multiple days.
-- Review `watchlist`, `emerging`, `entry_ready`, `confirmed`, and `confirmed_strong` logged signals for false positives, timing benefit, and missed breakouts before tuning thresholds.
-- Reduce confirmed-rank churn by reweighting or clipping curvature, replacing raw-price momentum with percentage/log momentum, and testing whether dominance should modulate instead of hard-blocking.
+- Review `watchlist`, `emerging`, and `entry_ready` logged signals for false positives, timing benefit, and missed breakouts before tuning thresholds.
+- Reduce raw-beta pileup by validating the new residual-momentum mode, then decide whether curvature or entry thresholds still need retuning.
 - Use the Binance BTCDOM replacement in live conditions, then decide whether the neutral zone and dominance adjustment still need retuning for the 3-7 day momentum objective.
 - Trim or refresh the manual universe against the exact Bybit market you intend to trade.
 - If another live day still shows regime stuck at `1`, revisit the macro regime design before cutting curvature any further.
-- If longer-horizon top/bottom span remains high, tune confirmed stability/persistence before making the ranking math more complex again.
-- Check whether `entry_ready` is selective enough to serve as the primary early-action tier without making `confirmed` feel redundant or late.
+- Check whether `entry_ready` is selective enough to stand alone as the only tradeable tier before adding complexity back into the live contract.
+- Run longer backtests with CSV export (`python backtest.py --export-dir ...`) and inspect equity-by-day plus per-ticker concentration instead of only staring at aggregate net PnL.
+- If repeated backtests become a routine workflow, warm the cache once first (`python backtest.py --prefetch-lookback-days 365`). That removes most repeated REST fetch waste, but replay runtime is still dominated by the CPU loop.
+- For broad variable sweeps, use `python backtest.py --research-fast ...` first, then rerun shortlisted configs in full mode before trusting them. Fast mode is meant to reduce bookkeeping cost, not replace final audited validation.
+- For multi-parameter sweeps, pair `--research-fast` with `--grid-setting ...`. That is now the honest fast path: reuse one replay plan, vary the settings, then rerun finalists in full mode.
+- If extra CPU is available, pair that grid path with `--variant-workers N`. That is now the compute-scaling path for this repo: one replay-plan snapshot, many isolated worker processes, unique DB outputs per variant.
+- Benchmarked on the local Apple M4 (`10` CPU cores), that process-parallel path is now clearly worthwhile:
+  - `32` cycles / `4` variants / `--research-fast`: `21.15s` at `1` worker, `11.03s` at `2`, `5.89s` at `4`
+  - `96` cycles / `4` variants / `--research-fast`: `62.44s` at `1` worker, `31.41s` at `2`, `18.75s` at `4`
+- Use the new post-exit trade fields when tuning TP/SL:
+  - `post_exit_best_pct` to see how much follow-through was left after exit
+  - `post_exit_worst_pct` to see how ugly the path became after exit
+  - `volatility_pct` to separate smooth continuation from noisy whipsaw after the close
+- Follow `BACKTEST_RESEARCH_PLAN.md` for future optimization work. The intended flow is now explicit:
+  - one-family sweeps first
+  - targeted interaction checks second
+  - full-mode validation on finalists only
+  - continuous longer-horizon and holdout testing last
+- Decide whether the next research step should be:
+  - continuous historical simulation on a reduced stable universe
+  - or sparse sampled sweeps on the current full universe
+  The current setup can do the second honestly today; the first needs a universe-history policy.
 - Run a short bounded local validation from this checkout to prove the new `.env` is actually being loaded and that execution no longer defaults off.
 - Install the launchd template on the Mac, verify `deploy/sync_exports.sh` exists and is executable, and confirm the first pull writes logs plus a fresh CSV export set locally.

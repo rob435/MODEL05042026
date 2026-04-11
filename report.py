@@ -23,9 +23,9 @@ SIGNAL_KIND_ORDER = {
 SIGNAL_KIND_LABELS = {
     "watchlist": "broad intrabar context",
     "emerging": "building intrabar setup",
-    "entry_ready": "midpoint intrabar entry candidate",
-    "confirmed": "close-confirmed breakout",
-    "confirmed_strong": "persistent close-confirmed breakout",
+    "entry_ready": "tradeable intrabar entry candidate",
+    "confirmed": "legacy confirmed row",
+    "confirmed_strong": "legacy confirmed upgrade row",
     "none": "no signal",
 }
 
@@ -50,6 +50,7 @@ TRADE_EXPORT_COLUMNS = [
     "post_exit_best_pct",
     "post_exit_worst_pct",
     "volatility_pct",
+    "notes",
 ]
 
 PORTFOLIO_EXPORT_COLUMNS = [
@@ -314,7 +315,8 @@ def _normalize_trade_row(row: dict[str, Any]) -> dict[str, Any]:
                 ),
             )
         ),
-}
+        "notes": _first_present(row, ("notes",)),
+    }
 
 
 def _normalize_portfolio_row(row: dict[str, Any], avg_trade_notional_usd: float | None) -> dict[str, Any]:

@@ -39,26 +39,16 @@ class IntrabarObservation:
 
 
 @dataclass(slots=True)
-class ConfirmedObservation:
-    observed_at_ms: int
-    rank: int
-    composite_score: float
-    qualified: bool
-
-
-@dataclass(slots=True)
 class MarketState:
     settings: Settings
     price_state: dict[str, deque] = field(init=False)
     close_times_ms: dict[str, deque] = field(init=False)
     last_alerted: dict[str, datetime] = field(default_factory=dict)
     last_intrabar_alerted: dict[tuple[str, str], datetime] = field(default_factory=dict)
-    last_confirmed_alerted: dict[tuple[str, str], datetime] = field(default_factory=dict)
     global_state: GlobalState = field(default_factory=GlobalState)
     provisional_state: dict[str, ProvisionalCandle | None] = field(init=False)
     intrabar_state: dict[str, str] = field(init=False)
     intrabar_observations: dict[str, deque] = field(init=False)
-    confirmed_observations: dict[str, deque] = field(init=False)
 
     def __post_init__(self) -> None:
         self.price_state = {
@@ -82,10 +72,6 @@ class MarketState:
             symbol: deque(maxlen=observation_window)
             for symbol in self.settings.universe
         }
-        self.confirmed_observations = {
-            symbol: deque(maxlen=max(self.settings.confirmed_persistence_window, 1))
-            for symbol in self.settings.universe
-        }
 
     def replace_history(self, symbol: str, candles: list[tuple[int, float]]) -> None:
         prices = self.price_state[symbol]
@@ -94,7 +80,6 @@ class MarketState:
         times.clear()
         self.provisional_state[symbol] = None
         self.reset_intrabar(symbol)
-        self.reset_confirmed_history(symbol)
         for close_time_ms, close_price in candles:
             times.append(close_time_ms)
             prices.append(close_price)
@@ -195,11 +180,6 @@ class MarketState:
             )
         )
 
-    def reset_confirmed_history(self, symbol: str) -> None:
-        if symbol not in self.confirmed_observations:
-            return
-        self.confirmed_observations[symbol].clear()
-
     def refresh_btcdom_state(self) -> None:
         closes = self.global_state.btcdom_closes
         state, change_pct = dominance_state(
@@ -211,28 +191,6 @@ class MarketState:
         self.global_state.btcdom_state = state
         self.global_state.btcdom_change_pct = change_pct
         self.global_state.dom_falling = int(state < 0)
-
-    def record_confirmed_observation(
-        self,
-        symbol: str,
-        observed_at_ms: int,
-        rank: int,
-        composite_score: float,
-        qualified: bool,
-    ) -> None:
-        if symbol not in self.confirmed_observations:
-            return
-        observations = self.confirmed_observations[symbol]
-        observation = ConfirmedObservation(
-            observed_at_ms=observed_at_ms,
-            rank=rank,
-            composite_score=composite_score,
-            qualified=qualified,
-        )
-        if observations and observations[-1].observed_at_ms == observed_at_ms:
-            observations[-1] = observation
-            return
-        observations.append(observation)
 
 
 class StateManager(MarketState):

@@ -241,6 +241,7 @@ class SignalDatabase:
                 entry_momentum_z REAL,
                 entry_curvature REAL,
                 entry_hurst REAL,
+                notes TEXT NOT NULL DEFAULT '',
                 post_exit_bars_target INTEGER NOT NULL DEFAULT 0,
                 post_exit_bars_observed INTEGER NOT NULL DEFAULT 0,
                 post_exit_completed INTEGER NOT NULL DEFAULT 0,
@@ -302,6 +303,75 @@ class SignalDatabase:
         )
         self._conn.execute(
             """
+            CREATE TABLE IF NOT EXISTS run_manifests (
+                run_id TEXT PRIMARY KEY,
+                started_at TEXT NOT NULL,
+                git_commit TEXT NOT NULL,
+                config_fingerprint TEXT NOT NULL,
+                execution_enabled INTEGER NOT NULL DEFAULT 0,
+                execution_submit_orders INTEGER NOT NULL DEFAULT 0,
+                demo_mode INTEGER NOT NULL DEFAULT 1,
+                telegram_enabled INTEGER NOT NULL DEFAULT 0,
+                operator_pause_new_entries INTEGER NOT NULL DEFAULT 0,
+                universe_size INTEGER NOT NULL DEFAULT 0,
+                momentum_reference_mode TEXT NOT NULL DEFAULT 'absolute',
+                cluster_assignment_mode TEXT NOT NULL DEFAULT 'manual',
+                notes TEXT NOT NULL DEFAULT ''
+            )
+            """
+        )
+        self._conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS runtime_health_snapshots (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                run_id TEXT NOT NULL,
+                recorded_at TEXT NOT NULL,
+                bootstraps INTEGER NOT NULL DEFAULT 0,
+                macro_refreshes INTEGER NOT NULL DEFAULT 0,
+                processed_cycles INTEGER NOT NULL DEFAULT 0,
+                processed_confirmed_cycles INTEGER NOT NULL DEFAULT 0,
+                processed_emerging_cycles INTEGER NOT NULL DEFAULT 0,
+                websocket_sessions INTEGER NOT NULL DEFAULT 0,
+                websocket_failures INTEGER NOT NULL DEFAULT 0,
+                queue_drops INTEGER NOT NULL DEFAULT 0,
+                confirmed_queue_drops INTEGER NOT NULL DEFAULT 0,
+                emerging_queue_drops INTEGER NOT NULL DEFAULT 0,
+                confirmed_queue_size INTEGER NOT NULL DEFAULT 0,
+                emerging_queue_size INTEGER NOT NULL DEFAULT 0,
+                open_positions INTEGER NOT NULL DEFAULT 0,
+                daily_stop_loss_count INTEGER NOT NULL DEFAULT 0,
+                last_bootstrap_at TEXT,
+                last_macro_refresh_at TEXT,
+                last_provisional_event_at TEXT,
+                last_confirmed_event_at TEXT,
+                last_processed_confirmed_at TEXT,
+                last_processed_emerging_at TEXT,
+                last_drift_check_at TEXT,
+                drift_status TEXT NOT NULL DEFAULT 'not_run',
+                operator_pause_new_entries INTEGER NOT NULL DEFAULT 0,
+                notes TEXT NOT NULL DEFAULT '',
+                FOREIGN KEY (run_id) REFERENCES run_manifests(run_id)
+            )
+            """
+        )
+        self._conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS runtime_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                run_id TEXT,
+                created_at TEXT NOT NULL,
+                severity TEXT NOT NULL,
+                component TEXT NOT NULL,
+                event_type TEXT NOT NULL,
+                stage TEXT,
+                ticker TEXT,
+                detail TEXT NOT NULL,
+                FOREIGN KEY (run_id) REFERENCES run_manifests(run_id)
+            )
+            """
+        )
+        self._conn.execute(
+            """
             CREATE INDEX IF NOT EXISTS idx_signals_ticker_timestamp
             ON signals (ticker, timestamp)
             """
@@ -331,6 +401,13 @@ class SignalDatabase:
             ON trade_analytics (closed_at, exit_event)
             """
         )
+        trade_columns = {
+            row[1] for row in self._conn.execute("PRAGMA table_info(trade_analytics)")
+        }
+        if "notes" not in trade_columns:
+            self._conn.execute(
+                "ALTER TABLE trade_analytics ADD COLUMN notes TEXT NOT NULL DEFAULT ''"
+            )
         self._conn.execute(
             """
             CREATE INDEX IF NOT EXISTS idx_position_marks_position_phase
@@ -341,6 +418,18 @@ class SignalDatabase:
             """
             CREATE INDEX IF NOT EXISTS idx_portfolio_snapshots_timestamp
             ON portfolio_snapshots (timestamp, stage)
+            """
+        )
+        self._conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_runtime_health_run_time
+            ON runtime_health_snapshots (run_id, recorded_at)
+            """
+        )
+        self._conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_runtime_events_run_time
+            ON runtime_events (run_id, created_at)
             """
         )
         self._conn.commit()
@@ -987,6 +1076,7 @@ class SignalDatabase:
                 entry_momentum_z,
                 entry_curvature,
                 entry_hurst,
+                notes,
                 post_exit_bars_target,
                 post_exit_bars_observed,
                 post_exit_completed,
@@ -1034,6 +1124,7 @@ class SignalDatabase:
                 :entry_momentum_z,
                 :entry_curvature,
                 :entry_hurst,
+                :notes,
                 :post_exit_bars_target,
                 :post_exit_bars_observed,
                 :post_exit_completed,
@@ -1279,6 +1370,288 @@ class SignalDatabase:
             """,
             (utc_day,),
         ).fetchone()
+
+    async def log_run_manifest(
+        self,
+        *,
+        run_id: str,
+        started_at: str,
+        git_commit: str,
+        config_fingerprint: str,
+        execution_enabled: bool,
+        execution_submit_orders: bool,
+        demo_mode: bool,
+        telegram_enabled: bool,
+        operator_pause_new_entries: bool,
+        universe_size: int,
+        momentum_reference_mode: str,
+        cluster_assignment_mode: str,
+        notes: str = "",
+    ) -> None:
+        await asyncio.to_thread(
+            self._log_run_manifest_sync,
+            run_id,
+            started_at,
+            git_commit,
+            config_fingerprint,
+            execution_enabled,
+            execution_submit_orders,
+            demo_mode,
+            telegram_enabled,
+            operator_pause_new_entries,
+            universe_size,
+            momentum_reference_mode,
+            cluster_assignment_mode,
+            notes,
+        )
+
+    def _log_run_manifest_sync(
+        self,
+        run_id: str,
+        started_at: str,
+        git_commit: str,
+        config_fingerprint: str,
+        execution_enabled: bool,
+        execution_submit_orders: bool,
+        demo_mode: bool,
+        telegram_enabled: bool,
+        operator_pause_new_entries: bool,
+        universe_size: int,
+        momentum_reference_mode: str,
+        cluster_assignment_mode: str,
+        notes: str,
+    ) -> None:
+        self._conn.execute(
+            """
+            INSERT OR REPLACE INTO run_manifests (
+                run_id,
+                started_at,
+                git_commit,
+                config_fingerprint,
+                execution_enabled,
+                execution_submit_orders,
+                demo_mode,
+                telegram_enabled,
+                operator_pause_new_entries,
+                universe_size,
+                momentum_reference_mode,
+                cluster_assignment_mode,
+                notes
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                run_id,
+                started_at,
+                git_commit,
+                config_fingerprint,
+                int(execution_enabled),
+                int(execution_submit_orders),
+                int(demo_mode),
+                int(telegram_enabled),
+                int(operator_pause_new_entries),
+                universe_size,
+                momentum_reference_mode,
+                cluster_assignment_mode,
+                notes,
+            ),
+        )
+        self._conn.commit()
+
+    async def log_runtime_health_snapshot(self, **snapshot) -> None:
+        await asyncio.to_thread(self._log_runtime_health_snapshot_sync, snapshot)
+
+    def _log_runtime_health_snapshot_sync(self, snapshot: dict) -> None:
+        self._conn.execute(
+            """
+            INSERT INTO runtime_health_snapshots (
+                run_id,
+                recorded_at,
+                bootstraps,
+                macro_refreshes,
+                processed_cycles,
+                processed_confirmed_cycles,
+                processed_emerging_cycles,
+                websocket_sessions,
+                websocket_failures,
+                queue_drops,
+                confirmed_queue_drops,
+                emerging_queue_drops,
+                confirmed_queue_size,
+                emerging_queue_size,
+                open_positions,
+                daily_stop_loss_count,
+                last_bootstrap_at,
+                last_macro_refresh_at,
+                last_provisional_event_at,
+                last_confirmed_event_at,
+                last_processed_confirmed_at,
+                last_processed_emerging_at,
+                last_drift_check_at,
+                drift_status,
+                operator_pause_new_entries,
+                notes
+            )
+            VALUES (
+                :run_id,
+                :recorded_at,
+                :bootstraps,
+                :macro_refreshes,
+                :processed_cycles,
+                :processed_confirmed_cycles,
+                :processed_emerging_cycles,
+                :websocket_sessions,
+                :websocket_failures,
+                :queue_drops,
+                :confirmed_queue_drops,
+                :emerging_queue_drops,
+                :confirmed_queue_size,
+                :emerging_queue_size,
+                :open_positions,
+                :daily_stop_loss_count,
+                :last_bootstrap_at,
+                :last_macro_refresh_at,
+                :last_provisional_event_at,
+                :last_confirmed_event_at,
+                :last_processed_confirmed_at,
+                :last_processed_emerging_at,
+                :last_drift_check_at,
+                :drift_status,
+                :operator_pause_new_entries,
+                :notes
+            )
+            """,
+            {
+                **snapshot,
+                "operator_pause_new_entries": int(bool(snapshot["operator_pause_new_entries"])),
+            },
+        )
+        self._conn.commit()
+
+    async def log_runtime_event(
+        self,
+        *,
+        run_id: str | None,
+        created_at: str,
+        severity: str,
+        component: str,
+        event_type: str,
+        detail: str,
+        stage: str | None = None,
+        ticker: str | None = None,
+    ) -> int:
+        return await asyncio.to_thread(
+            self._log_runtime_event_sync,
+            run_id,
+            created_at,
+            severity,
+            component,
+            event_type,
+            detail,
+            stage,
+            ticker,
+        )
+
+    def _log_runtime_event_sync(
+        self,
+        run_id: str | None,
+        created_at: str,
+        severity: str,
+        component: str,
+        event_type: str,
+        detail: str,
+        stage: str | None,
+        ticker: str | None,
+    ) -> int:
+        cursor = self._conn.execute(
+            """
+            INSERT INTO runtime_events (
+                run_id,
+                created_at,
+                severity,
+                component,
+                event_type,
+                stage,
+                ticker,
+                detail
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (run_id, created_at, severity, component, event_type, stage, ticker, detail),
+        )
+        self._conn.commit()
+        return int(cursor.lastrowid)
+
+    async def latest_run_manifest(self) -> sqlite3.Row | None:
+        return await asyncio.to_thread(self._latest_run_manifest_sync)
+
+    def _latest_run_manifest_sync(self) -> sqlite3.Row | None:
+        return self._conn.execute(
+            """
+            SELECT *
+            FROM run_manifests
+            ORDER BY started_at DESC
+            LIMIT 1
+            """
+        ).fetchone()
+
+    async def latest_runtime_health_snapshot(self, run_id: str | None = None) -> sqlite3.Row | None:
+        return await asyncio.to_thread(self._latest_runtime_health_snapshot_sync, run_id)
+
+    def _latest_runtime_health_snapshot_sync(self, run_id: str | None) -> sqlite3.Row | None:
+        if run_id is None:
+            return self._conn.execute(
+                """
+                SELECT *
+                FROM runtime_health_snapshots
+                ORDER BY recorded_at DESC
+                LIMIT 1
+                """
+            ).fetchone()
+        return self._conn.execute(
+            """
+            SELECT *
+            FROM runtime_health_snapshots
+            WHERE run_id = ?
+            ORDER BY recorded_at DESC
+            LIMIT 1
+            """,
+            (run_id,),
+        ).fetchone()
+
+    async def list_runtime_events(
+        self,
+        *,
+        run_id: str | None = None,
+        limit: int = 20,
+    ) -> list[sqlite3.Row]:
+        return await asyncio.to_thread(self._list_runtime_events_sync, run_id, limit)
+
+    def _list_runtime_events_sync(
+        self,
+        run_id: str | None,
+        limit: int,
+    ) -> list[sqlite3.Row]:
+        if run_id is None:
+            return self._conn.execute(
+                """
+                SELECT *
+                FROM runtime_events
+                ORDER BY created_at DESC, id DESC
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+        return self._conn.execute(
+            """
+            SELECT *
+            FROM runtime_events
+            WHERE run_id = ?
+            ORDER BY created_at DESC, id DESC
+            LIMIT ?
+            """,
+            (run_id, limit),
+        ).fetchall()
 
     def close(self) -> None:
         self._conn.close()

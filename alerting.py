@@ -23,28 +23,6 @@ class AlertPayload:
 
 
 @dataclass(slots=True)
-class SummaryEntry:
-    ticker: str
-    rank: int
-    composite_score: float
-    momentum_z: float
-    curvature_z: float
-    hurst: float
-
-
-@dataclass(slots=True)
-class SummaryPayload:
-    stage: str
-    cycle_time_ms: int
-    regime_score: int
-    dom_state: str
-    dom_change_pct: float
-    top_rankings: list[SummaryEntry]
-    bottom_rankings: list[SummaryEntry]
-    qualified_signals: list[str]
-
-
-@dataclass(slots=True)
 class ExecutionPayload:
     event: str
     ticker: str
@@ -90,9 +68,7 @@ class TelegramNotifier:
         labels = {
             "watchlist": "watchlist candidate",
             "emerging": "emerging setup",
-            "entry_ready": "midpoint intrabar entry candidate",
-            "confirmed": "first-pass confirmed breakout",
-            "confirmed_strong": "persistent confirmed breakout",
+            "entry_ready": "tradeable intrabar entry candidate",
         }
         label = labels.get(payload.signal_kind, "signal candidate")
         persistence_line = ""
@@ -121,33 +97,9 @@ class TelegramNotifier:
         )
         return await self._send_text(text)
 
-    async def send_summary(self, payload: SummaryPayload) -> bool:
-        top_lines = "\n".join(
-            f"#{entry.rank} {entry.ticker} score={entry.composite_score:.2f} "
-            f"mom_z={entry.momentum_z:.2f} cur_z={entry.curvature_z:.2f} hurst={entry.hurst:.2f}"
-            for entry in payload.top_rankings
-        ) or "none"
-        bottom_lines = "\n".join(
-            f"#{entry.rank} {entry.ticker} score={entry.composite_score:.2f} "
-            f"mom_z={entry.momentum_z:.2f} cur_z={entry.curvature_z:.2f} hurst={entry.hurst:.2f}"
-            for entry in payload.bottom_rankings
-        ) or "none"
-        qualified_lines = "\n".join(payload.qualified_signals) or "none"
-        text = (
-            f"15m confirmed summary\n"
-            f"Cycle time: {payload.cycle_time_ms}\n"
-            f"BTC regime: {payload.regime_score}\n"
-            f"Dominance state: {payload.dom_state}\n"
-            f"Dominance change: {payload.dom_change_pct * 100:.2f}%\n"
-            f"Qualified signals:\n{qualified_lines}\n"
-            f"Top {len(payload.top_rankings)}:\n{top_lines}\n"
-            f"Bottom {len(payload.bottom_rankings)}:\n{bottom_lines}"
-        )
-        return await self._send_text(text)
-
     async def send_execution(self, payload: ExecutionPayload) -> bool:
         labels = {
-            "enter_short": "entered new short position",
+            "enter_long": "entered new long position",
             "take_profit_exit": "take-profit exit",
             "stop_loss_exit": "stop-loss exit",
             "confirmed_exit": "confirmed-loss exit",

@@ -98,3 +98,181 @@
 - Restored `MAX_OPEN_POSITIONS` as a real live-entry safety net after the user explicitly asked for the portfolio cap back.
 - Reorganized `deploy/production.env.example` by operational impact so Telegram settings, execution/risk controls, and high-impact signal-quality knobs are grouped clearly instead of scattered.
 - Added `TELEGRAM_SIGNAL_ALERTS_ENABLED` so Telegram can be switched into execution-only mode without suppressing entry/exit notifications.
+
+## 2026-04-10
+
+- Reversed the execution layer back into momentum-long mode so `entry_ready` buys strength again instead of expressing as a contrarian short.
+- Restored symmetric exits of `TP=2%` above entry and `SL=2%` below entry across simulated fills, live demo orders, Telegram execution messages, env defaults, and docs.
+- Updated execution regression coverage so the safety nets and venue-sync path are validated under the restored long-side behavior instead of the stale short experiment.
+- Reran the full local suite after the reversal cleanup: `43` tests passing.
+- Added a configurable intraday tradeability gate for `entry_ready`, based on breadth, equal-weight basket drift, basket trend efficiency, and recent leader persistence, so the bot can stand down on obvious mean-reverting or anti-momentum sessions instead of only leaning on the BTC macro score.
+- Added `backtest.py` as the first real historical strategy harness. It reuses the production signal and execution engines, stages each future 15m close as a provisional intrabar proxy, then commits it as a confirmed close so entries/exits and safety guards can be exercised historically instead of only in forward testing.
+- Added backtest regression coverage for trade lifecycle and for filter-on vs filter-off blocking on the same synthetic history.
+- Ran a real recent-sample compare run with `python backtest.py --cycles 192 --compare-intraday-regime-filter`. Result: the harness worked, but the close-proxy approximation produced zero executed trades both with and without the filter on that sample, so this is not yet enough to claim the filter improves realized performance. The next honest step would be minute-level intrabar reconstruction.
+- Rebuilt `backtest.py` into a minute-aware intrabar replay instead of leaving it as a close-proxy toy:
+  - real historical `1m` OHLC inside each replayed `15m` bar
+  - equity-based sizing from `BACKTEST_STARTING_EQUITY_USD`, `RISK_PER_TRADE_PCT`, and `STOP_LOSS_PCT`
+  - modeled fees, slippage, gross exposure cap, daily stop-loss breaker, batch caps, and portfolio caps
+  - full trade ledger, equity curve, daily summaries, ticker summaries, and CSV export support
+- Fixed two replay honesty bugs that would have made the backtest lie:
+  - unchanged provisional minute closes no longer crash the replay
+  - new entries can no longer hit TP/SL on the same minute candle that created the entry signal
+- Parallelized intrabar history fetches because the first serial version was needlessly slow.
+- Added backtest config coverage and a regression test for unchanged provisional minute closes; local suite is now `48` passing tests.
+- Ran a real minute-aware comparison over the latest `96` confirmed bars:
+  - filter `on`: `6` trades, `+$1,418.66` net, `+1.42%`, max drawdown `1.79%`, `7` `entry_ready` signals, `6` fills
+  - filter `off`: `7` trades, `+$945.72` net, `+0.95%`, max drawdown `1.69%`, `14` `entry_ready` signals, `7` fills
+- Ran a shorter `32`-bar sanity window too:
+  - filter `on`: `4` trades, `+$336.25` net
+  - filter `off`: `4` trades, `+$336.25` net
+  - which is exactly the point: short windows can easily look identical, so longer windows matter more here.
+- Added sweep mode to `backtest.py` so repeated historical windows can be sampled across months or years instead of manually replaying one anchor date at a time.
+- Added progress logging to sweep mode because long minute-aware runs were otherwise a black box until the very end.
+- Profiled the minute-aware runtime:
+  - `8` cycles: about `2.8s` fetch + `7.6s` replay
+  - `32` cycles: about `3.2s` fetch + `30.3s` replay
+  - the real cost is the replay loop, not the network fetch
+- Ran a 1-year quarterly sweep with `96`-cycle windows (`24h` each), filter on vs off:
+  - filter `on` won `3 / 4` windows
+  - average net PnL: `+$626.61` vs `-$500.73`
+  - average return: `+0.63%` vs `-0.50%`
+  - average max drawdown: `2.89%` vs `4.58%`
+- Ran a 2-year semiannual sweep with `96`-cycle windows:
+  - `4` windows completed, `1` skipped because `NOTUSDT` did not yet exist in the oldest window
+  - filter `on` won `2 / 4` windows
+  - average net PnL: `+$783.63` vs `+$297.88`
+  - average return: `+0.78%` vs `+0.30%`
+  - average max drawdown: `2.23%` vs `3.80%`
+- The two-year sweep makes the tradeoff clear:
+  - the gate is not a universal profit booster
+  - it is a useful risk and selectivity filter
+  - it often helps most on bad or mixed days by cutting the number of `entry_ready` candidates materially
+- Narrowed the default universe again by user request:
+  - removed `NOTUSDT`, `BLURUSDT`, `POPCATUSDT`, and `STGUSDT`
+  - explicitly kept `JASMYUSDT`, `1000PEPEUSDT`, `1000BONKUSDT`, `1000FLOKIUSDT`, and `RENDERUSDT`
+- Important caveat: keeping `RENDERUSDT` still prevents the oldest `2024-04` full-universe sweep window from replaying cleanly, because it had no candles in that period either.
+
+## 2026-04-11
+
+- Added a real on-disk historical candle cache to `exchange.py`, keyed by source/category/symbol/interval/start time and stored in SQLite instead of ad hoc flat files.
+- Wired the backtest fetch path to reuse that cache for Bybit range fetches, recent closed-kline fetches, and Binance BTCDOM range fetches so repeated research runs stop redownloading the same history.
+- Added `BACKTEST_CACHE_ENABLED` and `BACKTEST_CACHE_PATH` to config plus the production env template so caching is explicit and configurable.
+- Added `python backtest.py --prefetch-lookback-days ...` as the official way to bulk-warm the cache for the current tracked universe and macro series.
+- Ran a real cache warm sanity pass over the last 2 UTC days ending `2026-04-11 00:00 UTC`:
+  - `55` tracked symbols including `BTCUSDT`
+  - `110` Bybit symbol/interval fetches (`15m` plus `1m`)
+  - `184,800` Bybit candles
+  - `227` BTC daily candles
+  - `146` BTCDOM candles
+  - `185,173` total cached rows
+- Verified locally with `python -m py_compile backtest.py exchange.py config.py` and `pytest -q` (`50` passing tests).
+- Profiled the minute-aware replay after caching and found the real hotspot clearly: `hurst_exponent()` in `indicators.py` was dominating runtime via repeated `np.polyfit` calls inside the per-symbol minute loop.
+- Replaced the old Hurst detrending loop with an equivalent vectorized linear-detrend formulation so it stops paying `polyfit/lstsq` cost hundreds of thousands of times per run.
+- Added explicit `BACKTEST_RESEARCH_FAST` / `--research-fast` support for parameter research:
+  - skips per-pass signal-row persistence in `SignalEngine`
+  - skips the follow-up SQL signal report load at the end of backtests
+  - short-circuits the intraday regime scan in fast mode when the gate is not participating in decisions
+- Measured the effect honestly:
+  - `cProfile` on an `8`-cycle minute-aware replay dropped from about `16.05s` total / `12.42s` inside `hurst_exponent()` to about `2.73s` total / `1.61s` inside `hurst_exponent()`
+  - wall-clock `32`-cycle run: normal `7.31s`, `--research-fast` `7.13s`
+- Added regression coverage for the optimized Hurst implementation and the new fast-research mode; full suite is now `52` passing tests.
+- Added generic plan-reuse sweeps to `backtest.py` through `--grid-setting KEY=v1,v2,...`.
+- The new grid runner fetches/builds one `MinuteReplayPlan` and then runs multiple variants against that same immutable replay input, instead of rebuilding the same historical plan for every parameter combination.
+- Ran a real CLI sanity check with a 2x2 grid over `take_profit_pct` and `hurst_cutoff` using `--research-fast`; the command completed and produced four variant summaries from one reused replay plan.
+- Upgraded the variant runner from serial execution to bounded worker-process execution via `--variant-workers` / `BACKTEST_VARIANT_WORKERS`.
+- Kept it honest and portable by serializing the prebuilt replay plan once to a temporary file, then letting worker processes load that immutable snapshot instead of sharing live mutable state or colliding on SQLite handles.
+- Ran a real CLI sanity check with `--variant-workers 2`; the process-based grid run completed successfully on this Mac.
+- Thorough speed tests on this local Apple M4 (`10` CPU cores) now show that process-level parallelism is worth it for multi-variant sweeps:
+  - `32` cycles, `4` variants, `--research-fast`:
+    - `1` worker: `21.15s`
+    - `2` workers: `11.03s`
+    - `4` workers: `5.89s`
+  - `96` cycles, `4` variants, `--research-fast`:
+    - `1` worker: `62.44s`
+    - `2` workers: `31.41s`
+    - `4` workers: `18.75s`
+- That is roughly `1.9x` to `3.6x` speedup on the tested grid sizes. The scaling is not perfect, but it is real enough that more CPU now translates into meaningfully faster research.
+- Extended the minute-aware backtester with post-exit follow-through analytics per closed trade:
+  - `post_exit_best_pct`
+  - `post_exit_worst_pct`
+  - `volatility_pct`
+- The simulator now tracks a bounded number of future intrabar candles after each close and writes those fields onto each `BacktestTrade`, so TP/SL tuning can use what happened after exit instead of only in-trade MFE/MAE.
+- Comprehensive backtest summaries now aggregate those follow-through fields into:
+  - `avg_post_exit_best_pct`
+  - `avg_post_exit_worst_pct`
+  - `avg_volatility_pct`
+- The CSV trade export inherits the new per-trade fields automatically because the exporter already writes `asdict(trade)`.
+- Added focused regression coverage for the tracker finalization math. Local verification is now `55` passing tests.
+- Added `BACKTEST_RESEARCH_PLAN.md` as the repo's explicit optimization discipline for this strategy.
+- The plan makes three things explicit so future research does not devolve into parameter thrashing:
+  - use one-family sweeps first for pruning
+  - run targeted interaction checks only after pruning
+  - reserve full 1-year validation and holdout/walk-forward checks for finalists only
+- Linked the new plan from `README.md` so the backtest mechanics and the research workflow now live together instead of in chat history.
+- Simplified the live strategy contract aggressively:
+  - `entry_ready` is now the only tradeable signal tier
+  - confirmed bars still advance state, but they no longer produce tradeable or Telegram-facing confirmed tiers
+  - the dead confirmed summary path was removed from the live runtime loop instead of being left inert and misleading
+- Added residual momentum modes to the live ranking path, with `basket_relative` as the default so the system ranks symbol-vs-basket strength instead of blindly buying generic alt beta.
+- Added manual cluster exposure control via `MAX_POSITIONS_PER_CLUSTER` plus `ticker_cluster(...)`, so the book can stop piling into effectively the same trade under different tickers.
+- Added a historical-universe policy to backtesting:
+  - `window_available` keeps only symbols with complete aligned data for that replay window
+  - `strict` requires the full configured universe and fails otherwise
+- Added walk-forward validation directly to `backtest.py` so short-listed variants can be trained on one window and tested on the next without another ad hoc script.
+- Added `reconcile.py` to compare Telegram trade logs against exported backtest trades, because pretty backtests are not enough if they cannot be checked against real forward behavior.
+- Reran the full local suite after the simplification and research additions: `60` tests passing.
+- Reworked residual momentum again so the live default is now `cluster_relative` instead of `basket_relative`, with support for `absolute`, `btc_relative`, `basket_relative`, `cluster_relative`, and `hybrid_relative`.
+- Added configurable cluster assignment modes:
+  - `manual`
+  - `dynamic`
+  - `hybrid`
+  Dynamic cluster labels now drive both residual-momentum references and `MAX_POSITIONS_PER_CLUSTER`.
+- Added a return-correlation clustering helper to `indicators.py` and regression coverage proving similar synthetic series cluster together while unrelated ones do not.
+- Added richer `entry_ready` diagnostics in `signal_engine.py` and propagated them into live execution notes, backtest trades, and exported trade analytics so later analysis can see the passing rationale directly.
+- Extended `backtest.py` again:
+  - built-in stress variants via `--stress-profile`
+  - richer walk-forward result tracking with exported `walk_forward_candidates.csv`
+  - profit-factor reporting in variant summaries
+  - cluster-label and entry-diagnostics preservation in simulated positions and trades
+- Extended `reconcile.py` from a crude overlap counter into a real reconciliation report:
+  - entry/exit precision and recall
+  - average timestamp deltas
+  - exit-reason agreement
+  - matched-entry and matched-exit CSV exports
+- Trimmed dead config surface aggressively:
+  - removed confirmed-only lifecycle knobs that no longer influenced the simplified live contract
+  - removed dead Telegram summary knobs instead of leaving them in `.env` as compatibility theater
+- Cleaned the operator docs and env template to match the actual runtime again, including the new residual/clustering controls, stress profiles, and reconciliation outputs.
+- Reran local verification after the full pass:
+  - focused suites first: `32` tests passing
+  - full suite after integration cleanup: `62` tests passing
+- Ran a fresh smoke backtest on the latest code with `python backtest.py --cycles 8 --research-fast --db /tmp/model050426-research.sqlite3`. It completed cleanly with zero trades in that tiny window, which is fine; the point was integration sanity, not performance theater.
+- Added a first real production-hardening layer without pretending to do a giant architecture rewrite:
+  - new `runtime_validation.py` for startup config validation
+  - new `runtime_monitor.py` for run manifests, health snapshots, and drift checks
+  - new `monitor.py` CLI for read-only inspection of recent runtime state
+- Extended `database.py` with:
+  - `run_manifests`
+  - `runtime_health_snapshots`
+  - `runtime_events`
+  plus async helpers to write and inspect them
+- Wired `main.py` to:
+  - fail fast on invalid runtime config
+  - persist a run manifest with git commit and config fingerprint
+  - log runtime start/stop events
+  - run periodic health snapshots
+  - run periodic venue-drift checks
+- Added `OPERATOR_PAUSE_NEW_ENTRIES` to the live execution path, so the service can be left running while fresh entries are explicitly blocked and recorded as control events.
+- Added runtime-event logging for the main live entry blockers (`operator pause`, position cap, cluster cap, batch cap, daily stop-loss cap) instead of leaving those reasons only in transient logs.
+- Added focused tests for:
+  - runtime validation
+  - runtime monitoring helpers
+  - operator pause
+  - drift detection
+- Reran verification after the hardening pass:
+  - focused suites: `20` tests passing
+  - full suite: `69` tests passing
+- Ran two safe bounded service checks from a clean working directory with live execution submission disabled:
+  - one baseline run proved `run_manifests` and `runtime_events` landed in SQLite and were readable through `monitor.py`
+  - one `1s` snapshot-interval run proved `runtime_health_snapshots` also land correctly and show queue depth, last activity timestamps, and drift status
+- The first bounded run from the repo root also exposed a real operational truth: repo-root `.env` still overrides shell env. That is intentional, but it means “safe override” testing should be done from a clean working directory if you want to bypass the local `.env`.

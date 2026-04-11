@@ -5,11 +5,11 @@ import asyncio
 from alerting import AlertPayload, TelegramNotifier
 
 
-def test_confirmed_alert_text_clarifies_persistence_upgrade() -> None:
-    asyncio.run(_exercise_confirmed_alert_text())
+def test_entry_ready_alert_text_uses_live_tradeable_label() -> None:
+    asyncio.run(_exercise_entry_ready_alert_text())
 
 
-async def _exercise_confirmed_alert_text() -> None:
+async def _exercise_entry_ready_alert_text() -> None:
     captured: list[str] = []
 
     class RecordingNotifier(TelegramNotifier):
@@ -20,8 +20,8 @@ async def _exercise_confirmed_alert_text() -> None:
     notifier = RecordingNotifier(session=None, bot_token="token", chat_id="chat")  # type: ignore[arg-type]
     await notifier.send(
         AlertPayload(
-            stage="confirmed",
-            signal_kind="confirmed",
+            stage="emerging",
+            signal_kind="entry_ready",
             ticker="TRXUSDT",
             composite_score=1.31,
             momentum_z=1.10,
@@ -37,5 +37,5 @@ async def _exercise_confirmed_alert_text() -> None:
     )
 
     assert captured
-    assert "first-pass confirmed breakout" in captured[0]
+    assert "tradeable intrabar entry candidate" in captured[0]
     assert "Persistence: 1/3 (strong at 2/3)" in captured[0]

@@ -6,9 +6,11 @@ import hmac
 import json
 import logging
 import re
+import sqlite3
 import time
 from dataclasses import dataclass
 from decimal import Decimal, ROUND_DOWN, ROUND_HALF_UP
+from pathlib import Path
 from urllib.parse import urlencode
 
 import aiohttp
@@ -95,6 +97,15 @@ class OrderAck:
 class WalletBalance:
     total_equity_usd: Decimal
     total_available_balance_usd: Decimal
+
+
+@dataclass(slots=True)
+class HistoricalCandle:
+    start_time_ms: int
+    open_price: float
+    high_price: float
+    low_price: float
+    close_price: float
 
 
 def round_decimal(value: Decimal, step: Decimal, rounding) -> Decimal:
@@ -318,6 +329,7 @@ class BybitMarketDataClient:
         self.session = session
         self.settings = settings
         self._rest_timeout = aiohttp.ClientTimeout(total=20)
+        self._cache_conn: sqlite3.Connection | None = None
 
     async def _get_json(self, path: str, params: dict[str, str | int]) -> dict:
         url = f"{self.settings.bybit_rest_base_url.rstrip('/')}{path}"
@@ -366,6 +378,153 @@ class BybitMarketDataClient:
             return payload
         raise RuntimeError(f"Binance error: exhausted retries for {path} {params}")
 
+    def _get_cache_conn(self) -> sqlite3.Connection | None:
+        if not self.settings.backtest_cache_enabled:
+            return None
+        if self._cache_conn is None:
+            cache_path = Path(self.settings.backtest_cache_path).expanduser()
+            cache_path.parent.mkdir(parents=True, exist_ok=True)
+            connection = sqlite3.connect(cache_path)
+            connection.execute("PRAGMA journal_mode=WAL")
+            connection.execute("PRAGMA synchronous=NORMAL")
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS historical_candles (
+                    source TEXT NOT NULL,
+                    category TEXT NOT NULL,
+                    symbol TEXT NOT NULL,
+                    interval TEXT NOT NULL,
+                    start_time_ms INTEGER NOT NULL,
+                    open_price REAL NOT NULL,
+                    high_price REAL NOT NULL,
+                    low_price REAL NOT NULL,
+                    close_price REAL NOT NULL,
+                    PRIMARY KEY (source, category, symbol, interval, start_time_ms)
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_historical_candles_lookup
+                ON historical_candles (source, category, symbol, interval, start_time_ms)
+                """
+            )
+            self._cache_conn = connection
+        return self._cache_conn
+
+    def close_cache(self) -> None:
+        if self._cache_conn is not None:
+            self._cache_conn.close()
+            self._cache_conn = None
+
+    def cached_candle_count(self) -> int:
+        connection = self._get_cache_conn()
+        if connection is None:
+            return 0
+        row = connection.execute("SELECT COUNT(*) FROM historical_candles").fetchone()
+        return int(row[0]) if row is not None else 0
+
+    def _cache_expected_starts(
+        self,
+        *,
+        start_ms: int,
+        end_ms: int,
+        interval_ms: int,
+    ) -> list[int]:
+        now_ms = int(time.time() * 1000)
+        starts: list[int] = []
+        cursor = start_ms
+        while cursor < end_ms:
+            if cursor + interval_ms <= now_ms:
+                starts.append(cursor)
+            cursor += interval_ms
+        return starts
+
+    def _load_cached_ohlc_range(
+        self,
+        *,
+        source: str,
+        category: str,
+        symbol: str,
+        interval: str,
+        start_ms: int,
+        end_ms: int,
+        interval_ms: int,
+    ) -> list[HistoricalCandle] | None:
+        connection = self._get_cache_conn()
+        if connection is None:
+            return None
+        expected_starts = self._cache_expected_starts(
+            start_ms=start_ms,
+            end_ms=end_ms,
+            interval_ms=interval_ms,
+        )
+        if not expected_starts:
+            return []
+        rows = connection.execute(
+            """
+            SELECT start_time_ms, open_price, high_price, low_price, close_price
+            FROM historical_candles
+            WHERE source = ? AND category = ? AND symbol = ? AND interval = ?
+              AND start_time_ms >= ? AND start_time_ms < ?
+            ORDER BY start_time_ms ASC
+            """,
+            (source, category, symbol, interval, start_ms, end_ms),
+        ).fetchall()
+        if len(rows) != len(expected_starts):
+            return None
+        starts = [int(row[0]) for row in rows]
+        if starts != expected_starts:
+            return None
+        return [
+            HistoricalCandle(
+                start_time_ms=int(row[0]),
+                open_price=float(row[1]),
+                high_price=float(row[2]),
+                low_price=float(row[3]),
+                close_price=float(row[4]),
+            )
+            for row in rows
+        ]
+
+    def _store_cached_ohlc_range(
+        self,
+        *,
+        source: str,
+        category: str,
+        symbol: str,
+        interval: str,
+        candles: list[HistoricalCandle],
+    ) -> None:
+        if not candles:
+            return
+        connection = self._get_cache_conn()
+        if connection is None:
+            return
+        connection.executemany(
+            """
+            INSERT OR REPLACE INTO historical_candles (
+                source, category, symbol, interval, start_time_ms,
+                open_price, high_price, low_price, close_price
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                (
+                    source,
+                    category,
+                    symbol,
+                    interval,
+                    candle.start_time_ms,
+                    candle.open_price,
+                    candle.high_price,
+                    candle.low_price,
+                    candle.close_price,
+                )
+                for candle in candles
+            ],
+        )
+        connection.commit()
+
     async def fetch_closed_klines(
         self,
         symbol: str,
@@ -377,6 +536,21 @@ class BybitMarketDataClient:
         now_ms = int(time.time() * 1000)
         interval_ms = interval_to_milliseconds(interval)
         attempts = [limit + 1, limit + 4, min(1000, limit + 16)]
+
+        if self.settings.backtest_cache_enabled:
+            aligned_end_ms = (now_ms // interval_ms) * interval_ms
+            for request_limit in attempts:
+                start_ms = aligned_end_ms - (request_limit * interval_ms)
+                candles = await self.fetch_closed_ohlc_range(
+                    symbol=symbol,
+                    interval=interval,
+                    start_ms=start_ms,
+                    end_ms=aligned_end_ms,
+                    category=category,
+                )
+                if len(candles) >= limit:
+                    tail = candles[-limit:]
+                    return [(candle.start_time_ms, candle.close_price) for candle in tail]
 
         for request_limit in attempts:
             payload = await self._get_json(
@@ -404,6 +578,104 @@ class BybitMarketDataClient:
             f"Unable to fetch {limit} closed {interval} candles for {symbol}"
         )
 
+    async def fetch_closed_ohlc_range(
+        self,
+        symbol: str,
+        interval: str,
+        start_ms: int,
+        end_ms: int,
+        *,
+        category: str | None = None,
+    ) -> list[HistoricalCandle]:
+        if end_ms <= start_ms:
+            return []
+        category = category or self.settings.bybit_category
+        interval_ms = interval_to_milliseconds(interval)
+        cached = self._load_cached_ohlc_range(
+            source="bybit",
+            category=category,
+            symbol=symbol,
+            interval=interval,
+            start_ms=start_ms,
+            end_ms=end_ms,
+            interval_ms=interval_ms,
+        )
+        if cached is not None:
+            return cached
+        max_candles_per_request = 1000
+        max_window_ms = interval_ms * max_candles_per_request
+        now_ms = int(time.time() * 1000)
+        candles: list[HistoricalCandle] = []
+        cursor_start = start_ms
+        while cursor_start < end_ms:
+            window_end = min(end_ms, cursor_start + max_window_ms)
+            payload = await self._get_json(
+                "/v5/market/kline",
+                {
+                    "category": category,
+                    "symbol": symbol,
+                    "interval": interval,
+                    "start": cursor_start,
+                    "end": window_end - 1,
+                    "limit": max_candles_per_request,
+                },
+            )
+            rows = payload["result"]["list"]
+            window_candles: list[HistoricalCandle] = []
+            for row in rows:
+                candle_start_ms = int(row[0])
+                if candle_start_ms < start_ms or candle_start_ms >= end_ms:
+                    continue
+                if candle_start_ms + interval_ms > now_ms:
+                    continue
+                window_candles.append(
+                    HistoricalCandle(
+                        start_time_ms=candle_start_ms,
+                        open_price=float(row[1]),
+                        high_price=float(row[2]),
+                        low_price=float(row[3]),
+                        close_price=float(row[4]),
+                    )
+                )
+            window_candles.sort(key=lambda item: item.start_time_ms)
+            candles.extend(window_candles)
+            cursor_start = window_end
+        deduped: dict[int, HistoricalCandle] = {candle.start_time_ms: candle for candle in candles}
+        ordered = [deduped[key] for key in sorted(deduped)]
+        if ordered:
+            self._ensure_contiguous(
+                [(candle.start_time_ms, candle.close_price) for candle in ordered],
+                interval_ms,
+                symbol,
+                interval,
+            )
+            self._store_cached_ohlc_range(
+                source="bybit",
+                category=category,
+                symbol=symbol,
+                interval=interval,
+                candles=ordered,
+            )
+        return ordered
+
+    async def fetch_closed_klines_range(
+        self,
+        symbol: str,
+        interval: str,
+        start_ms: int,
+        end_ms: int,
+        *,
+        category: str | None = None,
+    ) -> list[tuple[int, float]]:
+        candles = await self.fetch_closed_ohlc_range(
+            symbol=symbol,
+            interval=interval,
+            start_ms=start_ms,
+            end_ms=end_ms,
+            category=category,
+        )
+        return [(candle.start_time_ms, candle.close_price) for candle in candles]
+
     def _ensure_contiguous(
         self,
         candles: list[tuple[int, float]],
@@ -421,6 +693,16 @@ class BybitMarketDataClient:
         symbol = self.settings.btcdom_symbol.strip().upper()
         if symbol.endswith(".P"):
             symbol = symbol[:-2]
+        interval_ms = interval_to_milliseconds(self.settings.btcdom_interval)
+        if self.settings.backtest_cache_enabled:
+            now_ms = int(time.time() * 1000)
+            aligned_end_ms = (now_ms // interval_ms) * interval_ms
+            start_ms = aligned_end_ms - (
+                (self.settings.btcdom_history_lookback + 4) * interval_ms
+            )
+            candles = await self.fetch_btcdom_klines_range(start_ms=start_ms, end_ms=aligned_end_ms)
+            if len(candles) >= self.settings.btcdom_history_lookback:
+                return candles[-self.settings.btcdom_history_lookback :]
         payload = await self._get_binance_json(
             "/fapi/v1/klines",
             {
@@ -431,7 +713,6 @@ class BybitMarketDataClient:
         )
         if not isinstance(payload, list):
             raise RuntimeError(f"Binance error: unexpected payload for {symbol}: {payload}")
-        interval_ms = interval_to_milliseconds(self.settings.btcdom_interval)
         now_ms = int(time.time() * 1000)
         candles: list[tuple[int, float]] = []
         for row in payload:
@@ -448,6 +729,82 @@ class BybitMarketDataClient:
         candles = candles[-self.settings.btcdom_history_lookback :]
         self._ensure_contiguous(candles, interval_ms, symbol, self.settings.btcdom_interval)
         return candles
+
+    async def fetch_btcdom_klines_range(
+        self,
+        *,
+        start_ms: int,
+        end_ms: int,
+    ) -> list[tuple[int, float]]:
+        symbol = self.settings.btcdom_symbol.strip().upper()
+        if symbol.endswith(".P"):
+            symbol = symbol[:-2]
+        interval_ms = interval_to_milliseconds(self.settings.btcdom_interval)
+        if end_ms <= start_ms:
+            return []
+        cached = self._load_cached_ohlc_range(
+            source="binance_futures",
+            category="",
+            symbol=symbol,
+            interval=self.settings.btcdom_interval,
+            start_ms=start_ms,
+            end_ms=end_ms,
+            interval_ms=interval_ms,
+        )
+        if cached is not None:
+            return [(candle.start_time_ms, candle.close_price) for candle in cached]
+        max_candles_per_request = 1500
+        max_window_ms = interval_ms * max_candles_per_request
+        now_ms = int(time.time() * 1000)
+        candles: list[HistoricalCandle] = []
+        cursor_start = start_ms
+        while cursor_start < end_ms:
+            window_end = min(end_ms, cursor_start + max_window_ms)
+            payload = await self._get_binance_json(
+                "/fapi/v1/klines",
+                {
+                    "symbol": symbol,
+                    "interval": self.settings.btcdom_interval,
+                    "startTime": cursor_start,
+                    "endTime": window_end - 1,
+                    "limit": max_candles_per_request,
+                },
+            )
+            if not isinstance(payload, list):
+                raise RuntimeError(f"Binance error: unexpected payload for {symbol}: {payload}")
+            for row in payload:
+                candle_start_ms = int(row[0])
+                if candle_start_ms < start_ms or candle_start_ms >= end_ms:
+                    continue
+                if candle_start_ms + interval_ms > now_ms:
+                    continue
+                candles.append(
+                    HistoricalCandle(
+                        start_time_ms=candle_start_ms,
+                        open_price=float(row[1]),
+                        high_price=float(row[2]),
+                        low_price=float(row[3]),
+                        close_price=float(row[4]),
+                    )
+                )
+            cursor_start = window_end
+        deduped = {candle.start_time_ms: candle for candle in candles}
+        ordered = [deduped[key] for key in sorted(deduped)]
+        if ordered:
+            self._ensure_contiguous(
+                [(candle.start_time_ms, candle.close_price) for candle in ordered],
+                interval_ms,
+                symbol,
+                self.settings.btcdom_interval,
+            )
+            self._store_cached_ohlc_range(
+                source="binance_futures",
+                category="",
+                symbol=symbol,
+                interval=self.settings.btcdom_interval,
+                candles=ordered,
+            )
+        return [(candle.start_time_ms, candle.close_price) for candle in ordered]
 
     async def bootstrap(self) -> BootstrapPayload:
         semaphore = asyncio.Semaphore(self.settings.bootstrap_concurrency)

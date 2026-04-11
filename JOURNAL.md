@@ -313,3 +313,10 @@
   - `python3 -m pytest -q tests/test_backtest.py tests/test_replay.py` -> `14 passed`
   - `python3 -m py_compile backtest.py tests/test_backtest.py`
   - `python3 -m pytest -q` -> `73 passed`
+- Added explicit progress messages to `backtest.py` so long runs are less opaque:
+  - prefetch now announces start and completion
+  - normal backtests, compare runs, grid runs, sweeps, and walk-forward runs announce their phase and anchor date
+  - variant batches now print when they start, when the replay plan is snapshotted for workers, and when all variants finish
+- Reran targeted validation after the progress-message change:
+  - `python3 -m py_compile backtest.py`
+  - `python3 -m pytest -q tests/test_backtest.py` -> `13 passed`

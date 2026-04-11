@@ -9,6 +9,7 @@
 - A minute-aware historical backtest harness now exists in `backtest.py`. It reuses the live `SignalEngine`, replays historical `1m` OHLC inside each `15m` bar, models fees/slippage/exposure caps, and can compare the intraday regime filter on vs off over the same sample.
 - The backtest fetch path now supports an on-disk SQLite candle cache plus explicit prefetch warming through `python backtest.py --prefetch-lookback-days ...`.
 - Ordinary intrabar backtests now also support a fixed UTC anchor via `python backtest.py --end-date YYYY-MM-DD ...`, so a warmed cache can be reused without the default CLI quietly drifting into fresh tail fetches.
+- `backtest.py` now emits explicit stdout phase messages for prefetch, ordinary runs, compare mode, grid mode, sweeps, walk-forward, and export steps so long jobs are operationally legible.
 - The backtest now also has an explicit `--research-fast` mode that skips signal-row persistence and post-run signal-summary SQL while keeping trade and equity simulation intact for parameter sweeps.
 - The backtest now also supports generic plan-reuse grids through `--grid-setting KEY=v1,v2,...`, so one fetched `MinuteReplayPlan` can drive many parameter variants without rebuilding the same replay input every time.
 - Variant grids can now also use bounded worker-process parallelism through `--variant-workers` / `BACKTEST_VARIANT_WORKERS`, with each worker loading the same serialized replay-plan snapshot and writing to its own SQLite output.

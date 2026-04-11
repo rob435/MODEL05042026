@@ -138,3 +138,4 @@
 - Stop writing dead confirmation fields in the live path once the strategy contract no longer uses them. Historical DB columns may still exist, but the runtime should not keep propagating meaningless `confirmation_signal_kind` / `confirmed_at` values forever.
 - Do not let ordinary full-run/grid backtests silently anchor to wall-clock "now" once a large cache has been prefetched. That creates pointless tail fetches, more Bybit rate-limit warnings, and non-deterministic reuse of the warmed dataset.
 - Reuse the existing window-pinned intrabar fetch path for ordinary single-run, comparison, and grid backtests instead of maintaining two different anchoring behaviors. The logic already existed for sweeps and walk-forward runs; the bug was that the default CLI path ignored it.
+- Long backtest runs need blunt phase messages in stdout. Operators should not have to infer "is it fetching, building a plan, running variants, or exporting?" from Wi-Fi graphs or CPU usage.

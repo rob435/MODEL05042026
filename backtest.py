@@ -38,6 +38,10 @@ from universe import ticker_cluster
 LOGGER = logging.getLogger(__name__)
 
 
+def _progress(message: str) -> None:
+    print(message, flush=True)
+
+
 class NullNotifier:
     enabled = False
 
@@ -2170,6 +2174,7 @@ async def run_comprehensive_backtest_variants(
     if workers == 1 or len(variants) <= 1:
         rows = []
         for index, variant in enumerate(variants, start=1):
+            _progress(f"[variants] running {index}/{len(variants)}: {variant.name}")
             variant_settings = replace(settings, **variant.overrides)
             result = await run_comprehensive_backtest_plan(
                 variant_settings,
@@ -2193,6 +2198,9 @@ async def run_comprehensive_backtest_variants(
             )
         return BacktestVariantRunResult(variants=rows)
     loop = asyncio.get_running_loop()
+    _progress(
+        f"[variants] snapshotting replay plan for {len(variants)} variants across {workers} workers"
+    )
     plan_path = _write_plan_snapshot(plan)
     executor = ProcessPoolExecutor(max_workers=workers)
     try:
@@ -2214,6 +2222,7 @@ async def run_comprehensive_backtest_variants(
             os.unlink(plan_path)
         except FileNotFoundError:
             pass
+    _progress("[variants] all variants completed")
     return BacktestVariantRunResult(variants=rows)
 
 
@@ -2584,6 +2593,14 @@ def main() -> None:
     variant_specs = _combine_variant_specs(grid_specs, stress_specs)
 
     if args.prefetch_lookback_days is not None:
+        _progress(
+            f"[prefetch] warming {args.prefetch_lookback_days} UTC days"
+            + (
+                f" anchored at {args.prefetch_end_date}"
+                if args.prefetch_end_date
+                else " anchored at now"
+            )
+        )
         async def _run_prefetch() -> PrefetchSummary:
             async with aiohttp.ClientSession() as session:
                 client = BybitMarketDataClient(session=session, settings=settings)
@@ -2598,12 +2615,21 @@ def main() -> None:
                     client.close_cache()
 
         summary = asyncio.run(_run_prefetch())
+        _progress("[prefetch] complete")
         print(format_prefetch_summary(summary))
         return
 
     if args.sweep_lookback_days is not None:
         if args.mode != "intrabar":
             raise ValueError("Sweep mode currently supports only --mode intrabar")
+        _progress(
+            f"[sweep] building {args.sweep_lookback_days}-day sweep"
+            + (
+                f" anchored at {args.sweep_end_date}"
+                if args.sweep_end_date
+                else " anchored at now"
+            )
+        )
         window_end_times = _build_sweep_window_end_times(
             settings=settings,
             lookback_days=args.sweep_lookback_days,
@@ -2621,6 +2647,7 @@ def main() -> None:
             )
         )
         if args.export_dir:
+            _progress(f"[sweep] exporting results to {Path(args.export_dir).expanduser()}")
             export_sweep_comparison(result, export_dir=args.export_dir)
         print(format_sweep_comparison(result))
         return
@@ -2628,6 +2655,15 @@ def main() -> None:
     if args.walk_forward_lookback_days is not None:
         if args.mode != "intrabar":
             raise ValueError("Walk-forward mode currently supports only --mode intrabar")
+        _progress(
+            f"[walk-forward] running lookback={args.walk_forward_lookback_days}d "
+            f"train={args.walk_forward_train_days}d test={args.walk_forward_test_days}d"
+            + (
+                f" anchored at {args.walk_forward_end_date}"
+                if args.walk_forward_end_date
+                else " anchored at now"
+            )
+        )
         result = asyncio.run(
             run_walk_forward_validation(
                 settings,
@@ -2641,6 +2677,7 @@ def main() -> None:
             )
         )
         if args.export_dir:
+            _progress(f"[walk-forward] exporting results to {Path(args.export_dir).expanduser()}")
             export_walk_forward_result(result, export_dir=args.export_dir)
         print(format_walk_forward_result(result))
         return
@@ -2707,6 +2744,10 @@ def main() -> None:
     if args.compare_intraday_regime_filter:
         if variant_specs:
             raise ValueError("Use either --compare-intraday-regime-filter or --grid-setting, not both")
+        _progress(
+            f"[compare] fetching replay plan for {args.cycles} cycles"
+            + (f" anchored at {args.end_date}" if args.end_date else " anchored at now")
+        )
         async def _run_compare() -> tuple[ComprehensiveBacktestResult, ComprehensiveBacktestResult]:
             async with aiohttp.ClientSession() as session:
                 client = BybitMarketDataClient(session=session, settings=settings)
@@ -2739,6 +2780,7 @@ def main() -> None:
         filter_on, filter_off = asyncio.run(_run_compare())
         if args.export_dir:
             export_root = Path(args.export_dir).expanduser()
+            _progress(f"[compare] exporting results to {export_root}")
             export_comprehensive_backtest(filter_on, export_dir=str(export_root / "filter-on"))
             export_comprehensive_backtest(filter_off, export_dir=str(export_root / "filter-off"))
         print(_format_comprehensive_comparison(filter_on, filter_off))
@@ -2749,6 +2791,10 @@ def main() -> None:
         return
 
     if variant_specs:
+        _progress(
+            f"[grid] fetching replay plan for {args.cycles} cycles and {len(variant_specs)} variants"
+            + (f" anchored at {args.end_date}" if args.end_date else " anchored at now")
+        )
         async def _run_variants() -> BacktestVariantRunResult:
             async with aiohttp.ClientSession() as session:
                 client = BybitMarketDataClient(session=session, settings=settings)
@@ -2771,10 +2817,15 @@ def main() -> None:
 
         result = asyncio.run(_run_variants())
         if args.export_dir:
+            _progress(f"[grid] exporting results to {Path(args.export_dir).expanduser()}")
             export_variant_run_result(result, export_dir=args.export_dir)
         print(format_variant_run_result(result))
         return
 
+    _progress(
+        f"[backtest] running {args.cycles} cycles in {args.mode} mode"
+        + (f" anchored at {args.end_date}" if args.end_date else " anchored at now")
+    )
     result = asyncio.run(
         fetch_and_run_comprehensive_backtest(
             settings,
@@ -2787,6 +2838,7 @@ def main() -> None:
         )
     )
     if args.export_dir:
+        _progress(f"[backtest] exporting results to {Path(args.export_dir).expanduser()}")
         export_comprehensive_backtest(result, export_dir=args.export_dir)
     print(format_comprehensive_backtest(result))
 

@@ -109,6 +109,10 @@
   - run manifest recorded git commit and config fingerprint
   - runtime start/stop events landed in SQLite
   - with snapshot interval forced to `1s`, health snapshots also landed and were readable through `monitor.py`
+- A local research-box setup path now exists:
+  - `deploy/prepare_local_env.py` writes a safe local `.env`
+  - `deploy/cache_bundle.py` transfers the large backtest cache between machines
+  - `deploy/setup_windows.ps1` bootstraps a Windows research PC around those helpers
 
 ## Remaining risks
 
@@ -133,6 +137,7 @@
 - Dynamic clustering is still threshold-based and correlation-on-returns is still a blunt proxy. It is better than the old static-only map, but it can still group badly in noisy regimes or miss nonlinear relationships.
 - The new drift monitor is periodic and symbol-by-symbol. It is good enough for a first control layer, but it is not a private-websocket reconciliation engine.
 - The runtime control plane is now real, but it is still SQLite-based and local-process based. That is appropriate for this repo; it is not the same thing as institutional monitoring infrastructure.
+- The Windows bootstrap itself is only lightly validated here. The risky logic lives in Python helpers and is tested; the PowerShell wrapper still needs one real run on the target PC.
 - TP/SL is checked only when the runtime processes a cycle. There is no separate sub-second price watcher, so a violent move can still gap through the exact configured threshold.
 - Venue exit reconciliation is polling-based, not websocket-based. Telegram exit messages and SQLite close state will lag until the next engine cycle sees that Bybit has already closed the position.
 - A real demo smoke entry was executed successfully on `SOLUSDT`; the venue accepted the order and TP/SL were installed. There is now a live demo position unless it has already exited on Bybit.

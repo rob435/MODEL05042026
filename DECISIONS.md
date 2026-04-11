@@ -128,3 +128,6 @@
 - Do the first production-hardening pass around explicit controls and observability, not around a big repo rewrite. That means startup validation, manifests, health snapshots, runtime events, and drift checks before deeper architecture work.
 - Keep the control-plane modules flat (`runtime_validation.py`, `runtime_monitor.py`, `monitor.py`) instead of inventing package layers. The repo benefits from clearer boundaries, not from enterprise cosplay.
 - Add `OPERATOR_PAUSE_NEW_ENTRIES` as the simplest honest manual brake. If someone wants the bot to keep observing but stop taking fresh risk, that should be a first-class control, not a hacky env dance.
+- Stop telling local research machines to copy the production template verbatim. The VPS template is the canonical knob list, but a PC needs localized paths and safe defaults. That should be generated mechanically, not remembered manually.
+- Treat the warmed candle cache as transferable infrastructure. Packing and restoring a 1-year SQLite cache is saner than redownloading 30M rows on every machine, and much saner than trying to commit the blob to git.
+- Keep the Windows research-box bootstrap blunt and small: one PowerShell script is enough. This repo does not need a second installer framework just to create a venv, localize `.env`, optionally restore cache, and run tests.

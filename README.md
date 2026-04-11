@@ -69,6 +69,22 @@ cp deploy/production.env.example .env
 python main.py
 ```
 
+For a local research machine, do not copy the VPS-oriented template verbatim unless you enjoy debugging `/opt/...` path garbage later. Generate a local-safe `.env` instead:
+
+```bash
+python deploy/prepare_local_env.py --output .env
+```
+
+That localizes the persistent paths and disables live order submission by default.
+
+On Windows, use the bundled bootstrap:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\deploy\setup_windows.ps1
+```
+
+That script creates `.venv`, installs requirements, writes a localized research `.env`, optionally restores a cache bundle, and runs `pytest -q`.
+
 ## Test
 
 ```bash
@@ -145,6 +161,28 @@ python backtest.py --prefetch-lookback-days 365 --prefetch-end-date 2026-04-10
 ```
 
 That downloads and stores the current universe's required `15m`, intrabar, BTC daily, and BTCDOM series into `BACKTEST_CACHE_PATH`. Brutally honest caveat: a full year of `1m` candles across the whole universe is large. It saves repeated network time, but it will consume real disk space.
+
+If you already warmed the cache on another machine, transfer it instead of redownloading it:
+
+```bash
+python deploy/cache_bundle.py pack \
+  --source .cache/backtest_candles.sqlite3 \
+  --archive ./backtest_candles.sqlite3.gz
+```
+
+Then restore it on the target machine:
+
+```bash
+python deploy/cache_bundle.py unpack \
+  --archive ./backtest_candles.sqlite3.gz \
+  --destination .cache/backtest_candles.sqlite3
+```
+
+Inspect a restored cache with:
+
+```bash
+python deploy/cache_bundle.py inspect --path .cache/backtest_candles.sqlite3
+```
 
 For wide parameter sweeps, use the explicit fast-research mode:
 

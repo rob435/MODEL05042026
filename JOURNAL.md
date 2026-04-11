@@ -276,3 +276,9 @@
   - one baseline run proved `run_manifests` and `runtime_events` landed in SQLite and were readable through `monitor.py`
   - one `1s` snapshot-interval run proved `runtime_health_snapshots` also land correctly and show queue depth, last activity timestamps, and drift status
 - The first bounded run from the repo root also exposed a real operational truth: repo-root `.env` still overrides shell env. That is intentional, but it means “safe override” testing should be done from a clean working directory if you want to bypass the local `.env`.
+- Added a proper research-box setup path for a separate PC:
+  - `deploy/prepare_local_env.py` writes a local-safe `.env` from the production template instead of inheriting `/opt/...` paths and live/demo placeholders
+  - `deploy/cache_bundle.py` packs, unpacks, and inspects the warmed backtest cache so it can be moved between machines instead of redownloaded
+  - `deploy/setup_windows.ps1` bootstraps a Windows box, optionally restores a cache bundle, and runs `pytest -q`
+- Updated `README.md` so the PC setup and cache-handoff flow now live in the repo rather than in chat memory.
+- Added focused tests for the new deploy helpers and cache bundle round-trip path.

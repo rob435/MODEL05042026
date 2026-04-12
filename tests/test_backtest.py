@@ -16,10 +16,12 @@ from backtest import (
     HistoricalBacktestSimulator,
     InMemorySignalDatabase,
     MinuteReplayPlan,
+    ReplayProgressTracker,
     export_variant_run_result,
     fetch_minute_replay_plan,
     format_variant_run_result,
     parse_args,
+    _progress_bar,
     _build_stress_variant_specs,
     _resolve_window_universe,
     _safe_variant_worker_count,
@@ -187,6 +189,35 @@ def test_safe_variant_worker_count_keeps_workers_when_memory_is_healthy(monkeypa
 
     assert workers == 4
     assert note is None
+
+
+def test_progress_bar_formats_completion_ratio() -> None:
+    assert _progress_bar(completed=0, total=10, width=10) == "[----------]"
+    assert _progress_bar(completed=5, total=10, width=10) == "[#####-----]"
+    assert _progress_bar(completed=10, total=10, width=10) == "[##########]"
+
+
+def test_replay_progress_tracker_reports_percent_and_eta(monkeypatch: pytest.MonkeyPatch) -> None:
+    messages: list[str] = []
+    monotonic_values = iter([10.0, 16.0])
+
+    monkeypatch.setattr(backtest, "_progress", lambda message: messages.append(message))
+    monkeypatch.setattr(backtest.time, "monotonic", lambda: next(monotonic_values))
+
+    tracker = ReplayProgressTracker(
+        label="backtest",
+        total_bars=100,
+        started_at=0.0,
+        last_reported_at=0.0,
+        report_interval_seconds=5.0,
+    )
+    tracker.maybe_report(25)
+
+    assert len(messages) == 1
+    assert "[backtest] replay" in messages[0]
+    assert "25.0%" in messages[0]
+    assert "bars=25/100" in messages[0]
+    assert "eta=" in messages[0]
 
 
 def test_plan_snapshot_round_trip_is_compacter_than_raw_pickle(tmp_path: Path) -> None:

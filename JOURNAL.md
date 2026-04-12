@@ -389,3 +389,9 @@
   - `python3 -m py_compile backtest.py tests/test_backtest.py`
   - `python3 -m pyflakes backtest.py tests/test_backtest.py`
   - `pytest -q` -> `84 passed`
+- Added a dedicated tracked placeholder directory for local research outputs:
+  - `backtest-runs/.gitignore` keeps large local backtest exports out of git without hiding the folder itself
+  - `README.md` examples now point yearly/grid exports at `./backtest-runs/...` instead of spraying artifacts into the repo root
+- Added real replay-loop progress output for single comprehensive runs:
+  - stdout now prints a text progress bar plus completed bars, elapsed time, and ETA during the actual replay loop instead of going silent after `replay plan ready`
+  - kept it dependency-free and time-gated so the terminal gets useful updates without dumping a line for every bar

@@ -218,7 +218,9 @@ python backtest.py \
   --grid-setting cluster_assignment_mode=dynamic,hybrid
 ```
 
-The runner now prints blunt phase messages and cache/network stats while it works, so you can tell whether it is fetching history, building the replay plan, running variants, or exporting. Variant runs also emit per-variant completion lines with the completed count, per-variant runtime, total elapsed time, average variant time, and an ETA for the remaining pending variants.
+The runner now prints blunt phase messages and cache/network stats while it works, so you can tell whether it is fetching history, building the replay plan, running variants, or exporting. Single-run comprehensive backtests now also emit replay progress lines with a text progress bar, completed bar count, elapsed time, and ETA during the actual simulation loop. Variant runs emit per-variant completion lines with the completed count, per-variant runtime, total elapsed time, average variant time, and an ETA for the remaining pending variants.
+
+Use `./backtest-runs/` for local research outputs instead of dumping huge SQLite and CSV artifacts into the repo root. That directory is kept in the repo as a tracked placeholder, but its contents are ignored by git.
 
 On memory-constrained machines, the grid runner may also reduce the requested worker count after writing the replay snapshot. That is deliberate. A huge annual replay plan plus too many worker processes is how you get a late `MemoryError` and waste a day.
 
@@ -229,13 +231,13 @@ python backtest.py \
   --cycles 35040 \
   --end-date 2026-04-11 \
   --variant-workers 4 \
-  --export-dir ./year-grid \
+  --export-dir ./backtest-runs/year-grid \
   --resume-variants \
   --grid-setting hurst_cutoff=0.50,0.55,0.60 \
   --grid-setting intraday_regime_min_pass_count=2,3
 ```
 
-That resumes from `./year-grid/variant_summary.csv` and skips variants that already completed.
+That resumes from `./backtest-runs/year-grid/variant_summary.csv` and skips variants that already completed.
 
 For built-in stress testing, add one or more `--stress-profile` flags:
 
@@ -293,7 +295,7 @@ If you already want a normal exported backtest, `backtest.py` can run the reconc
 python backtest.py \
   --cycles 35040 \
   --end-date 2026-04-11 \
-  --export-dir ./year-backtest \
+  --export-dir ./backtest-runs/year-backtest \
   --reconcile-telegram-html ./messages.html
 ```
 

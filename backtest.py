@@ -102,6 +102,51 @@ def _variant_progress_message(
     )
 
 
+def _progress_bar(
+    *,
+    completed: int,
+    total: int,
+    width: int = 20,
+) -> str:
+    if total <= 0:
+        return "[" + ("-" * width) + "]"
+    ratio = min(max(completed / total, 0.0), 1.0)
+    filled = min(width, max(0, int(ratio * width)))
+    return "[" + ("#" * filled) + ("-" * (width - filled)) + "]"
+
+
+@dataclass(slots=True)
+class ReplayProgressTracker:
+    label: str
+    total_bars: int
+    started_at: float
+    last_reported_at: float
+    report_interval_seconds: float = 5.0
+
+    def maybe_report(self, completed_bars: int) -> None:
+        now = time.monotonic()
+        if completed_bars < self.total_bars and (now - self.last_reported_at) < self.report_interval_seconds:
+            return
+        elapsed_seconds = max(0.0, now - self.started_at)
+        average_seconds = (elapsed_seconds / completed_bars) if completed_bars > 0 else None
+        remaining_bars = max(0, self.total_bars - completed_bars)
+        eta_seconds = (
+            average_seconds * remaining_bars
+            if average_seconds is not None
+            else None
+        )
+        percent = ((completed_bars / self.total_bars) * 100.0) if self.total_bars > 0 else 0.0
+        _progress(
+            f"[{self.label}] replay "
+            f"{_progress_bar(completed=completed_bars, total=self.total_bars)} "
+            f"{percent:5.1f}% "
+            f"bars={completed_bars}/{self.total_bars} "
+            f"elapsed={_format_duration_seconds(elapsed_seconds)} "
+            f"eta={_format_duration_seconds(eta_seconds)}"
+        )
+        self.last_reported_at = now
+
+
 class NullNotifier:
     enabled = False
 
@@ -1982,6 +2027,12 @@ async def run_comprehensive_backtest_plan(
     )
     simulator = HistoricalBacktestSimulator(backtest_settings)
     intrabar_interval_ms = interval_to_milliseconds(backtest_settings.backtest_intrabar_interval)
+    progress_tracker = ReplayProgressTracker(
+        label="backtest",
+        total_bars=len(plan.confirmed_plan.replay_timestamps),
+        started_at=time.monotonic(),
+        last_reported_at=time.monotonic(),
+    )
 
     try:
         for offset, bar_start_ms in enumerate(plan.confirmed_plan.replay_timestamps):
@@ -2070,6 +2121,7 @@ async def run_comprehensive_backtest_plan(
                 timestamp_ms=confirmed_timestamp_ms,
                 confirmed_prices=confirmed_prices,
             )
+            progress_tracker.maybe_report(offset + 1)
 
         final_mark_prices = {
             symbol: candles[-1].close_price

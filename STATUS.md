@@ -10,6 +10,8 @@
 - The backtest fetch path now supports an on-disk SQLite candle cache plus explicit prefetch warming through `python backtest.py --prefetch-lookback-days ...`.
 - Ordinary intrabar backtests now also support a fixed UTC anchor via `python backtest.py --end-date YYYY-MM-DD ...`, so a warmed cache can be reused without the default CLI quietly drifting into fresh tail fetches.
 - `backtest.py` now emits explicit stdout phase messages for prefetch, ordinary runs, compare mode, grid mode, sweeps, walk-forward, and export steps so long jobs are operationally legible.
+- Single comprehensive runs are no longer silent during the heavy replay loop. They now emit replay progress with a text bar, completed bars, elapsed time, and ETA.
+- `./backtest-runs/` now exists as the dedicated local home for heavy backtest outputs. The folder itself is tracked, but its contents are ignored by git so large SQLite/export artifacts stop cluttering the repo root.
 - The backtest now also has an explicit `--research-fast` mode that skips signal-row persistence and post-run signal-summary SQL while keeping trade and equity simulation intact for parameter sweeps.
 - The backtest now also supports generic plan-reuse grids through `--grid-setting KEY=v1,v2,...`, so one fetched `MinuteReplayPlan` can drive many parameter variants without rebuilding the same replay input every time.
 - Variant grids can now also use bounded worker-process parallelism through `--variant-workers` / `BACKTEST_VARIANT_WORKERS`, with each worker loading the same serialized replay-plan snapshot and writing to its own SQLite output.

@@ -354,3 +354,20 @@
   - updated `README.md` to make the new local reconciliation path explicit instead of leaving it as an implicit side effect
 - Reran shell validation after the sync update:
   - `bash -n deploy/sync_exports.sh`
+- Added long-grid throughput visibility to `backtest.py`:
+  - each completed variant now records `run_seconds`
+  - stdout progress now reports completed pending count, total elapsed, average variant runtime, and ETA
+  - final variant summaries now include overall elapsed time plus per-variant runtime
+  - checkpoint loading remains backward-compatible with older `variant_summary.csv` files that predate `run_seconds`
+- Reran targeted validation after the variant-progress upgrade:
+  - `python3 -m py_compile backtest.py tests/test_backtest.py`
+  - `python3 -m pyflakes backtest.py tests/test_backtest.py`
+  - `python3 -m pytest -q tests/test_backtest.py` -> `17 passed`
+- Added a blunt memory guard for large grid runs:
+  - after writing the replay snapshot, `backtest.py` now estimates whether the requested worker count is safe for the currently available RAM
+  - if not, it reduces the worker count and tells the operator instead of blindly launching enough workers to die with `MemoryError`
+  - this specifically targets the full-year Windows case where a huge pickled replay plan plus 4 workers on a 16 GB box was not viable
+- Reran validation after the worker-cap change:
+  - `python3 -m py_compile backtest.py tests/test_backtest.py`
+  - `python3 -m pyflakes backtest.py tests/test_backtest.py`
+  - `python3 -m pytest -q tests/test_backtest.py` -> `19 passed`

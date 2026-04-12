@@ -9,7 +9,9 @@ import math
 import os
 import pickle
 import sqlite3
+import sys
 import tempfile
+import time
 from collections import defaultdict
 from concurrent.futures import ProcessPoolExecutor
 from dataclasses import asdict, dataclass, replace
@@ -52,6 +54,51 @@ LOGGER = logging.getLogger(__name__)
 
 def _progress(message: str) -> None:
     print(message, flush=True)
+
+
+def _format_duration_seconds(seconds: float | None) -> str:
+    if seconds is None or seconds < 0:
+        return "n/a"
+    if seconds < 60:
+        return f"{seconds:.1f}s"
+    total_seconds = int(round(seconds))
+    hours, remainder = divmod(total_seconds, 3600)
+    minutes, secs = divmod(remainder, 60)
+    if hours:
+        return f"{hours:d}h{minutes:02d}m{secs:02d}s"
+    return f"{minutes:d}m{secs:02d}s"
+
+
+def _variant_progress_message(
+    *,
+    completed_pending: int,
+    total_pending: int,
+    resumed_count: int,
+    total_requested: int,
+    run_started_at: float,
+    row: "BacktestVariantSummary",
+) -> str:
+    elapsed_seconds = max(0.0, time.monotonic() - run_started_at)
+    average_completion_seconds = (
+        elapsed_seconds / completed_pending
+        if completed_pending > 0
+        else None
+    )
+    remaining_pending = max(0, total_pending - completed_pending)
+    eta_seconds = (
+        average_completion_seconds * remaining_pending
+        if average_completion_seconds is not None
+        else None
+    )
+    return (
+        "[variants] completed "
+        f"{completed_pending}/{total_pending} pending "
+        f"({completed_pending + resumed_count}/{total_requested} total): "
+        f"{row.name} in {_format_duration_seconds(row.run_seconds)} "
+        f"elapsed={_format_duration_seconds(elapsed_seconds)} "
+        f"avg_completion={_format_duration_seconds(average_completion_seconds)} "
+        f"eta={_format_duration_seconds(eta_seconds)}"
+    )
 
 
 class NullNotifier:
@@ -301,6 +348,7 @@ class BacktestVariantSpec:
 class BacktestVariantSummary:
     name: str
     database_path: str
+    run_seconds: float
     trade_count: int
     wins: int
     losses: int
@@ -319,6 +367,8 @@ class BacktestVariantRunResult:
     variants_requested: int = 0
     variants_completed_now: int = 0
     variants_resumed: int = 0
+    total_elapsed_seconds: float = 0.0
+    avg_variant_seconds: float | None = None
 
 
 @dataclass(slots=True)
@@ -1551,6 +1601,7 @@ def _variant_ranked_rows(rows: list[BacktestVariantSummary]) -> list[dict]:
                 "rank": rank,
                 "name": row.name,
                 "database_path": row.database_path,
+                "run_seconds": row.run_seconds,
                 "trade_count": row.trade_count,
                 "wins": row.wins,
                 "losses": row.losses,
@@ -1584,6 +1635,7 @@ def _load_variant_checkpoint(path: Path) -> list[BacktestVariantSummary]:
             BacktestVariantSummary(
                 name=str(row["name"]),
                 database_path=str(row["database_path"]),
+                run_seconds=float(row.get("run_seconds", 0.0)),
                 trade_count=int(row["trade_count"]),
                 wins=int(row["wins"]),
                 losses=int(row["losses"]),
@@ -1600,6 +1652,12 @@ def _load_variant_checkpoint(path: Path) -> list[BacktestVariantSummary]:
 
 def _write_variant_checkpoint(path: Path, rows: list[BacktestVariantSummary]) -> None:
     _write_csv(path, [asdict(row) for row in rows])
+
+
+def _average_variant_runtime(rows: list[BacktestVariantSummary]) -> float | None:
+    if not rows:
+        return None
+    return sum(row.run_seconds for row in rows) / len(rows)
 
 
 def _export_backtest_trade_events_from_db(database_path: str, output_csv: Path) -> None:
@@ -2161,6 +2219,8 @@ def format_variant_run_result(result: BacktestVariantRunResult) -> str:
         f"  requested={result.variants_requested or len(result.variants)}",
         f"  completed_now={result.variants_completed_now}",
         f"  resumed={result.variants_resumed}",
+        f"  elapsed={_format_duration_seconds(result.total_elapsed_seconds)}",
+        f"  avg_variant={_format_duration_seconds(result.avg_variant_seconds)}",
     ]
     if result.best_variant is not None:
         lines.append(
@@ -2177,7 +2237,8 @@ def format_variant_run_result(result: BacktestVariantRunResult) -> str:
             f"max_drawdown_pct={row.max_drawdown_pct * 100:.2f}% "
             f"pf={_variant_profit_factor_text(row.profit_factor)} "
             f"entry_ready_signals={row.entry_ready_signals} filled={row.entries_filled} "
-            f"win_rate={(_variant_win_rate(row) or 0.0) * 100:.1f}%"
+            f"win_rate={(_variant_win_rate(row) or 0.0) * 100:.1f}% "
+            f"runtime={_format_duration_seconds(row.run_seconds)}"
         )
     return "\n".join(lines)
 
@@ -2344,6 +2405,7 @@ def _run_variant_sync(
     sqlite_path: str,
     variant: BacktestVariantSpec,
 ) -> BacktestVariantSummary:
+    started_at = time.monotonic()
     variant_settings = replace(settings, **variant.overrides)
     result = asyncio.run(
         run_comprehensive_backtest_plan(
@@ -2355,6 +2417,7 @@ def _run_variant_sync(
     return BacktestVariantSummary(
         name=variant.name,
         database_path=result.database_path,
+        run_seconds=max(0.0, time.monotonic() - started_at),
         trade_count=result.summary.trade_count,
         wins=result.summary.wins,
         losses=result.summary.losses,
@@ -2378,6 +2441,74 @@ def _write_plan_snapshot(plan: MinuteReplayPlan) -> str:
     with open(path, "wb") as buffer:
         pickle.dump(plan, buffer, protocol=pickle.HIGHEST_PROTOCOL)
     return path
+
+
+def _available_memory_bytes() -> int | None:
+    if sys.platform.startswith("win"):
+        try:
+            import ctypes
+
+            class _MemoryStatus(ctypes.Structure):
+                _fields_ = [
+                    ("dwLength", ctypes.c_uint32),
+                    ("dwMemoryLoad", ctypes.c_uint32),
+                    ("ullTotalPhys", ctypes.c_uint64),
+                    ("ullAvailPhys", ctypes.c_uint64),
+                    ("ullTotalPageFile", ctypes.c_uint64),
+                    ("ullAvailPageFile", ctypes.c_uint64),
+                    ("ullTotalVirtual", ctypes.c_uint64),
+                    ("ullAvailVirtual", ctypes.c_uint64),
+                    ("sullAvailExtendedVirtual", ctypes.c_uint64),
+                ]
+
+            status = _MemoryStatus()
+            status.dwLength = ctypes.sizeof(_MemoryStatus)
+            if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status)) == 0:
+                return None
+            return int(status.ullAvailPhys)
+        except Exception:
+            return None
+    try:
+        page_size = os.sysconf("SC_PAGE_SIZE")
+        available_pages = os.sysconf("SC_AVPHYS_PAGES")
+        if page_size <= 0 or available_pages <= 0:
+            return None
+        return int(page_size * available_pages)
+    except (AttributeError, ValueError, OSError):
+        return None
+
+
+def _safe_variant_worker_count(
+    *,
+    requested_workers: int,
+    pending_variants: int,
+    plan_snapshot_bytes: int,
+) -> tuple[int, str | None]:
+    workers = max(1, min(requested_workers, pending_variants))
+    if workers <= 1 or plan_snapshot_bytes <= 0:
+        return workers, None
+    available_bytes = _available_memory_bytes()
+    if available_bytes is None or available_bytes <= 0:
+        return workers, None
+    reserve_bytes = 2 * 1024 * 1024 * 1024
+    usable_bytes = available_bytes - reserve_bytes
+    if usable_bytes <= 0:
+        capped = 1
+    else:
+        # Unpickled replay plans are materially larger than the on-disk snapshot.
+        estimated_bytes_per_worker = max(plan_snapshot_bytes * 4, 512 * 1024 * 1024)
+        capped = max(1, min(workers, usable_bytes // estimated_bytes_per_worker))
+    if capped >= workers:
+        return workers, None
+    return (
+        capped,
+        (
+            "[variants] reducing workers from "
+            f"{workers} to {capped} because the replay snapshot is "
+            f"{plan_snapshot_bytes / (1024 ** 3):.2f} GiB and only about "
+            f"{available_bytes / (1024 ** 3):.2f} GiB RAM is currently free"
+        ),
+    )
 
 
 def _load_plan_snapshot(path: str) -> MinuteReplayPlan:
@@ -2404,6 +2535,7 @@ async def run_comprehensive_backtest_variants(
     max_workers: int | None = None,
     checkpoint_path: str | None = None,
 ) -> BacktestVariantRunResult:
+    run_started_at = time.monotonic()
     checkpoint_file = Path(checkpoint_path).expanduser() if checkpoint_path else None
     resumed_rows = _load_variant_checkpoint(checkpoint_file) if checkpoint_file is not None else []
     resumed_by_name = {row.name: row for row in resumed_rows}
@@ -2417,22 +2549,26 @@ async def run_comprehensive_backtest_variants(
     )
     workers = max(1, workers)
     rows = list(resumed_rows)
+    total_pending = len(pending_variants)
     if workers == 1 or len(pending_variants) <= 1:
         for index, variant in enumerate(pending_variants, start=1):
             _progress(f"[variants] running {index}/{len(pending_variants)} pending: {variant.name}")
-            variant_settings = replace(settings, **variant.overrides)
-            result = await run_comprehensive_backtest_plan(
-                variant_settings,
-                plan,
-                sqlite_path=_safe_db_path(
-                    sqlite_path,
-                    f"variant-{variants.index(variant) + 1:02d}",
-                ),
-            )
-            rows.append(
-                BacktestVariantSummary(
+            variant_started_at = time.monotonic()
+            row: BacktestVariantSummary
+            try:
+                variant_settings = replace(settings, **variant.overrides)
+                result = await run_comprehensive_backtest_plan(
+                    variant_settings,
+                    plan,
+                    sqlite_path=_safe_db_path(
+                        sqlite_path,
+                        f"variant-{variants.index(variant) + 1:02d}",
+                    ),
+                )
+                row = BacktestVariantSummary(
                     name=variant.name,
                     database_path=result.database_path,
+                    run_seconds=max(0.0, time.monotonic() - variant_started_at),
                     trade_count=result.summary.trade_count,
                     wins=result.summary.wins,
                     losses=result.summary.losses,
@@ -2443,16 +2579,51 @@ async def run_comprehensive_backtest_variants(
                     entry_ready_signals=result.summary.entry_ready_signals,
                     entries_filled=result.summary.entries_filled,
                 )
+            except Exception:
+                completed_pending = len(rows) - len(resumed_rows)
+                elapsed_seconds = max(0.0, time.monotonic() - run_started_at)
+                average_completion_seconds = (
+                    elapsed_seconds / completed_pending
+                    if completed_pending > 0
+                    else None
+                )
+                eta_seconds = (
+                    average_completion_seconds * max(0, total_pending - completed_pending)
+                    if average_completion_seconds is not None
+                    else None
+                )
+                _progress(
+                    f"[variants] failed after {completed_pending}/{total_pending} pending "
+                    f"elapsed={_format_duration_seconds(elapsed_seconds)} "
+                    f"avg_completion={_format_duration_seconds(average_completion_seconds)} "
+                    f"eta={_format_duration_seconds(eta_seconds)} "
+                    f"while running {variant.name}"
+                )
+                raise
+            rows.append(row)
+            _progress(
+                _variant_progress_message(
+                    completed_pending=len(rows) - len(resumed_rows),
+                    total_pending=total_pending,
+                    resumed_count=len(resumed_rows),
+                    total_requested=len(variants),
+                    run_started_at=run_started_at,
+                    row=row,
+                )
             )
             if checkpoint_file is not None:
                 _write_variant_checkpoint(checkpoint_file, _rank_variants(rows))
         ranked_rows = _rank_variants(rows)
+        completed_now = len(pending_variants)
+        total_elapsed_seconds = max(0.0, time.monotonic() - run_started_at)
         return BacktestVariantRunResult(
             variants=ranked_rows,
             best_variant=_select_best_variant(ranked_rows) if ranked_rows else None,
             variants_requested=len(variants),
-            variants_completed_now=len(pending_variants),
+            variants_completed_now=completed_now,
             variants_resumed=len(resumed_rows),
+            total_elapsed_seconds=total_elapsed_seconds,
+            avg_variant_seconds=_average_variant_runtime(ranked_rows),
         )
     if not pending_variants:
         ranked_rows = _rank_variants(rows)
@@ -2462,12 +2633,23 @@ async def run_comprehensive_backtest_variants(
             variants_requested=len(variants),
             variants_completed_now=0,
             variants_resumed=len(resumed_rows),
+            total_elapsed_seconds=max(0.0, time.monotonic() - run_started_at),
+            avg_variant_seconds=_average_variant_runtime(ranked_rows),
         )
     loop = asyncio.get_running_loop()
     _progress(
         f"[variants] snapshotting replay plan for {len(pending_variants)} pending variants across {workers} workers"
     )
     plan_path = _write_plan_snapshot(plan)
+    plan_snapshot_bytes = Path(plan_path).stat().st_size
+    safe_workers, worker_note = _safe_variant_worker_count(
+        requested_workers=workers,
+        pending_variants=len(pending_variants),
+        plan_snapshot_bytes=plan_snapshot_bytes,
+    )
+    if worker_note:
+        _progress(worker_note)
+    workers = safe_workers
     executor = ProcessPoolExecutor(max_workers=workers)
     try:
         tasks = [
@@ -2485,8 +2667,39 @@ async def run_comprehensive_backtest_variants(
             for variant in pending_variants
         ]
         for task in asyncio.as_completed(tasks):
-            row = await task
+            try:
+                row = await task
+            except Exception:
+                completed_pending = len(rows) - len(resumed_rows)
+                elapsed_seconds = max(0.0, time.monotonic() - run_started_at)
+                average_completion_seconds = (
+                    elapsed_seconds / completed_pending
+                    if completed_pending > 0
+                    else None
+                )
+                eta_seconds = (
+                    average_completion_seconds * max(0, total_pending - completed_pending)
+                    if average_completion_seconds is not None
+                    else None
+                )
+                _progress(
+                    f"[variants] failed after {completed_pending}/{total_pending} pending "
+                    f"elapsed={_format_duration_seconds(elapsed_seconds)} "
+                    f"avg_completion={_format_duration_seconds(average_completion_seconds)} "
+                    f"eta={_format_duration_seconds(eta_seconds)}"
+                )
+                raise
             rows.append(row)
+            _progress(
+                _variant_progress_message(
+                    completed_pending=len(rows) - len(resumed_rows),
+                    total_pending=total_pending,
+                    resumed_count=len(resumed_rows),
+                    total_requested=len(variants),
+                    run_started_at=run_started_at,
+                    row=row,
+                )
+            )
             if checkpoint_file is not None:
                 _write_variant_checkpoint(checkpoint_file, _rank_variants(rows))
     finally:
@@ -2497,12 +2710,16 @@ async def run_comprehensive_backtest_variants(
             pass
     _progress("[variants] all variants completed")
     ranked_rows = _rank_variants(rows)
+    completed_now = len(pending_variants)
+    total_elapsed_seconds = max(0.0, time.monotonic() - run_started_at)
     return BacktestVariantRunResult(
         variants=ranked_rows,
         best_variant=_select_best_variant(ranked_rows) if ranked_rows else None,
         variants_requested=len(variants),
-        variants_completed_now=len(pending_variants),
+        variants_completed_now=completed_now,
         variants_resumed=len(resumed_rows),
+        total_elapsed_seconds=total_elapsed_seconds,
+        avg_variant_seconds=_average_variant_runtime(ranked_rows),
     )
 
 

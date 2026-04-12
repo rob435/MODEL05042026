@@ -61,6 +61,8 @@ Recommended research stages:
 
 Do not start with full-year giant sweeps across dozens of variants. That is expensive and encourages cargo-cult interpretation.
 
+For long grids, use the runner's own throughput diagnostics instead of guessing from CPU graphs. It now prints per-variant completion timing, running average variant time, and ETA for the remaining pending variants.
+
 ## Metrics That Matter
 
 Primary:

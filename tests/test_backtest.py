@@ -16,9 +16,11 @@ from backtest import (
     MinuteReplayPlan,
     export_variant_run_result,
     fetch_minute_replay_plan,
+    format_variant_run_result,
     parse_args,
     _build_stress_variant_specs,
     _resolve_window_universe,
+    _safe_variant_worker_count,
     _select_best_variant,
     _build_variant_specs,
     _combine_variant_specs,
@@ -64,6 +66,7 @@ def test_export_variant_run_result_writes_ranked_outputs(tmp_path: Path) -> None
             BacktestVariantSummary(
                 name="a",
                 database_path=str(db_path),
+                run_seconds=12.5,
                 trade_count=3,
                 wins=2,
                 losses=1,
@@ -77,6 +80,7 @@ def test_export_variant_run_result_writes_ranked_outputs(tmp_path: Path) -> None
             BacktestVariantSummary(
                 name="b",
                 database_path=str(db_path),
+                run_seconds=10.0,
                 trade_count=2,
                 wins=1,
                 losses=1,
@@ -91,6 +95,7 @@ def test_export_variant_run_result_writes_ranked_outputs(tmp_path: Path) -> None
         best_variant=BacktestVariantSummary(
             name="a",
             database_path=str(db_path),
+            run_seconds=12.5,
             trade_count=3,
             wins=2,
             losses=1,
@@ -104,6 +109,8 @@ def test_export_variant_run_result_writes_ranked_outputs(tmp_path: Path) -> None
         variants_requested=2,
         variants_completed_now=2,
         variants_resumed=0,
+        total_elapsed_seconds=22.5,
+        avg_variant_seconds=11.25,
     )
 
     export_variant_run_result(result, export_dir=str(tmp_path / "variant-export"))
@@ -112,6 +119,65 @@ def test_export_variant_run_result_writes_ranked_outputs(tmp_path: Path) -> None
     assert (tmp_path / "variant-export" / "variant_ranked_summary.csv").exists()
     assert (tmp_path / "variant-export" / "variant_best_summary.csv").exists()
     assert (tmp_path / "variant-export" / "best_variant_trades.csv").exists()
+
+
+def test_format_variant_run_result_includes_elapsed_and_runtime() -> None:
+    row = BacktestVariantSummary(
+        name="a",
+        database_path="a.sqlite3",
+        run_seconds=12.5,
+        trade_count=3,
+        wins=2,
+        losses=1,
+        net_pnl_usd=200.0,
+        total_return_pct=0.02,
+        max_drawdown_pct=0.01,
+        profit_factor=1.5,
+        entry_ready_signals=5,
+        entries_filled=3,
+    )
+    result = BacktestVariantRunResult(
+        variants=[row],
+        best_variant=row,
+        variants_requested=1,
+        variants_completed_now=1,
+        variants_resumed=0,
+        total_elapsed_seconds=12.5,
+        avg_variant_seconds=12.5,
+    )
+
+    output = format_variant_run_result(result)
+
+    assert "elapsed=12.5s" in output
+    assert "avg_variant=12.5s" in output
+    assert "runtime=12.5s" in output
+
+
+def test_safe_variant_worker_count_caps_workers_on_low_memory(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(backtest, "_available_memory_bytes", lambda: 5 * 1024 * 1024 * 1024)
+
+    workers, note = _safe_variant_worker_count(
+        requested_workers=4,
+        pending_variants=6,
+        plan_snapshot_bytes=900 * 1024 * 1024,
+    )
+
+    assert workers == 1
+    assert note is not None
+    assert "reducing workers from 4 to 1" in note
+
+
+def test_safe_variant_worker_count_keeps_workers_when_memory_is_healthy(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(backtest, "_available_memory_bytes", lambda: 32 * 1024 * 1024 * 1024)
+
+    workers, note = _safe_variant_worker_count(
+        requested_workers=4,
+        pending_variants=6,
+        plan_snapshot_bytes=300 * 1024 * 1024,
+    )
+
+    assert workers == 4
+    assert note is None
 
 
 def test_post_exit_tracking_populates_trade_follow_through_metrics() -> None:
@@ -312,6 +378,7 @@ def test_select_best_variant_prefers_higher_pnl_then_lower_drawdown() -> None:
             BacktestVariantSummary(
                 name="a",
                 database_path="a.sqlite3",
+                run_seconds=9.0,
                 trade_count=5,
                 wins=3,
                 losses=2,
@@ -325,6 +392,7 @@ def test_select_best_variant_prefers_higher_pnl_then_lower_drawdown() -> None:
             BacktestVariantSummary(
                 name="b",
                 database_path="b.sqlite3",
+                run_seconds=8.0,
                 trade_count=5,
                 wins=3,
                 losses=2,

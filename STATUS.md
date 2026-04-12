@@ -14,6 +14,8 @@
 - The backtest now also supports generic plan-reuse grids through `--grid-setting KEY=v1,v2,...`, so one fetched `MinuteReplayPlan` can drive many parameter variants without rebuilding the same replay input every time.
 - Variant grids can now also use bounded worker-process parallelism through `--variant-workers` / `BACKTEST_VARIANT_WORKERS`, with each worker loading the same serialized replay-plan snapshot and writing to its own SQLite output.
 - Variant grids now also support checkpoint/resume via `--resume-variants`, using `variant_summary.csv` as the persisted completion state for interrupted long runs.
+- Variant grids now also expose per-variant throughput diagnostics: each completed variant carries `run_seconds`, and stdout now reports per-variant completion timing, rolling average runtime, and ETA for the remaining pending variants.
+- Variant grids now also cap worker count against currently available RAM after snapshotting the replay plan, so memory-constrained machines degrade to fewer workers instead of crashing late with `MemoryError`.
 - Comprehensive backtests now also record bounded post-exit follow-through per trade (`post_exit_best_pct`, `post_exit_worst_pct`, `volatility_pct`) plus corresponding summary averages, so TP/SL research can use actual modeled after-close behavior instead of only in-trade excursion stats.
 - Backtest fetch phases now expose real cache/network visibility from `exchange.py`: cache hits, misses, stored candles, and Bybit/Binance HTTP request counts.
 - Grid exports are stronger now: `variant_summary.csv`, `variant_ranked_summary.csv`, `variant_best_summary.csv`, and `best_variant_trades.csv` all land under the export directory.

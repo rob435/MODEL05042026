@@ -218,7 +218,9 @@ python backtest.py \
   --grid-setting cluster_assignment_mode=dynamic,hybrid
 ```
 
-The runner now prints blunt phase messages and cache/network stats while it works, so you can tell whether it is fetching history, building the replay plan, running variants, or exporting.
+The runner now prints blunt phase messages and cache/network stats while it works, so you can tell whether it is fetching history, building the replay plan, running variants, or exporting. Variant runs also emit per-variant completion lines with the completed count, per-variant runtime, total elapsed time, average variant time, and an ETA for the remaining pending variants.
+
+On memory-constrained machines, the grid runner may also reduce the requested worker count after writing the replay snapshot. That is deliberate. A huge annual replay plan plus too many worker processes is how you get a late `MemoryError` and waste a day.
 
 For interrupted long grids, use checkpoint/resume:
 

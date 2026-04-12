@@ -16,6 +16,8 @@
 - Variant grids now also support checkpoint/resume via `--resume-variants`, using `variant_summary.csv` as the persisted completion state for interrupted long runs.
 - Variant grids now also expose per-variant throughput diagnostics: each completed variant carries `run_seconds`, and stdout now reports per-variant completion timing, rolling average runtime, and ETA for the remaining pending variants.
 - Variant grids now also cap worker count against currently available RAM after snapshotting the replay plan, so memory-constrained machines degrade to fewer workers instead of crashing late with `MemoryError`.
+- Comprehensive minute-aware backtests no longer use SQLite for signal summaries at all. They now aggregate signal-summary data in memory during replay, which keeps full-mode reporting available without pulling SQLite into the comprehensive hot path.
+- Variant-grid replay snapshots are now slimmer. The worker handoff serializes a compact primitive payload for `MinuteReplayPlan`, strips `HistoricalCandle` object overhead, and avoids duplicating BTC daily history already embedded in `confirmed_plan`.
 - Comprehensive backtests now also record bounded post-exit follow-through per trade (`post_exit_best_pct`, `post_exit_worst_pct`, `volatility_pct`) plus corresponding summary averages, so TP/SL research can use actual modeled after-close behavior instead of only in-trade excursion stats.
 - Backtest fetch phases now expose real cache/network visibility from `exchange.py`: cache hits, misses, stored candles, and Bybit/Binance HTTP request counts.
 - Grid exports are stronger now: `variant_summary.csv`, `variant_ranked_summary.csv`, `variant_best_summary.csv`, and `best_variant_trades.csv` all land under the export directory.
@@ -31,7 +33,7 @@
 - `main.py` supports bounded live runs with runtime counters for soak validation.
 - Deployment docs now include a dedicated soak-run guide and production env template.
 - Deployment scaffold exists for `systemd`.
-- Local verification is green: `79` tests passing.
+- Local verification is green: `84` tests passing.
 - Cycle processing now batches DB writes and waits briefly for the WebSocket close wave before scoring.
 - Confirmed logs and cooldown are tied to candle event time; emerging alerts use wall-clock detection time because they fire before candle close.
 - Default universe was live-validated against Bybit; `FETUSDT` and `FTMUSDT` were removed after failing validation.
@@ -149,6 +151,7 @@
 - Keeping `RENDERUSDT` means the oldest `2024-04` full-universe sweep window is still invalid, even after removing `NOTUSDT`.
 - A fully warmed 1-year `1m` cache across the whole universe will consume meaningful disk space. The new cache makes repeated research less wasteful, but it does not make the replay loop cheap.
 - The replay loop is still the main cost even after optimization. The biggest hotspot was Hurst, and that has been reduced materially, but large multi-window sweeps are still CPU-heavy.
+- The new compact snapshot reduces worker handoff cost, but it does not eliminate per-worker replay-plan duplication in RAM. Truly fixing that would require a larger shared-data or lower-level layout rewrite.
 - The next tuning pass is now mostly about observing the Binance BTCDOM replacement in live conditions, then deciding whether the dominance adjustment is still too strong or too weak for the 3-7 day momentum objective.
 - BTC regime may now be too low-information to be useful operationally if it continues to stay fixed at `1` across full live windows.
 - Some symbols still span both top and bottom summary extremes over longer live windows, even though the immediate flip problem appears much better than before.
@@ -183,6 +186,7 @@
 - For broad variable sweeps, use `python backtest.py --research-fast ...` first, then rerun shortlisted configs in full mode before trusting them. Fast mode is meant to reduce bookkeeping cost, not replace final audited validation.
 - For multi-parameter sweeps, pair `--research-fast` with `--grid-setting ...`. That is now the honest fast path: reuse one replay plan, vary the settings, then rerun finalists in full mode.
 - If extra CPU is available, pair that grid path with `--variant-workers N`. That is now the compute-scaling path for this repo: one replay-plan snapshot, many isolated worker processes, unique DB outputs per variant.
+- Full-mode comprehensive backtests are now less I/O-bound than before because the signal-summary path stays entirely in memory. That does not make year-long runs cheap, but it removes one avoidable drag from the hot path.
 - Benchmarked on the local Apple M4 (`10` CPU cores), that process-parallel path is now clearly worthwhile:
   - `32` cycles / `4` variants / `--research-fast`: `21.15s` at `1` worker, `11.03s` at `2`, `5.89s` at `4`
   - `96` cycles / `4` variants / `--research-fast`: `62.44s` at `1` worker, `31.41s` at `2`, `18.75s` at `4`

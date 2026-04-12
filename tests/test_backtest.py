@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import pickle
 import sys
 from pathlib import Path
 
@@ -13,6 +14,7 @@ from backtest import (
     BacktestVariantSummary,
     BacktestVariantSpec,
     HistoricalBacktestSimulator,
+    InMemorySignalDatabase,
     MinuteReplayPlan,
     export_variant_run_result,
     fetch_minute_replay_plan,
@@ -25,11 +27,14 @@ from backtest import (
     _build_variant_specs,
     _combine_variant_specs,
     _build_sweep_window_end_times,
+    _load_plan_snapshot,
+    _write_plan_snapshot,
     run_backtest_plan,
     run_comprehensive_backtest_plan,
     run_comprehensive_backtest_variants,
 )
 from config import Settings
+from database import SignalRecord
 from exchange import HistoricalCandle, interval_to_milliseconds
 from replay import build_replay_plan
 
@@ -48,6 +53,10 @@ def test_comprehensive_backtest_allows_unchanged_provisional_minute_closes(tmp_p
 
 def test_comprehensive_backtest_research_fast_skips_signal_rows(tmp_path: Path) -> None:
     asyncio.run(_exercise_comprehensive_backtest_research_fast(tmp_path))
+
+
+def test_in_memory_signal_summary_database_builds_report_summary() -> None:
+    asyncio.run(_exercise_in_memory_signal_summary_database())
 
 
 def test_comprehensive_backtest_variants_reuse_one_plan(tmp_path: Path) -> None:
@@ -178,6 +187,62 @@ def test_safe_variant_worker_count_keeps_workers_when_memory_is_healthy(monkeypa
 
     assert workers == 4
     assert note is None
+
+
+def test_plan_snapshot_round_trip_is_compacter_than_raw_pickle(tmp_path: Path) -> None:
+    settings = Settings(
+        universe=["AAAUSDT", "BBBUSDT", "CCCUSDT"],
+        state_window=24,
+        btc_daily_lookback=10,
+        btc_vol_lookback=5,
+        btcdom_history_lookback=8,
+        momentum_lookback=6,
+        momentum_skip=1,
+        curvature_ma_window=3,
+        curvature_signal_window=2,
+        hurst_window=24,
+        hurst_cutoff=-1.0,
+        top_n=1,
+        watchlist_top_n=3,
+        emerging_top_n=1,
+        entry_ready_top_n=1,
+        emerging_min_observations=1,
+        emerging_min_rank_improvement=0,
+        entry_ready_min_observations=1,
+        entry_ready_min_rank_improvement=0,
+        entry_ready_min_composite_gain=0.0,
+        regime_thresholds={0: None, 1: None, 2: None, 3: None},
+        emerging_cooldown_minutes=0,
+        watchlist_cooldown_minutes=0,
+        entry_ready_cooldown_minutes=0,
+        max_open_positions=1,
+        take_profit_pct=0.02,
+        stop_loss_pct=0.02,
+        risk_per_trade_pct=0.01,
+        intraday_regime_filter_enabled=False,
+        analytics_enabled=False,
+        backtest_intrabar_interval="1",
+        backtest_research_fast=True,
+    )
+    plan = _build_sample_minute_plan(settings, base_ms=97 * interval_to_milliseconds("D"))
+    raw_path = tmp_path / "raw-plan.pkl"
+    with raw_path.open("wb") as handle:
+        pickle.dump(plan, handle, protocol=pickle.HIGHEST_PROTOCOL)
+    compact_path = Path(_write_plan_snapshot(plan))
+    loaded = _load_plan_snapshot(str(compact_path))
+    try:
+        assert compact_path.stat().st_size < raw_path.stat().st_size
+        assert loaded.confirmed_plan.replay_timestamps == plan.confirmed_plan.replay_timestamps
+        assert loaded.confirmed_plan.history_by_symbol == plan.confirmed_plan.history_by_symbol
+        assert loaded.btcdom_history == plan.btcdom_history
+        assert loaded.active_universe == plan.active_universe
+        sample_symbol = settings.tracked_symbols[0]
+        sample_bucket = plan.confirmed_plan.replay_timestamps[0]
+        original_candles = plan.intrabar_by_symbol[sample_symbol][sample_bucket]
+        restored_candles = loaded.intrabar_by_symbol[sample_symbol][sample_bucket]
+        assert [c.close_price for c in restored_candles] == [c.close_price for c in original_candles]
+    finally:
+        compact_path.unlink(missing_ok=True)
 
 
 def test_post_exit_tracking_populates_trade_follow_through_metrics() -> None:
@@ -686,53 +751,7 @@ async def _exercise_comprehensive_backtest_research_fast(tmp_path: Path) -> None
         backtest_intrabar_interval="1",
         backtest_research_fast=True,
     )
-    day_ms = interval_to_milliseconds("D")
-    minute_ms = interval_to_milliseconds("1")
-    base_ms = 80 * day_ms
-    total_cycles = settings.state_window + 1
-    timestamps = [base_ms + (idx * settings.ticker_interval_ms) for idx in range(total_cycles)]
-    history = {
-        "AAAUSDT": list(zip(timestamps, [100.0 + (idx * 0.5) for idx in range(total_cycles)])),
-        "BBBUSDT": list(zip(timestamps, [100.0 + (idx * 0.2) for idx in range(total_cycles)])),
-        "CCCUSDT": list(zip(timestamps, [100.0 - (idx * 0.1) for idx in range(total_cycles)])),
-        "BTCUSDT": list(zip(timestamps, [40_000.0 + (idx * 20.0) for idx in range(total_cycles)])),
-    }
-    btc_daily_history = [
-        (idx * day_ms, 20_000.0 + (idx * 15.0))
-        for idx in range(settings.btc_daily_lookback + 80)
-    ]
-    confirmed_plan = build_replay_plan(
-        history_by_symbol=history,
-        btc_daily_history=btc_daily_history,
-        state_window=settings.state_window,
-        replay_cycles=1,
-    )
-    bar_start_ms = confirmed_plan.replay_timestamps[0]
-    intrabar_by_symbol: dict[str, dict[int, list[HistoricalCandle]]] = {}
-    for symbol in settings.tracked_symbols:
-        last_close = history[symbol][-1][1]
-        candles = [
-            HistoricalCandle(
-                start_time_ms=bar_start_ms + (minute_idx * minute_ms),
-                open_price=last_close + (minute_idx * 0.01),
-                high_price=last_close + (minute_idx * 0.01),
-                low_price=last_close + (minute_idx * 0.01),
-                close_price=last_close + (minute_idx * 0.01),
-            )
-            for minute_idx in range(settings.ticker_interval_ms // minute_ms)
-        ]
-        intrabar_by_symbol[symbol] = {bar_start_ms: candles}
-    btcdom_interval_ms = interval_to_milliseconds(settings.btcdom_interval)
-    btcdom_history = [
-        (idx * btcdom_interval_ms, 1_000.0 + idx)
-        for idx in range((base_ms // btcdom_interval_ms) + settings.btcdom_history_lookback + 4)
-    ]
-    plan = MinuteReplayPlan(
-        confirmed_plan=confirmed_plan,
-        intrabar_by_symbol=intrabar_by_symbol,
-        btc_daily_history=btc_daily_history,
-        btcdom_history=btcdom_history,
-    )
+    plan = _build_sample_minute_plan(settings, base_ms=80 * interval_to_milliseconds("D"))
 
     result = await run_comprehensive_backtest_plan(
         settings,
@@ -742,6 +761,55 @@ async def _exercise_comprehensive_backtest_research_fast(tmp_path: Path) -> None
 
     assert result.summary.mode == "1m intrabar replay [research-fast]"
     assert result.summary.signal_summary.total_rows == 0
+
+
+async def _exercise_in_memory_signal_summary_database() -> None:
+    sink = InMemorySignalDatabase()
+    await sink.log_signals(
+        [
+            SignalRecord(
+                timestamp="2026-04-12T00:00:00+00:00",
+                stage="emerging",
+                signal_kind="entry_ready",
+                ticker="AAAUSDT",
+                momentum_z=1.0,
+                curvature=0.2,
+                hurst=0.5,
+                regime_score=1,
+                composite_score=1.2,
+                alerted=True,
+                price=101.0,
+                rank=1,
+                persistence_hits=0,
+                dom_falling=False,
+                dom_state="neutral",
+                dom_change_pct=0.0,
+            ),
+            SignalRecord(
+                timestamp="2026-04-12T00:01:00+00:00",
+                stage="emerging",
+                signal_kind="none",
+                ticker="BBBUSDT",
+                momentum_z=0.1,
+                curvature=0.0,
+                hurst=0.4,
+                regime_score=1,
+                composite_score=0.1,
+                alerted=False,
+                price=99.0,
+                rank=2,
+                persistence_hits=0,
+                dom_falling=False,
+                dom_state="neutral",
+                dom_change_pct=0.0,
+            ),
+        ]
+    )
+    summary = sink.to_report_summary(top_n=10)
+    assert summary.total_rows == 2
+    assert summary.alerted_rows == 1
+    assert summary.first_timestamp == "2026-04-12T00:00:00+00:00"
+    assert summary.last_timestamp == "2026-04-12T00:01:00+00:00"
 
 
 async def _exercise_comprehensive_backtest_variants(tmp_path: Path) -> None:
@@ -780,58 +848,7 @@ async def _exercise_comprehensive_backtest_variants(tmp_path: Path) -> None:
         backtest_intrabar_interval="1",
         backtest_research_fast=True,
     )
-    day_ms = interval_to_milliseconds("D")
-    minute_ms = interval_to_milliseconds("1")
-    base_ms = 95 * day_ms
-    total_cycles = settings.state_window + 1
-    timestamps = [base_ms + (idx * settings.ticker_interval_ms) for idx in range(total_cycles)]
-    history = {
-        "AAAUSDT": list(zip(timestamps, [100.0 + (idx * 0.6) for idx in range(total_cycles)])),
-        "BBBUSDT": list(zip(timestamps, [100.0 + (idx * 0.2) for idx in range(total_cycles)])),
-        "CCCUSDT": list(zip(timestamps, [100.0 - (idx * 0.1) for idx in range(total_cycles)])),
-        "BTCUSDT": list(zip(timestamps, [40_000.0 + (idx * 30.0) for idx in range(total_cycles)])),
-    }
-    btc_daily_history = [
-        (idx * day_ms, 20_000.0 + (idx * 15.0))
-        for idx in range(settings.btc_daily_lookback + 80)
-    ]
-    confirmed_plan = build_replay_plan(
-        history_by_symbol=history,
-        btc_daily_history=btc_daily_history,
-        state_window=settings.state_window,
-        replay_cycles=1,
-    )
-    bar_start_ms = confirmed_plan.replay_timestamps[0]
-    intrabar_by_symbol: dict[str, dict[int, list[HistoricalCandle]]] = {}
-    for symbol in settings.tracked_symbols:
-        last_close = history[symbol][-1][1]
-        candles = []
-        for minute_idx in range(settings.ticker_interval_ms // minute_ms):
-            close_price = last_close + (minute_idx * 0.02)
-            high_price = close_price
-            if symbol == "AAAUSDT" and minute_idx == 14:
-                high_price = last_close * 1.05
-            candles.append(
-                HistoricalCandle(
-                    start_time_ms=bar_start_ms + (minute_idx * minute_ms),
-                    open_price=close_price,
-                    high_price=high_price,
-                    low_price=close_price,
-                    close_price=close_price,
-                )
-            )
-        intrabar_by_symbol[symbol] = {bar_start_ms: candles}
-    btcdom_interval_ms = interval_to_milliseconds(settings.btcdom_interval)
-    btcdom_history = [
-        (idx * btcdom_interval_ms, 1_000.0 + idx)
-        for idx in range((base_ms // btcdom_interval_ms) + settings.btcdom_history_lookback + 4)
-    ]
-    plan = MinuteReplayPlan(
-        confirmed_plan=confirmed_plan,
-        intrabar_by_symbol=intrabar_by_symbol,
-        btc_daily_history=btc_daily_history,
-        btcdom_history=btcdom_history,
-    )
+    plan = _build_sample_minute_plan(settings, base_ms=95 * interval_to_milliseconds("D"))
     variants = [
         BacktestVariantSpec(name="tp_2pct", overrides={"take_profit_pct": 0.02}),
         BacktestVariantSpec(name="tp_4pct", overrides={"take_profit_pct": 0.04}),
@@ -887,9 +904,40 @@ async def _exercise_comprehensive_backtest_variant_resume(tmp_path: Path) -> Non
         backtest_intrabar_interval="1",
         backtest_research_fast=True,
     )
+    plan = _build_sample_minute_plan(settings, base_ms=96 * interval_to_milliseconds("D"))
+    variants = [
+        BacktestVariantSpec(name="tp_2pct", overrides={"take_profit_pct": 0.02}),
+        BacktestVariantSpec(name="tp_4pct", overrides={"take_profit_pct": 0.04}),
+    ]
+    checkpoint_path = tmp_path / "resume" / "variant_summary.csv"
+    checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+    checkpoint_path.write_text(
+        "name,database_path,trade_count,wins,losses,net_pnl_usd,total_return_pct,max_drawdown_pct,profit_factor,entry_ready_signals,entries_filled\n"
+        "tp_2pct,/tmp/tp_2pct.sqlite3,1,1,0,10.0,0.001,0.002,1.5,2,1\n",
+        encoding="utf-8",
+    )
+
+    result = await run_comprehensive_backtest_variants(
+        settings,
+        plan=plan,
+        sqlite_path=str(tmp_path / "variants-resume.sqlite3"),
+        variants=variants,
+        max_workers=1,
+        checkpoint_path=str(checkpoint_path),
+    )
+
+    assert result.variants_requested == 2
+    assert result.variants_resumed == 1
+    assert result.variants_completed_now == 1
+    assert {row.name for row in result.variants} == {"tp_2pct", "tp_4pct"}
+    checkpoint_text = checkpoint_path.read_text(encoding="utf-8")
+    assert "tp_2pct" in checkpoint_text
+    assert "tp_4pct" in checkpoint_text
+
+
+def _build_sample_minute_plan(settings: Settings, *, base_ms: int) -> MinuteReplayPlan:
     day_ms = interval_to_milliseconds("D")
     minute_ms = interval_to_milliseconds("1")
-    base_ms = 96 * day_ms
     total_cycles = settings.state_window + 1
     timestamps = [base_ms + (idx * settings.ticker_interval_ms) for idx in range(total_cycles)]
     history = {
@@ -933,40 +981,13 @@ async def _exercise_comprehensive_backtest_variant_resume(tmp_path: Path) -> Non
         (idx * btcdom_interval_ms, 1_000.0 + idx)
         for idx in range((base_ms // btcdom_interval_ms) + settings.btcdom_history_lookback + 4)
     ]
-    plan = MinuteReplayPlan(
+    return MinuteReplayPlan(
         confirmed_plan=confirmed_plan,
         intrabar_by_symbol=intrabar_by_symbol,
         btc_daily_history=btc_daily_history,
         btcdom_history=btcdom_history,
+        active_universe=[symbol for symbol in settings.tracked_symbols if symbol != "BTCUSDT"],
     )
-    variants = [
-        BacktestVariantSpec(name="tp_2pct", overrides={"take_profit_pct": 0.02}),
-        BacktestVariantSpec(name="tp_4pct", overrides={"take_profit_pct": 0.04}),
-    ]
-    checkpoint_path = tmp_path / "resume" / "variant_summary.csv"
-    checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
-    checkpoint_path.write_text(
-        "name,database_path,trade_count,wins,losses,net_pnl_usd,total_return_pct,max_drawdown_pct,profit_factor,entry_ready_signals,entries_filled\n"
-        "tp_2pct,/tmp/tp_2pct.sqlite3,1,1,0,10.0,0.001,0.002,1.5,2,1\n",
-        encoding="utf-8",
-    )
-
-    result = await run_comprehensive_backtest_variants(
-        settings,
-        plan=plan,
-        sqlite_path=str(tmp_path / "variants-resume.sqlite3"),
-        variants=variants,
-        max_workers=1,
-        checkpoint_path=str(checkpoint_path),
-    )
-
-    assert result.variants_requested == 2
-    assert result.variants_resumed == 1
-    assert result.variants_completed_now == 1
-    assert {row.name for row in result.variants} == {"tp_2pct", "tp_4pct"}
-    checkpoint_text = checkpoint_path.read_text(encoding="utf-8")
-    assert "tp_2pct" in checkpoint_text
-    assert "tp_4pct" in checkpoint_text
 
 
 def _seed_trade_analytics_db(path: Path) -> None:

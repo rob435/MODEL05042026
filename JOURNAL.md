@@ -371,3 +371,21 @@
   - `python3 -m py_compile backtest.py tests/test_backtest.py`
   - `python3 -m pyflakes backtest.py tests/test_backtest.py`
   - `python3 -m pytest -q tests/test_backtest.py` -> `19 passed`
+
+## 2026-04-12
+
+- Removed SQLite entirely from the comprehensive replay signal path:
+  - `run_comprehensive_backtest_plan()` now feeds `SignalEngine` through an in-memory summary sink during the minute loop
+  - full-mode signal summaries are now built directly from that in-memory aggregate instead of writing signal rows to SQLite and re-reading them
+  - this keeps the full-mode report output while taking SQLite fully out of the comprehensive replay hot path
+- Slimmed the worker snapshot format for variant grids:
+  - `MinuteReplayPlan` is no longer raw-pickled for workers
+  - the snapshot now serializes a compact primitive payload, strips `HistoricalCandle` object overhead, and stops duplicating `btc_daily_history` at the top level because it already lives inside `confirmed_plan`
+  - workers reconstruct the plan from that compact payload on load
+- Added regression coverage for the new behavior:
+  - the in-memory signal-summary sink now has a direct test
+  - the compact snapshot path now has a round-trip test and a size check against the old raw pickle
+- Reran validation after the replay-hot-path changes:
+  - `python3 -m py_compile backtest.py tests/test_backtest.py`
+  - `python3 -m pyflakes backtest.py tests/test_backtest.py`
+  - `pytest -q` -> `84 passed`

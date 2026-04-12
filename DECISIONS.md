@@ -148,3 +148,10 @@
 - Treat VPS reconciliation artifacts as part of the normal pull-sync bundle, not a second manual retrieval workflow. If daily forward-vs-backtest exports live only on the server, they will be forgotten; `deploy/sync_exports.sh` should pull them to the local analysis machine by default.
 - Long grids need throughput visibility at the variant level, not just phase banners. The runner now logs per-variant completion timing, average variant runtime, and ETA so operators can distinguish "slow but progressing" from "stalled".
 - Long grids also need a memory sanity check before spawning workers. On smaller Windows boxes, the snapshot/unpickle cost of an annual replay plan can exceed RAM long before CPU becomes the real bottleneck, so the runner should reduce worker count instead of dying late with `MemoryError`.
+
+## 2026-04-12
+
+- Stop paying SQLite cost anywhere in the comprehensive replay signal path when the database is only serving signal summaries. The right compromise is an in-memory summary sink during replay, not per-cycle persistence and not an end-of-run SQLite flush.
+- Keep the full-mode report contract intact without round-tripping through SQLite. The comprehensive path now builds `ReportSummary` directly from the in-memory aggregate and only uses the database again where it still serves a real purpose.
+- Do not raw-pickle the full `MinuteReplayPlan` object graph into every worker. The worker snapshot should use a compact primitive payload, especially for `HistoricalCandle` buckets, and it should not duplicate `btc_daily_history` that is already present inside `confirmed_plan`.
+- Treat this as a first-pass memory fix, not a fantasy claim that worker duplication is solved completely. Workers still rebuild their own replay plan in memory; the point of this change is to cut snapshot size and load overhead materially without a bigger data-layout rewrite.

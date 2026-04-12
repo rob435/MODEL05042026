@@ -22,7 +22,7 @@ import aiohttp
 import numpy as np
 
 from config import Settings, load_settings
-from database import SignalDatabase
+from database import SignalDatabase, SignalRecord
 from execution import ExecutionEngine
 from exchange import (
     BybitMarketDataClient,
@@ -50,6 +50,7 @@ from universe import ticker_cluster
 
 
 LOGGER = logging.getLogger(__name__)
+_PLAN_SNAPSHOT_VERSION = 1
 
 
 def _progress(message: str) -> None:
@@ -482,6 +483,112 @@ def _empty_report_summary() -> ReportSummary:
         trade_daily=[],
         portfolio_overview=None,
     )
+
+
+@dataclass(slots=True)
+class InMemorySignalDatabase:
+    total_rows: int = 0
+    alerted_rows: int = 0
+    first_timestamp: str | None = None
+    last_timestamp: str | None = None
+    stage_counts: dict[str, list[int]] | None = None
+    signal_kind_counts: dict[str, list[int]] | None = None
+    ticker_counts: dict[str, list[float | int]] | None = None
+
+    def __post_init__(self) -> None:
+        if self.stage_counts is None:
+            self.stage_counts = {}
+        if self.signal_kind_counts is None:
+            self.signal_kind_counts = {}
+        if self.ticker_counts is None:
+            self.ticker_counts = {}
+
+    async def initialize(self) -> None:
+        return None
+
+    async def log_signals(self, records: list[SignalRecord]) -> None:
+        if not records:
+            return
+        for record in records:
+            self.total_rows += 1
+            if record.alerted:
+                self.alerted_rows += 1
+            if self.first_timestamp is None or record.timestamp < self.first_timestamp:
+                self.first_timestamp = record.timestamp
+            if self.last_timestamp is None or record.timestamp > self.last_timestamp:
+                self.last_timestamp = record.timestamp
+            stage_bucket = self.stage_counts.setdefault(record.stage or "unknown", [0, 0])
+            stage_bucket[0] += 1
+            stage_bucket[1] += int(record.alerted)
+            signal_kind = _normalize_signal_kind(record.signal_kind)
+            kind_bucket = self.signal_kind_counts.setdefault(signal_kind, [0, 0])
+            kind_bucket[0] += 1
+            kind_bucket[1] += int(record.alerted)
+            ticker_bucket = self.ticker_counts.setdefault(
+                record.ticker,
+                [0, 0, 0.0, float("-inf")],
+            )
+            ticker_bucket[0] += 1
+            ticker_bucket[1] += int(record.alerted)
+            ticker_bucket[2] += record.composite_score
+            ticker_bucket[3] = max(float(ticker_bucket[3]), record.composite_score)
+
+    def close(self) -> None:
+        return None
+
+    def to_report_summary(self, *, top_n: int = 10) -> ReportSummary:
+        top_tickers = [
+            (
+                ticker,
+                int(values[0]),
+                int(values[1]),
+                (float(values[2]) / int(values[0])) if int(values[0]) else 0.0,
+                float(values[3]),
+            )
+            for ticker, values in self.ticker_counts.items()
+        ]
+        top_tickers.sort(key=lambda item: (-item[2], -item[4], item[0]))
+        return ReportSummary(
+            total_rows=self.total_rows,
+            alerted_rows=self.alerted_rows,
+            first_timestamp=self.first_timestamp,
+            last_timestamp=self.last_timestamp,
+            stage_counts=[
+                (stage, int(values[0]), int(values[1]))
+                for stage, values in sorted(self.stage_counts.items(), key=lambda item: item[0])
+            ],
+            signal_kind_counts=[
+                (signal_kind, int(values[0]), int(values[1]))
+                for signal_kind, values in sorted(
+                    self.signal_kind_counts.items(),
+                    key=lambda item: (_signal_kind_order(item[0]), item[0]),
+                )
+            ],
+            top_tickers=top_tickers[:top_n],
+            trade_overview=None,
+            trade_daily=[],
+            portfolio_overview=None,
+        )
+
+
+def _normalize_signal_kind(value: str | None) -> str:
+    if value in (None, ""):
+        return "legacy_confirmed"
+    normalized = str(value).strip()
+    if normalized in {"confirmed", "confirmed_strong"}:
+        return "legacy_confirmed"
+    return normalized
+
+
+def _signal_kind_order(value: str) -> int:
+    ordering = {
+        "watchlist": 0,
+        "emerging": 1,
+        "entry_ready": 2,
+        "legacy_confirmed": 3,
+        "none": 4,
+    }
+    return ordering.get(value, 99)
 
 
 async def run_backtest_plan(
@@ -1864,7 +1971,7 @@ async def run_comprehensive_backtest_plan(
         current_timestamp_ms=initial_ts,
     )
 
-    database = SignalDatabase(backtest_settings.sqlite_path)
+    database = InMemorySignalDatabase()
     await database.initialize()
     notifier = NullNotifier()
     signal_engine = SignalEngine(
@@ -1978,7 +2085,7 @@ async def run_comprehensive_backtest_plan(
     signal_summary = (
         _empty_report_summary()
         if backtest_settings.backtest_research_fast
-        else load_report_summary(backtest_settings.sqlite_path, top_n=10)
+        else database.to_report_summary(top_n=10)
     )
     wins = [trade.net_pnl_usd for trade in simulator.trades if trade.net_pnl_usd > 0]
     losses = [trade.net_pnl_usd for trade in simulator.trades if trade.net_pnl_usd < 0]
@@ -2430,6 +2537,111 @@ def _run_variant_sync(
     )
 
 
+def _serialize_replay_plan(plan: ReplayPlan) -> dict[str, object]:
+    return {
+        "replay_timestamps": list(plan.replay_timestamps),
+        "history_by_symbol": {
+            symbol: list(candles)
+            for symbol, candles in plan.history_by_symbol.items()
+        },
+        "btc_daily_history": list(plan.btc_daily_history),
+    }
+
+
+def _deserialize_replay_plan(payload: dict[str, object]) -> ReplayPlan:
+    history_payload = payload["history_by_symbol"]
+    if not isinstance(history_payload, dict):
+        raise ValueError("Invalid replay plan snapshot: history_by_symbol")
+    return ReplayPlan(
+        replay_timestamps=[int(value) for value in payload["replay_timestamps"]],
+        history_by_symbol={
+            str(symbol): [(int(ts), float(price)) for ts, price in candles]
+            for symbol, candles in history_payload.items()
+        },
+        btc_daily_history=[
+            (int(ts), float(price))
+            for ts, price in payload["btc_daily_history"]
+        ],
+    )
+
+
+def _serialize_intrabar_history(
+    intrabar_by_symbol: dict[str, dict[int, list[HistoricalCandle]]],
+) -> dict[str, dict[int, list[tuple[int, float, float, float, float]]]]:
+    return {
+        symbol: {
+            int(bucket_start_ms): [
+                (
+                    candle.start_time_ms,
+                    candle.open_price,
+                    candle.high_price,
+                    candle.low_price,
+                    candle.close_price,
+                )
+                for candle in candles
+            ]
+            for bucket_start_ms, candles in bucket_map.items()
+        }
+        for symbol, bucket_map in intrabar_by_symbol.items()
+    }
+
+
+def _deserialize_intrabar_history(
+    payload: dict[str, dict[int, list[tuple[int, float, float, float, float]]]],
+) -> dict[str, dict[int, list[HistoricalCandle]]]:
+    return {
+        str(symbol): {
+            int(bucket_start_ms): [
+                HistoricalCandle(
+                    start_time_ms=int(start_time_ms),
+                    open_price=float(open_price),
+                    high_price=float(high_price),
+                    low_price=float(low_price),
+                    close_price=float(close_price),
+                )
+                for start_time_ms, open_price, high_price, low_price, close_price in candles
+            ]
+            for bucket_start_ms, candles in bucket_map.items()
+        }
+        for symbol, bucket_map in payload.items()
+    }
+
+
+def _serialize_minute_replay_plan(plan: MinuteReplayPlan) -> dict[str, object]:
+    return {
+        "version": _PLAN_SNAPSHOT_VERSION,
+        "kind": "minute_replay_plan",
+        "confirmed_plan": _serialize_replay_plan(plan.confirmed_plan),
+        "intrabar_by_symbol": _serialize_intrabar_history(plan.intrabar_by_symbol),
+        "btcdom_history": list(plan.btcdom_history),
+        "active_universe": list(plan.active_universe) if plan.active_universe is not None else None,
+    }
+
+
+def _deserialize_minute_replay_plan(payload: dict[str, object]) -> MinuteReplayPlan:
+    if payload.get("kind") != "minute_replay_plan":
+        raise ValueError("Invalid replay snapshot kind")
+    confirmed_plan = _deserialize_replay_plan(payload["confirmed_plan"])
+    intrabar_payload = payload["intrabar_by_symbol"]
+    if not isinstance(intrabar_payload, dict):
+        raise ValueError("Invalid replay snapshot: intrabar_by_symbol")
+    active_universe_payload = payload.get("active_universe")
+    return MinuteReplayPlan(
+        confirmed_plan=confirmed_plan,
+        intrabar_by_symbol=_deserialize_intrabar_history(intrabar_payload),
+        btc_daily_history=list(confirmed_plan.btc_daily_history),
+        btcdom_history=[
+            (int(ts), float(price))
+            for ts, price in payload["btcdom_history"]
+        ],
+        active_universe=(
+            [str(symbol) for symbol in active_universe_payload]
+            if active_universe_payload is not None
+            else None
+        ),
+    )
+
+
 def _write_plan_snapshot(plan: MinuteReplayPlan) -> str:
     handle = tempfile.NamedTemporaryFile(
         prefix="model050426-plan-",
@@ -2439,7 +2651,11 @@ def _write_plan_snapshot(plan: MinuteReplayPlan) -> str:
     path = handle.name
     handle.close()
     with open(path, "wb") as buffer:
-        pickle.dump(plan, buffer, protocol=pickle.HIGHEST_PROTOCOL)
+        pickle.dump(
+            _serialize_minute_replay_plan(plan),
+            buffer,
+            protocol=pickle.HIGHEST_PROTOCOL,
+        )
     return path
 
 
@@ -2513,7 +2729,10 @@ def _safe_variant_worker_count(
 
 def _load_plan_snapshot(path: str) -> MinuteReplayPlan:
     with open(path, "rb") as buffer:
-        return pickle.load(buffer)
+        payload = pickle.load(buffer)
+    if not isinstance(payload, dict):
+        raise ValueError("Invalid replay snapshot payload")
+    return _deserialize_minute_replay_plan(payload)
 
 
 def _run_variant_from_plan_path_sync(

@@ -4,6 +4,8 @@
 
 - Core implementation exists.
 - The live engine now supports two processing stages but only one tradeable signal ladder: `watchlist`, `emerging`, and `entry_ready`. Confirmed bars still advance state, but they no longer create tradeable or operator-facing confirmed tiers.
+- The config surface is smaller now. Weak or fake choices have been removed: no `hybrid_relative`, no blend-weight tuning, no cluster-assignment mode, no per-rebalance entry cap, no watchlist Telegram toggle, and no optional profit-ratchet hold rule.
+- `MOMENTUM_SKIP` and the `INTRADAY_REGIME_*` family remain live research controls.
 - Tests exist for indicator math, gap detection, and signal-engine behavior.
 - Replay tooling exists for recent-candle validation through the production engine path.
 - A minute-aware historical backtest harness now exists in `backtest.py`. It reuses the live `SignalEngine`, replays historical `1m` OHLC inside each `15m` bar, models fees/slippage/exposure caps, and can compare the intraday regime filter on vs off over the same sample.
@@ -70,14 +72,13 @@
 - Live and simulated trades now also support an optional laddered profit ratchet. When `PROFIT_RATCHET_ENABLED=true`, a TP touch can extend the position in place, lift the stop rung by rung, and emit explicit ratchet events for later reconciliation.
 - Execution analytics now persist closed-trade summaries, open-position marks, post-exit follow-through, and portfolio snapshots directly into SQLite.
 - `MAX_DAILY_STOP_LOSSES` is now a live execution guard; once the UTC-day stop-loss count reaches the configured limit, new entries are skipped for the rest of that day.
-- `MAX_ENTRIES_PER_REBALANCE` is now a live execution guard; once an emerging cycle has opened the configured number of fresh positions, lower-ranked `entry_ready` candidates are skipped for that rebalance pass.
 - `MAX_OPEN_POSITIONS` is now back as a live execution guard; once the total open-position count reaches the configured cap, fresh entries are skipped until something closes.
 - `MAX_POSITIONS_PER_CLUSTER` is now a live execution guard; once the configured count for the current cluster label is already open, additional names from that cluster are skipped even if raw portfolio slots remain.
 - `report.py` can now summarize trade analytics and export CSVs for `signals`, `trades`, `trade_daily_summary`, and `portfolio_snapshots`.
 - Live-entry safety now checks both local SQLite and current Bybit venue state, so the bot will not intentionally double-enter the same ticker if the venue already has an open position.
 - `.env` loading now overrides stale inherited shell variables, so local credential edits actually take effect without restarting the whole environment.
 - Live entry sizing is now risk-based instead of fixed-notional: `RISK_PER_TRADE_PCT` defaults to `1%` of Bybit `totalAvailableBalance`, converted into position notional through the configured stop distance.
-- The practical entry rule is now one open position per ticker, plus optional portfolio and per-batch throttles via `MAX_OPEN_POSITIONS` and `MAX_ENTRIES_PER_REBALANCE`.
+- The practical entry rule is now one open position per ticker, plus portfolio and cluster throttles via `MAX_OPEN_POSITIONS` and `MAX_POSITIONS_PER_CLUSTER`.
 - Dead config surface has been trimmed: `ANALYTICS_EXPORT_DIR` was removed because it no longer affected live behavior.
 - The production env template is now grouped by operational impact, with Telegram, execution/risk, and high-impact signal-quality controls separated into clearer sections.
 - Telegram control now includes a signal-alert master switch, so the bot can run in execution-only chat mode without still sending `confirmed` or `entry_ready` candidate alerts.
@@ -102,12 +103,7 @@
   - `btc_relative`
   - `basket_relative`
   - `cluster_relative` (default)
-  - `hybrid_relative`
-- Cluster assignment now supports:
-  - `manual`
-  - `dynamic` (default)
-  - `hybrid`
-- Dynamic cluster labels now feed both residual-momentum ranking and `MAX_POSITIONS_PER_CLUSTER`, so concentration control is no longer tied only to the static manual map.
+- Dynamic correlation cluster labels now feed both residual-momentum ranking and `MAX_POSITIONS_PER_CLUSTER`, so concentration control is no longer tied to the static manual map.
 - Backtesting now has a real universe-history policy plus additional research tooling:
   - `BACKTEST_UNIVERSE_POLICY`
   - `BACKTEST_MIN_ACTIVE_UNIVERSE`
@@ -175,6 +171,12 @@
 - The profit ratchet is also intentionally not a true trailing stop. It is a rung-based state machine that moves only on TP touches and only while the ticker still satisfies the configured hold rule.
 - With profit ratchet enabled, venue TP is deliberately disabled and engine-managed. That is necessary for in-place extension, but it also means TP advancement remains bound to engine cycle cadence rather than true tick-by-tick exchange ownership.
 - Comprehensive backtests now expose richer exit diagnostics through both stdout and CSV export, including exit-reason summaries, break-even arm behavior, and daily exit mix.
+- Comprehensive backtests now also export `backtest_equity_vs_btc_daily.csv`, which joins each UTC day with strategy equity/return and BTC close/return so the equity curve can be compared against the BTC chart without manual merging.
+- Comprehensive backtests now also export `backtest_btc_overlay_curve.csv`, so the replayed BTC path survives on disk as more than one daily point per day.
+- Comprehensive backtests now also export `backtest_equity_curve.png` automatically when plotting libraries are installed, so the BTC overlay is immediately viewable inside the backtest folder instead of requiring a manual plotting step.
+- Those PNGs now keep that full replay detail even when regenerated later from an export folder, instead of silently degrading back to the coarse daily overlay CSV.
+- Comprehensive backtests now size fresh entries from realized wallet balance rather than marked-to-market equity, so open-position unrealized PnL no longer changes the next entry’s risk budget.
+- Grid/variant runs now also keep per-variant backtest exports under `variants/<variant-name>/...` and copy the best variant overlay files into the grid root as `best_variant_*.csv/png`.
 - `backtest_trades.csv` now includes break-even arm metadata, and the backtester can build neighboring TP variants directly with `--tp-neighbor-step-pct` for quick local TP checks.
 - Venue exit reconciliation is polling-based, not websocket-based. Telegram exit messages and SQLite close state will lag until the next engine cycle sees that Bybit has already closed the position.
 - A real demo smoke entry was executed successfully on `SOLUSDT`; the venue accepted the order and TP/SL were installed. There is now a live demo position unless it has already exited on Bybit.

@@ -21,10 +21,7 @@ VALID_MOMENTUM_REFERENCE_MODES = {
     "btc_relative",
     "basket_relative",
     "cluster_relative",
-    "hybrid_relative",
 }
-
-VALID_CLUSTER_ASSIGNMENT_MODES = {"manual", "dynamic", "hybrid"}
 
 
 def validate_runtime_settings(
@@ -87,22 +84,6 @@ def validate_runtime_settings(
                 "error",
                 "momentum_reference_mode.invalid",
                 f"Unsupported MOMENTUM_REFERENCE_MODE={settings.momentum_reference_mode}.",
-            )
-        )
-    if settings.cluster_assignment_mode not in VALID_CLUSTER_ASSIGNMENT_MODES:
-        messages.append(
-            ValidationMessage(
-                "error",
-                "cluster_assignment_mode.invalid",
-                f"Unsupported CLUSTER_ASSIGNMENT_MODE={settings.cluster_assignment_mode}.",
-            )
-        )
-    if not 0 <= settings.momentum_reference_blend_btc_weight <= 1:
-        messages.append(
-            ValidationMessage(
-                "error",
-                "momentum_reference_blend.invalid",
-                "MOMENTUM_REFERENCE_BLEND_BTC_WEIGHT must be between 0 and 1.",
             )
         )
     if settings.cluster_correlation_lookback_bars < 3:

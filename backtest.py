@@ -8,6 +8,8 @@ import logging
 import math
 import os
 import pickle
+import re
+import shutil
 import sqlite3
 import sys
 import tempfile
@@ -54,7 +56,6 @@ from trade_management import (
     profit_ratchet_can_advance,
     profit_ratchet_prices,
 )
-from universe import ticker_cluster
 
 
 LOGGER = logging.getLogger(__name__)
@@ -356,7 +357,6 @@ class ComprehensiveBacktestSummary:
     skipped_duplicate_ticker: int
     skipped_max_open_positions: int
     skipped_cluster_limit: int
-    skipped_max_entries_per_rebalance: int
     skipped_daily_stop_losses: int
     skipped_gross_exposure_cap: int
     skipped_too_small: int
@@ -373,6 +373,8 @@ class ComprehensiveBacktestResult:
     trades: list[BacktestTrade]
     equity_curve: list[EquitySnapshot]
     position_events: list[BacktestPositionEvent] = field(default_factory=list)
+    btc_daily_history: list[tuple[int, float]] = field(default_factory=list)
+    btc_overlay_history: list[tuple[int, float]] = field(default_factory=list)
 
 
 @dataclass(slots=True)
@@ -453,6 +455,7 @@ class BacktestVariantSummary:
     profit_factor: float | None
     entry_ready_signals: int
     entries_filled: int
+    export_dir_path: str | None = None
 
 
 @dataclass(slots=True)
@@ -528,7 +531,6 @@ def _build_backtest_settings(
         telegram_bot_token=None,
         telegram_chat_id=None,
         telegram_signal_alerts_enabled=False,
-        watchlist_telegram_enabled=False,
         analytics_post_exit_bars=0,
         intraday_regime_filter_enabled=(
             settings.intraday_regime_filter_enabled
@@ -554,7 +556,6 @@ def _build_comprehensive_settings(
         telegram_bot_token=None,
         telegram_chat_id=None,
         telegram_signal_alerts_enabled=False,
-        watchlist_telegram_enabled=False,
         analytics_enabled=False,
         intraday_regime_filter_enabled=(
             settings.intraday_regime_filter_enabled
@@ -1359,7 +1360,6 @@ class HistoricalBacktestSimulator:
         self.skipped_duplicate_ticker = 0
         self.skipped_max_open_positions = 0
         self.skipped_cluster_limit = 0
-        self.skipped_max_entries_per_rebalance = 0
         self.skipped_daily_stop_losses = 0
         self.skipped_gross_exposure_cap = 0
         self.skipped_too_small = 0
@@ -1457,6 +1457,13 @@ class HistoricalBacktestSimulator:
             + self._unrealized_pnl_usd(mark_prices)
         )
 
+    def current_wallet_balance_usd(self) -> float:
+        return (
+            self.settings.backtest_starting_equity_usd
+            + self.realized_gross_pnl_usd
+            - self.total_fees_usd
+        )
+
     def current_gross_exposure_usd(self, mark_prices: dict[str, float]) -> float:
         exposure = 0.0
         for ticker, position in self.positions.items():
@@ -1467,7 +1474,7 @@ class HistoricalBacktestSimulator:
     def _open_cluster_counts(self) -> dict[str, int]:
         counts: dict[str, int] = {}
         for position in self.positions.values():
-            cluster = position.cluster_label or f"manual:{ticker_cluster(position.ticker)}"
+            cluster = position.cluster_label or f"solo:{position.ticker}"
             counts[cluster] = counts.get(cluster, 0) + 1
         return counts
 
@@ -1723,7 +1730,6 @@ class HistoricalBacktestSimulator:
         candidates = [signal for signal in ranked_signals if signal.signal_kind == "entry_ready"]
         candidates.sort(key=lambda signal: signal.rank)
         self.entry_ready_signals += len(candidates)
-        opened_this_cycle = 0
         cluster_counts = self._open_cluster_counts()
         for signal in candidates:
             if signal.ticker in blocked_tickers:
@@ -1738,18 +1744,12 @@ class HistoricalBacktestSimulator:
             ):
                 self.skipped_max_open_positions += 1
                 continue
-            cluster = signal.cluster_label or f"manual:{ticker_cluster(signal.ticker)}"
+            cluster = signal.cluster_label or f"solo:{signal.ticker}"
             if (
                 self.settings.max_positions_per_cluster > 0
                 and cluster_counts.get(cluster, 0) >= self.settings.max_positions_per_cluster
             ):
                 self.skipped_cluster_limit += 1
-                continue
-            if (
-                self.settings.max_entries_per_rebalance > 0
-                and opened_this_cycle >= self.settings.max_entries_per_rebalance
-            ):
-                self.skipped_max_entries_per_rebalance += 1
                 continue
             if (
                 self.settings.max_daily_stop_losses > 0
@@ -1758,11 +1758,13 @@ class HistoricalBacktestSimulator:
             ):
                 self.skipped_daily_stop_losses += 1
                 continue
-            equity_usd = self.current_equity_usd(mark_prices)
+            wallet_balance_usd = self.current_wallet_balance_usd()
             gross_exposure = self.current_gross_exposure_usd(mark_prices)
-            gross_cap = equity_usd * self.settings.backtest_max_gross_exposure_multiple
+            gross_cap = wallet_balance_usd * self.settings.backtest_max_gross_exposure_multiple
             available_notional = max(gross_cap - gross_exposure, 0.0)
-            risk_based_notional = equity_usd * self.settings.risk_per_trade_pct / self.settings.stop_loss_pct
+            risk_based_notional = (
+                wallet_balance_usd * self.settings.risk_per_trade_pct / self.settings.stop_loss_pct
+            )
             target_notional = min(risk_based_notional, available_notional)
             if target_notional <= 0:
                 self.skipped_gross_exposure_cap += 1
@@ -1798,7 +1800,6 @@ class HistoricalBacktestSimulator:
             )
             self.entries_filled += 1
             cluster_counts[cluster] = cluster_counts.get(cluster, 0) + 1
-            opened_this_cycle += 1
         self._record_snapshot(timestamp_ms, mark_prices)
 
     def process_confirmed(
@@ -2112,6 +2113,11 @@ def _load_variant_checkpoint(path: Path) -> list[BacktestVariantSummary]:
             BacktestVariantSummary(
                 name=str(row["name"]),
                 database_path=str(row["database_path"]),
+                export_dir_path=(
+                    str(row["export_dir_path"])
+                    if row.get("export_dir_path")
+                    else None
+                ),
                 run_seconds=float(row.get("run_seconds", 0.0)),
                 trade_count=int(row["trade_count"]),
                 wins=int(row["wins"]),
@@ -2135,6 +2141,26 @@ def _average_variant_runtime(rows: list[BacktestVariantSummary]) -> float | None
     if not rows:
         return None
     return sum(row.run_seconds for row in rows) / len(rows)
+
+
+def _variant_export_slug(name: str) -> str:
+    slug = re.sub(r"[^A-Za-z0-9._-]+", "-", name).strip("-_.")
+    return slug or "variant"
+
+
+def _ensure_equity_overlay_exports(export_dir: Path) -> None:
+    overlay_rows = _load_csv_dict_rows(export_dir / "backtest_equity_vs_btc_daily.csv")
+    if not overlay_rows:
+        return
+    detailed_equity_rows = _load_csv_dict_rows(export_dir / "backtest_equity_curve.csv")
+    detailed_btc_rows = _load_csv_dict_rows(export_dir / "backtest_btc_overlay_curve.csv")
+    _export_equity_vs_btc_png(
+        overlay_rows,
+        output_path=export_dir / "backtest_equity_curve.png",
+        detailed_equity_rows=detailed_equity_rows,
+        detailed_btc_rows=detailed_btc_rows,
+    )
+    (export_dir / "equity_vs_btc.png").unlink(missing_ok=True)
 
 
 def _export_backtest_trade_events_from_db(database_path: str, output_csv: Path) -> None:
@@ -2205,6 +2231,13 @@ def export_comprehensive_backtest(
     export_path.mkdir(parents=True, exist_ok=True)
     _write_csv(export_path / "backtest_trades.csv", [asdict(trade) for trade in result.trades])
     _write_csv(export_path / "backtest_equity_curve.csv", [asdict(row) for row in result.equity_curve])
+    _write_csv(
+        export_path / "backtest_btc_overlay_curve.csv",
+        [
+            {"timestamp": _timestamp_iso(timestamp_ms), "btc_close": close}
+            for timestamp_ms, close in (result.btc_overlay_history or result.btc_daily_history)
+        ],
+    )
     _write_csv(export_path / "backtest_daily.csv", [asdict(row) for row in result.summary.daily])
     _write_csv(export_path / "backtest_tickers.csv", [asdict(row) for row in result.summary.tickers])
     _write_csv(export_path / "backtest_position_events.csv", [asdict(row) for row in result.position_events])
@@ -2220,6 +2253,251 @@ def export_comprehensive_backtest(
         ],
     )
     _write_csv(export_path / "backtest_daily_exit_mix.csv", _daily_exit_mix_rows(result.trades))
+    equity_vs_btc_rows = _equity_vs_btc_daily_rows(result)
+    _write_csv(export_path / "backtest_equity_vs_btc_daily.csv", equity_vs_btc_rows)
+    _export_equity_vs_btc_png(
+        equity_vs_btc_rows,
+        output_path=export_path / "backtest_equity_curve.png",
+        result=result,
+    )
+    (export_path / "equity_vs_btc.png").unlink(missing_ok=True)
+
+
+def _equity_vs_btc_daily_rows(
+    result: ComprehensiveBacktestResult,
+) -> list[dict[str, float | int | str | None]]:
+    if not result.summary.daily:
+        return []
+    btc_close_by_day: dict[str, float] = {}
+    for timestamp_ms, close in sorted(result.btc_daily_history):
+        btc_close_by_day[_utc_day(timestamp_ms)] = close
+    ordered_btc_days = sorted(btc_close_by_day)
+    previous_btc_close_by_day: dict[str, float | None] = {}
+    previous_close: float | None = None
+    for day in ordered_btc_days:
+        previous_btc_close_by_day[day] = previous_close
+        previous_close = btc_close_by_day[day]
+
+    rows: list[dict[str, float | int | str | None]] = []
+    starting_equity = result.summary.starting_equity_usd
+    ending_equity = starting_equity
+    for daily in result.summary.daily:
+        starting_equity = ending_equity
+        ending_equity = starting_equity * (1.0 + daily.return_pct)
+        btc_close = btc_close_by_day.get(daily.day)
+        previous_btc_close = previous_btc_close_by_day.get(daily.day)
+        btc_daily_return_pct = (
+            ((btc_close / previous_btc_close) - 1.0)
+            if btc_close is not None
+            and previous_btc_close is not None
+            and previous_btc_close > 0
+            else None
+        )
+        rows.append(
+            {
+                "day": daily.day,
+                "trades": daily.trades,
+                "wins": daily.wins,
+                "losses": daily.losses,
+                "starting_equity_usd": starting_equity,
+                "ending_equity_usd": ending_equity,
+                "strategy_daily_return_pct": daily.return_pct,
+                "strategy_net_pnl_usd": daily.net_pnl_usd,
+                "btc_close": btc_close,
+                "btc_daily_return_pct": btc_daily_return_pct,
+                "strategy_minus_btc_return_pct": (
+                    daily.return_pct - btc_daily_return_pct
+                    if btc_daily_return_pct is not None
+                    else None
+                ),
+            }
+        )
+    return rows
+
+
+def _flatten_intrabar_close_history(
+    intrabar_buckets: dict[int, list[HistoricalCandle]] | None,
+) -> list[tuple[int, float]]:
+    if not intrabar_buckets:
+        return []
+    flattened: list[tuple[int, float]] = []
+    for bucket_start_ms in sorted(intrabar_buckets):
+        for candle in intrabar_buckets[bucket_start_ms]:
+            flattened.append((candle.start_time_ms, candle.close_price))
+    return flattened
+
+
+def _export_equity_vs_btc_png(
+    rows: list[dict[str, float | int | str | None]],
+    *,
+    output_path: Path,
+    result: ComprehensiveBacktestResult | None = None,
+    detailed_equity_rows: list[dict[str, float | int | str | None]] | None = None,
+    detailed_btc_rows: list[dict[str, float | int | str | None]] | None = None,
+) -> None:
+    if not rows:
+        return
+    try:
+        import matplotlib.pyplot as plt
+        import pandas as pd
+    except ImportError:
+        return
+
+    frame = pd.DataFrame(rows)
+    if frame.empty:
+        return
+    required = {"day", "starting_equity_usd", "ending_equity_usd", "btc_close"}
+    if not required.issubset(frame.columns):
+        return
+
+    detailed_equity_source = (
+        detailed_equity_rows
+        if detailed_equity_rows is not None
+        else [
+            {
+                "timestamp": snapshot.timestamp,
+                "equity_usd": snapshot.equity_usd,
+            }
+            for snapshot in (result.equity_curve if result is not None else [])
+        ]
+    )
+    detailed_equity = pd.DataFrame(detailed_equity_source)
+    if not detailed_equity.empty:
+        detailed_equity["timestamp"] = pd.to_datetime(detailed_equity["timestamp"], utc=True)
+        detailed_equity["equity_usd"] = pd.to_numeric(
+            detailed_equity["equity_usd"], errors="coerce"
+        )
+        detailed_equity = detailed_equity.dropna(subset=["timestamp", "equity_usd"]).sort_values(
+            "timestamp"
+        )
+        detailed_equity = detailed_equity.drop_duplicates(subset=["timestamp"], keep="last")
+
+    detailed_btc_source = (
+        detailed_btc_rows
+        if detailed_btc_rows is not None
+        else [
+            {
+                "timestamp": pd.to_datetime(timestamp_ms, unit="ms", utc=True),
+                "btc_close": close,
+            }
+            for timestamp_ms, close in (
+                (result.btc_overlay_history or result.btc_daily_history)
+                if result is not None
+                else []
+            )
+        ]
+    )
+    detailed_btc = pd.DataFrame(detailed_btc_source)
+    if not detailed_btc.empty:
+        detailed_btc["timestamp"] = pd.to_datetime(detailed_btc["timestamp"], utc=True)
+        detailed_btc["btc_close"] = pd.to_numeric(detailed_btc["btc_close"], errors="coerce")
+        detailed_btc = detailed_btc.dropna(subset=["timestamp", "btc_close"]).sort_values("timestamp")
+        detailed_btc = detailed_btc.drop_duplicates(subset=["timestamp"], keep="last")
+
+    use_detailed_chart = not detailed_equity.empty and not detailed_btc.empty
+    if use_detailed_chart:
+        equity_x = detailed_equity["timestamp"]
+        equity_y = detailed_equity["equity_usd"]
+        btc_x = detailed_btc["timestamp"]
+        btc_y = detailed_btc["btc_close"]
+        unique_days = pd.Series(
+            pd.to_datetime(detailed_equity["timestamp"].dt.floor("D").unique(), utc=True)
+        ).sort_values(ignore_index=True)
+    else:
+        frame["day"] = pd.to_datetime(frame["day"], utc=True)
+        frame = frame.sort_values("day").reset_index(drop=True)
+        frame["starting_equity_usd"] = pd.to_numeric(frame["starting_equity_usd"], errors="coerce")
+        frame["ending_equity_usd"] = pd.to_numeric(frame["ending_equity_usd"], errors="coerce")
+        frame["btc_close"] = pd.to_numeric(frame["btc_close"], errors="coerce")
+        if frame["starting_equity_usd"].isna().all() or frame["btc_close"].isna().all():
+            return
+
+        frame = frame.dropna(subset=["starting_equity_usd", "ending_equity_usd", "btc_close"]).reset_index(
+            drop=True
+        )
+        if frame.empty:
+            return
+
+        equity_x = frame["day"]
+        equity_y = frame["ending_equity_usd"]
+        btc_x = frame["day"]
+        btc_y = frame["btc_close"]
+        unique_days = pd.Series(
+            pd.to_datetime(frame["day"].dt.floor("D").unique(), utc=True)
+        ).sort_values(ignore_index=True)
+
+    first_strategy = float(equity_y.iloc[0])
+    if first_strategy <= 0:
+        return
+    equity_min = float(equity_y.min())
+    equity_max = float(equity_y.max())
+    btc_min = float(btc_y.min())
+    btc_max = float(btc_y.max())
+    if btc_max > btc_min:
+        btc_overlay = (
+            (btc_y - btc_min) / (btc_max - btc_min) * (equity_max - equity_min)
+        ) + equity_min
+    else:
+        btc_overlay = np.full(len(btc_y), (equity_min + equity_max) / 2.0)
+
+    plt.style.use("default")
+    fig, ax = plt.subplots(figsize=(14, 7.5), dpi=180)
+    fig.patch.set_facecolor("#f6f0e4")
+    ax.set_facecolor("#fbf7ef")
+    ax.plot(
+        btc_x,
+        btc_overlay,
+        linewidth=1.2 if use_detailed_chart else 1.6,
+        color="#c9bba2",
+        alpha=0.48 if use_detailed_chart else 0.40,
+        zorder=1,
+    )
+    ax.plot(
+        equity_x,
+        equity_y,
+        linewidth=2.8,
+        color="#2f7d68",
+        drawstyle="default" if use_detailed_chart else "steps-post",
+        zorder=3,
+    )
+    ax.set_title(
+        f"Backtest Equity Curve: {output_path.parent.name}",
+        fontsize=14,
+        fontweight="bold",
+        pad=10,
+    )
+    ax.set_xlabel("UTC Date")
+    ax.set_ylabel("USD")
+    ax.margins(x=0.01)
+    tick_count = min(len(unique_days), max(30, min(40, len(unique_days)))) if len(unique_days) > 0 else 0
+    if tick_count > 0:
+        tick_positions = np.unique(np.linspace(0, len(unique_days) - 1, num=tick_count, dtype=int))
+        tick_days = unique_days.iloc[tick_positions]
+        ax.set_xticks(tick_days)
+        ax.set_xticklabels(
+            [day.strftime("%Y-%m-%d") for day in tick_days],
+            rotation=90,
+            ha="center",
+            fontsize=8,
+        )
+    try:
+        from matplotlib.ticker import FuncFormatter
+
+        ax.yaxis.set_major_formatter(FuncFormatter(lambda value, _pos: f"${value:,.0f}"))
+    except Exception:
+        pass
+    ax.grid(True, which="major", color="#e9decb", alpha=0.55, linewidth=0.8)
+    ax.grid(True, which="minor", color="#f1e8d8", alpha=0.45, linewidth=0.5)
+    ax.minorticks_on()
+    lower = min(float(np.min(btc_overlay)), equity_min)
+    upper = max(float(np.max(btc_overlay)), equity_max)
+    span = upper - lower
+    if span <= 0:
+        span = max(abs(upper) * 0.02, 1.0)
+    ax.set_ylim(bottom=lower - (span * 0.08), top=upper + (span * 0.06))
+    fig.tight_layout()
+    fig.savefig(output_path, bbox_inches="tight")
+    plt.close(fig)
 
 
 def format_comprehensive_backtest(result: ComprehensiveBacktestResult) -> str:
@@ -2287,7 +2565,7 @@ def format_comprehensive_backtest(result: ComprehensiveBacktestResult) -> str:
             f"Entry flow: entry_ready_signals={summary.entry_ready_signals} filled={summary.entries_filled} "
             f"dup={summary.skipped_duplicate_ticker} max_open={summary.skipped_max_open_positions} "
             f"cluster_cap={summary.skipped_cluster_limit} "
-            f"batch_cap={summary.skipped_max_entries_per_rebalance} daily_stop={summary.skipped_daily_stop_losses} "
+            f"daily_stop={summary.skipped_daily_stop_losses} "
             f"gross_cap={summary.skipped_gross_exposure_cap} too_small={summary.skipped_too_small}"
         ),
         f"Max open positions observed: {summary.max_open_positions_observed}",
@@ -2607,7 +2885,6 @@ async def run_comprehensive_backtest_plan(
         skipped_duplicate_ticker=simulator.skipped_duplicate_ticker,
         skipped_max_open_positions=simulator.skipped_max_open_positions,
         skipped_cluster_limit=simulator.skipped_cluster_limit,
-        skipped_max_entries_per_rebalance=simulator.skipped_max_entries_per_rebalance,
         skipped_daily_stop_losses=simulator.skipped_daily_stop_losses,
         skipped_gross_exposure_cap=simulator.skipped_gross_exposure_cap,
         skipped_too_small=simulator.skipped_too_small,
@@ -2622,6 +2899,11 @@ async def run_comprehensive_backtest_plan(
         trades=simulator.trades,
         equity_curve=simulator.equity_curve,
         position_events=simulator.position_events,
+        btc_daily_history=list(plan.btc_daily_history),
+        btc_overlay_history=(
+            _flatten_intrabar_close_history(plan.intrabar_by_symbol.get("BTCUSDT"))
+            or list(plan.confirmed_plan.history_by_symbol.get("BTCUSDT", []))
+        ),
     )
 
 
@@ -2835,6 +3117,21 @@ def export_variant_run_result(
         best_database_path = Path(best_variant.database_path).expanduser()
         if best_database_path.exists():
             _export_backtest_trade_events_from_db(str(best_database_path), best_trades_csv)
+        best_export_dir = (
+            Path(best_variant.export_dir_path).expanduser()
+            if best_variant.export_dir_path
+            else None
+        )
+        if best_export_dir is not None and best_export_dir.exists():
+            _ensure_equity_overlay_exports(best_export_dir)
+            for source_name, target_name in (
+                ("backtest_equity_vs_btc_daily.csv", "best_variant_backtest_equity_vs_btc_daily.csv"),
+                ("backtest_daily.csv", "best_variant_backtest_daily.csv"),
+                ("backtest_equity_curve.png", "best_variant_backtest_equity_curve.png"),
+            ):
+                source_path = best_export_dir / source_name
+                if source_path.exists():
+                    shutil.copy2(source_path, export_path / target_name)
         if (telegram_html_path or actual_db_path) and best_database_path.exists():
             reconciliation_dir = export_path / "best_variant_reconciliation"
             summary_text = _run_export_reconciliation(
@@ -2974,6 +3271,7 @@ def _run_variant_sync(
     plan: MinuteReplayPlan,
     sqlite_path: str,
     variant: BacktestVariantSpec,
+    export_base_dir: str | None = None,
 ) -> BacktestVariantSummary:
     started_at = time.monotonic()
     variant_settings = replace(settings, **variant.overrides)
@@ -2984,9 +3282,17 @@ def _run_variant_sync(
             sqlite_path=sqlite_path,
         )
     )
+    export_dir_path: str | None = None
+    if export_base_dir:
+        variant_export_dir = (
+            Path(export_base_dir).expanduser() / _variant_export_slug(variant.name)
+        )
+        export_comprehensive_backtest(result, export_dir=str(variant_export_dir))
+        export_dir_path = str(variant_export_dir)
     return BacktestVariantSummary(
         name=variant.name,
         database_path=result.database_path,
+        export_dir_path=export_dir_path,
         run_seconds=max(0.0, time.monotonic() - started_at),
         trade_count=result.summary.trade_count,
         wins=result.summary.wins,
@@ -3203,9 +3509,16 @@ def _run_variant_from_plan_path_sync(
     plan_path: str,
     sqlite_path: str,
     variant: BacktestVariantSpec,
+    export_base_dir: str | None = None,
 ) -> BacktestVariantSummary:
     plan = _load_plan_snapshot(plan_path)
-    return _run_variant_sync(settings, plan, sqlite_path, variant)
+    return _run_variant_sync(
+        settings,
+        plan,
+        sqlite_path,
+        variant,
+        export_base_dir=export_base_dir,
+    )
 
 
 async def run_comprehensive_backtest_variants(
@@ -3216,6 +3529,7 @@ async def run_comprehensive_backtest_variants(
     variants: list[BacktestVariantSpec],
     max_workers: int | None = None,
     checkpoint_path: str | None = None,
+    export_base_dir: str | None = None,
 ) -> BacktestVariantRunResult:
     run_started_at = time.monotonic()
     checkpoint_file = Path(checkpoint_path).expanduser() if checkpoint_path else None
@@ -3250,6 +3564,7 @@ async def run_comprehensive_backtest_variants(
                 row = BacktestVariantSummary(
                     name=variant.name,
                     database_path=result.database_path,
+                    export_dir_path=None,
                     run_seconds=max(0.0, time.monotonic() - variant_started_at),
                     trade_count=result.summary.trade_count,
                     wins=result.summary.wins,
@@ -3261,6 +3576,13 @@ async def run_comprehensive_backtest_variants(
                     entry_ready_signals=result.summary.entry_ready_signals,
                     entries_filled=result.summary.entries_filled,
                 )
+                if export_base_dir:
+                    variant_export_dir = (
+                        Path(export_base_dir).expanduser() / _variant_export_slug(variant.name)
+                    )
+                    export_comprehensive_backtest(result, export_dir=str(variant_export_dir))
+                    _ensure_equity_overlay_exports(variant_export_dir)
+                    row.export_dir_path = str(variant_export_dir)
             except Exception:
                 completed_pending = len(rows) - len(resumed_rows)
                 elapsed_seconds = max(0.0, time.monotonic() - run_started_at)
@@ -3283,6 +3605,8 @@ async def run_comprehensive_backtest_variants(
                 )
                 raise
             rows.append(row)
+            if row.export_dir_path:
+                _ensure_equity_overlay_exports(Path(row.export_dir_path).expanduser())
             _progress(
                 _variant_progress_message(
                     completed_pending=len(rows) - len(resumed_rows),
@@ -3345,6 +3669,7 @@ async def run_comprehensive_backtest_variants(
                     f"variant-{variants.index(variant) + 1:02d}",
                 ),
                 variant,
+                export_base_dir,
             )
             for variant in pending_variants
         ]
@@ -4075,6 +4400,11 @@ def main() -> None:
                 sqlite_path=db_path,
                 variants=variant_specs,
                 max_workers=args.variant_workers,
+                export_base_dir=(
+                    str(Path(args.export_dir).expanduser() / "variants")
+                    if args.export_dir
+                    else None
+                ),
                 checkpoint_path=(
                     str(Path(args.export_dir).expanduser() / "variant_summary.csv")
                     if args.resume_variants and args.export_dir

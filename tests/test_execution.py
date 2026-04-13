@@ -43,10 +43,6 @@ def test_execution_engine_allows_multiple_tickers_but_only_one_position_per_tick
     asyncio.run(_exercise_per_ticker_entry_guard(tmp_path))
 
 
-def test_execution_engine_limits_entries_per_rebalance(tmp_path: Path) -> None:
-    asyncio.run(_exercise_max_entries_per_rebalance(tmp_path))
-
-
 def test_execution_engine_respects_max_open_positions(tmp_path: Path) -> None:
     asyncio.run(_exercise_max_open_positions(tmp_path))
 
@@ -913,79 +909,6 @@ async def _exercise_live_break_even_stop_update(tmp_path: Path) -> None:
     assert armed_flag == 1
 
 
-async def _exercise_max_entries_per_rebalance(tmp_path: Path) -> None:
-    settings = Settings(
-        sqlite_path=str(tmp_path / "execution-rebalance-cap.db"),
-        universe=["AAAUSDT", "BBBUSDT", "CCCUSDT"],
-        execution_enabled=True,
-        demo_mode=True,
-        execution_submit_orders=False,
-        max_entries_per_rebalance=1,
-    )
-    state = MarketState(settings=settings)
-    for symbol, price in (
-        ("BTCUSDT", 20_000.0),
-        ("AAAUSDT", 100.0),
-        ("BBBUSDT", 90.0),
-        ("CCCUSDT", 80.0),
-    ):
-        state.replace_history(
-            symbol,
-            [(0, price), (settings.ticker_interval_ms, price + 1.0)],
-        )
-
-    database = SignalDatabase(settings.sqlite_path)
-    await database.initialize()
-    execution = ExecutionEngine(settings=settings, state=state, database=database)
-
-    actions = await execution.process_cycle(
-        stage="emerging",
-        cycle_time_ms=settings.ticker_interval_ms * 2,
-        ranked_signals=[
-            RankedSignal(
-                stage="emerging",
-                signal_kind="entry_ready",
-                ticker="AAAUSDT",
-                current_price=101.0,
-                momentum_z=2.0,
-                curvature=0.2,
-                hurst=0.7,
-                regime_score=2,
-                composite_score=1.4,
-                rank=1,
-                persistence_hits=0,
-                alerted=False,
-            ),
-            RankedSignal(
-                stage="emerging",
-                signal_kind="entry_ready",
-                ticker="BBBUSDT",
-                current_price=91.0,
-                momentum_z=1.5,
-                curvature=0.15,
-                hurst=0.68,
-                regime_score=2,
-                composite_score=1.2,
-                rank=2,
-                persistence_hits=0,
-                alerted=False,
-            ),
-        ],
-    )
-
-    assert [(action.action, action.ticker) for action in actions] == [
-        ("enter_long", "AAAUSDT"),
-        ("skip_entry", "BBBUSDT"),
-    ]
-    assert "max_entries_per_rebalance_reached" in actions[1].detail
-
-    with sqlite3.connect(settings.sqlite_path) as connection:
-        open_positions = connection.execute(
-            "SELECT ticker FROM positions WHERE status = 'open' ORDER BY ticker"
-        ).fetchall()
-    assert open_positions == [("AAAUSDT",)]
-
-
 async def _exercise_max_open_positions(tmp_path: Path) -> None:
     settings = Settings(
         sqlite_path=str(tmp_path / "execution-open-cap.db"),
@@ -994,7 +917,6 @@ async def _exercise_max_open_positions(tmp_path: Path) -> None:
         demo_mode=True,
         execution_submit_orders=False,
         max_open_positions=1,
-        max_entries_per_rebalance=0,
     )
     state = MarketState(settings=settings)
     for symbol, price in (
@@ -1103,6 +1025,7 @@ async def _exercise_max_positions_per_cluster(tmp_path: Path) -> None:
                 rank=1,
                 persistence_hits=0,
                 alerted=False,
+                cluster_label="corr:shared",
             ),
             RankedSignal(
                 stage="emerging",
@@ -1117,6 +1040,7 @@ async def _exercise_max_positions_per_cluster(tmp_path: Path) -> None:
                 rank=2,
                 persistence_hits=0,
                 alerted=False,
+                cluster_label="corr:shared",
             ),
         ],
     )
@@ -1126,7 +1050,7 @@ async def _exercise_max_positions_per_cluster(tmp_path: Path) -> None:
         ("skip_entry", "OPUSDT"),
     ]
     assert (
-        "max_positions_per_cluster_reached cluster=manual:l2 count=1 limit=1"
+        "max_positions_per_cluster_reached cluster=corr:shared count=1 limit=1"
         == actions[1].detail
     )
 

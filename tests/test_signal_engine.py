@@ -103,7 +103,17 @@ async def _exercise_cooldown_behavior(tmp_path: Path) -> None:
         universe=["AAAUSDT", "BBBUSDT", "CCCUSDT"],
         telegram_bot_token=None,
         telegram_chat_id=None,
-        watchlist_telegram_enabled=True,
+        top_n=1,
+        emerging_top_n=1,
+        entry_ready_top_n=1,
+        watchlist_top_n=5,
+        emerging_min_observations=1,
+        emerging_min_rank_improvement=0,
+        entry_ready_min_observations=1,
+        entry_ready_min_rank_improvement=0,
+        entry_ready_min_composite_gain=0.0,
+        intraday_regime_filter_enabled=False,
+        regime_thresholds={0: None, 1: None, 2: None, 3: None},
     )
     state = MarketState(settings=settings)
     timestamps = [idx * settings.ticker_interval_ms for idx in range(settings.state_window)]
@@ -196,7 +206,6 @@ async def _exercise_emerging_transition_behavior(tmp_path: Path) -> None:
         universe=["AAAUSDT", "BBBUSDT", "CCCUSDT"],
         telegram_bot_token=None,
         telegram_chat_id=None,
-        watchlist_telegram_enabled=True,
         top_n=1,
         emerging_top_n=1,
         entry_ready_top_n=1,
@@ -250,7 +259,7 @@ async def _exercise_emerging_transition_behavior(tmp_path: Path) -> None:
         signal.ticker == "AAAUSDT" and signal.signal_kind == "watchlist"
         for signal in watchlist_signals
     )
-    assert notifier.kinds == ["watchlist"]
+    assert notifier.kinds == []
 
     state.intrabar_observations["AAAUSDT"] = deque(
         [
@@ -267,7 +276,7 @@ async def _exercise_emerging_transition_behavior(tmp_path: Path) -> None:
         signal.ticker == "AAAUSDT" and signal.signal_kind == "emerging"
         for signal in emerging_signals
     )
-    assert notifier.kinds == ["watchlist", "emerging"]
+    assert notifier.kinds == ["emerging"]
 
     state.intrabar_observations["AAAUSDT"] = deque(
         [
@@ -285,7 +294,7 @@ async def _exercise_emerging_transition_behavior(tmp_path: Path) -> None:
         signal.ticker == "AAAUSDT" and signal.signal_kind == "entry_ready"
         for signal in entry_ready_signals
     )
-    assert notifier.kinds == ["watchlist", "emerging", "entry_ready"]
+    assert notifier.kinds == ["emerging", "entry_ready"]
 
     assert state.append_close("BTCUSDT", next_timestamp, btc_prices[-1] + 50.0) is True
     assert state.append_close("AAAUSDT", next_timestamp, strong[-1] + 2.5) is True
@@ -294,7 +303,7 @@ async def _exercise_emerging_transition_behavior(tmp_path: Path) -> None:
 
     confirmed_signals = await engine.process(cycle_time_ms=next_timestamp, stage="confirmed")
     assert confirmed_signals == []
-    assert notifier.kinds == ["watchlist", "emerging", "entry_ready"]
+    assert notifier.kinds == ["emerging", "entry_ready"]
 
 
 async def _exercise_intraday_regime_block(tmp_path: Path) -> None:
@@ -303,7 +312,6 @@ async def _exercise_intraday_regime_block(tmp_path: Path) -> None:
         universe=["AAAUSDT", "BBBUSDT", "CCCUSDT"],
         telegram_bot_token=None,
         telegram_chat_id=None,
-        watchlist_telegram_enabled=True,
         top_n=1,
         emerging_top_n=1,
         entry_ready_top_n=1,
@@ -378,7 +386,6 @@ async def _exercise_intraday_regime_disabled(tmp_path: Path) -> None:
         universe=["AAAUSDT", "BBBUSDT", "CCCUSDT"],
         telegram_bot_token=None,
         telegram_chat_id=None,
-        watchlist_telegram_enabled=True,
         top_n=1,
         emerging_top_n=1,
         entry_ready_top_n=1,
@@ -452,7 +459,6 @@ async def _exercise_signal_alert_toggle(tmp_path: Path) -> None:
         telegram_bot_token=None,
         telegram_chat_id=None,
         telegram_signal_alerts_enabled=False,
-        watchlist_telegram_enabled=True,
         top_n=1,
         emerging_top_n=1,
         entry_ready_top_n=1,
@@ -574,7 +580,6 @@ async def _exercise_entry_ready_diagnostics(tmp_path: Path) -> None:
         telegram_bot_token=None,
         telegram_chat_id=None,
         momentum_reference_mode="cluster_relative",
-        cluster_assignment_mode="dynamic",
         cluster_correlation_lookback_bars=24,
         cluster_correlation_threshold=0.9,
         top_n=1,

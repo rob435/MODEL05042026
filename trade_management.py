@@ -40,7 +40,7 @@ def profit_ratchet_can_advance(
         return False
     if settings.profit_ratchet_max_steps > 0 and current_step >= settings.profit_ratchet_max_steps:
         return False
-    if settings.profit_ratchet_require_entry_ready and signal_kind != "entry_ready":
+    if signal_kind != "entry_ready":
         return False
     return True
 

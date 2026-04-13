@@ -87,7 +87,6 @@ Selection / throttle diagnostics:
 - `entry_ready_signals`
 - `entries_filled`
 - `skipped_max_open_positions`
-- `skipped_max_entries_per_rebalance`
 - `skipped_daily_stop_losses`
 
 Do not optimize on win rate alone. That is how bad systems get dressed up as good ones.
@@ -137,15 +136,11 @@ These are the highest-leverage knobs for the current system.
 4. Residual momentum / clustering
    Current defaults:
    - `momentum_reference_mode=cluster_relative`
-   - `momentum_reference_blend_btc_weight=0.35`
-   - `cluster_assignment_mode=dynamic`
    - `cluster_correlation_lookback_bars=48`
    - `cluster_correlation_threshold=0.70`
 
    First-pass ranges:
-   - `momentum_reference_mode`: `basket_relative`, `cluster_relative`, `hybrid_relative`
-   - `momentum_reference_blend_btc_weight`: `0.25`, `0.35`, `0.50`
-   - `cluster_assignment_mode`: `dynamic`, `hybrid`
+   - `momentum_reference_mode`: `basket_relative`, `cluster_relative`
    - `cluster_correlation_lookback_bars`: `32`, `48`, `64`
    - `cluster_correlation_threshold`: `0.60`, `0.70`, `0.80`
 
@@ -165,12 +160,10 @@ These matter, but only after the engine is selecting cleaner trades.
 2. Portfolio throttles
    Current defaults:
    - `max_open_positions=3`
-   - `max_entries_per_rebalance=0`
    - `max_daily_stop_losses=0`
 
    First-pass ranges:
    - `max_open_positions`: `2`, `3`, `4`
-   - `max_entries_per_rebalance`: `1`, `2`, `0`
    - `max_daily_stop_losses`: `1`, `2`, `3`, `0`
 
 ### Tier 3: Optimize Last
@@ -291,8 +284,8 @@ python backtest.py \
   --cycles 96 \
   --research-fast \
   --variant-workers 4 \
-  --grid-setting momentum_reference_mode=basket_relative,cluster_relative,hybrid_relative \
-  --grid-setting cluster_assignment_mode=dynamic,hybrid
+  --grid-setting momentum_reference_mode=basket_relative,cluster_relative \
+  --grid-setting cluster_correlation_threshold=0.60,0.70,0.80
 ```
 
 Keep only the top two or three candidates from each family.
@@ -306,8 +299,8 @@ python backtest.py \
   --variant-workers 4 \
   --export-dir ./research/year-grid \
   --resume-variants \
-  --grid-setting momentum_reference_mode=basket_relative,cluster_relative,hybrid_relative \
-  --grid-setting cluster_assignment_mode=dynamic,hybrid
+  --grid-setting momentum_reference_mode=basket_relative,cluster_relative \
+  --grid-setting cluster_correlation_threshold=0.60,0.70,0.80
 ```
 
 ### Phase 2: Interaction Checks
@@ -321,7 +314,7 @@ Check only interactions that are likely to matter:
 - residual reference mode x cluster assignment mode
 - residual reference mode x intraday regime strictness
 - `take_profit_pct` x `stop_loss_pct`
-- `max_open_positions` x `max_entries_per_rebalance`
+- `max_open_positions` x `max_positions_per_cluster`
 
 Do not test every possible pair. Test survivors only.
 
@@ -389,7 +382,7 @@ python backtest.py \
   --research-fast \
   --variant-workers 4 \
   --grid-setting max_open_positions=2,3,4 \
-  --grid-setting max_entries_per_rebalance=1,2,0 \
+  --grid-setting max_positions_per_cluster=1,2 \
   --grid-setting max_daily_stop_losses=1,2,3,0
 ```
 

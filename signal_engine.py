@@ -21,7 +21,6 @@ from indicators import (
     volatility_adjusted_momentum,
 )
 from state import MarketState
-from universe import ticker_cluster
 
 LOGGER = logging.getLogger(__name__)
 
@@ -130,28 +129,11 @@ class SignalEngine:
         self,
         raw_prices_by_symbol: dict[str, np.ndarray],
     ) -> dict[str, str]:
-        mode = self.settings.cluster_assignment_mode
-        if mode == "manual":
-            return {
-                symbol: f"manual:{ticker_cluster(symbol)}"
-                for symbol in raw_prices_by_symbol
-            }
-        labels = correlation_cluster_labels(
+        return correlation_cluster_labels(
             raw_prices_by_symbol,
             lookback_bars=max(self.settings.cluster_correlation_lookback_bars, 3),
             threshold=self.settings.cluster_correlation_threshold,
         )
-        if mode == "dynamic":
-            return labels
-        if mode == "hybrid":
-            resolved: dict[str, str] = {}
-            for symbol, label in labels.items():
-                if label.startswith("solo:"):
-                    resolved[symbol] = f"manual:{ticker_cluster(symbol)}"
-                else:
-                    resolved[symbol] = label
-            return resolved
-        raise ValueError(f"Unsupported CLUSTER_ASSIGNMENT_MODE: {mode}")
 
     def _basket_relative_prices(
         self,
@@ -201,33 +183,6 @@ class SignalEngine:
             return None
         return target / cluster_basket
 
-    def _hybrid_relative_prices(
-        self,
-        ticker: str,
-        raw_prices_by_symbol: dict[str, np.ndarray],
-        *,
-        include_provisional: bool,
-    ) -> np.ndarray | None:
-        raw_prices = raw_prices_by_symbol.get(ticker)
-        if raw_prices is None or raw_prices.size == 0 or np.any(raw_prices <= 0):
-            return None
-        btc_prices = self.state.get_prices("BTCUSDT", include_provisional=include_provisional)
-        basket_relative = self._basket_relative_prices(ticker, raw_prices_by_symbol)
-        if (
-            basket_relative is None
-            or btc_prices.size != raw_prices.size
-            or np.any(btc_prices <= 0)
-        ):
-            return basket_relative if basket_relative is not None else raw_prices
-        btc_normalized = btc_prices / btc_prices[0]
-        basket_reference = raw_prices / basket_relative
-        btc_weight = float(np.clip(self.settings.momentum_reference_blend_btc_weight, 0.0, 1.0))
-        basket_weight = 1.0 - btc_weight
-        blended_reference = (btc_normalized**btc_weight) * (basket_reference**basket_weight)
-        if np.any(blended_reference <= 0):
-            return raw_prices
-        return raw_prices / blended_reference
-
     def _momentum_signal_prices(
         self,
         ticker: str,
@@ -264,15 +219,6 @@ class SignalEngine:
             if basket_relative is not None:
                 return basket_relative, "basket_relative:fallback"
             return raw_prices, "absolute:fallback"
-        if mode == "hybrid_relative":
-            hybrid = self._hybrid_relative_prices(
-                ticker,
-                raw_prices_by_symbol,
-                include_provisional=include_provisional,
-            )
-            if hybrid is None:
-                return raw_prices, "absolute:fallback"
-            return hybrid, "hybrid_relative"
         raise ValueError(f"Unsupported MOMENTUM_REFERENCE_MODE: {mode}")
 
     def _compute_metrics(self, stage: str) -> dict[str, TickerMetrics]:
@@ -318,7 +264,7 @@ class SignalEngine:
                 momentum_raw=momentum,
                 curvature_raw=curvature,
                 hurst=hurst,
-                cluster_label=cluster_labels.get(symbol, f"manual:{ticker_cluster(symbol)}"),
+                cluster_label=cluster_labels.get(symbol, f"solo:{symbol}"),
                 momentum_reference_label=reference_label,
             )
         if len(metrics) < 2:
@@ -675,7 +621,7 @@ class SignalEngine:
                 )
                 if not self.settings.telegram_signal_alerts_enabled:
                     eligible_to_alert = False
-                if signal_kind == "watchlist" and not self.settings.watchlist_telegram_enabled:
+                if signal_kind == "watchlist":
                     eligible_to_alert = False
                 self.state.intrabar_state[ticker] = signal_kind if should_signal else "neutral"
             alerted = False

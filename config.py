@@ -73,7 +73,6 @@ class Settings:
     risk_per_trade_pct: float = 0.01
     max_open_positions: int = 3
     max_positions_per_cluster: int = 1
-    max_entries_per_rebalance: int = 0
     take_profit_pct: float = 0.02
     stop_loss_pct: float = 0.02
     stale_position_max_minutes: int = 240
@@ -81,7 +80,6 @@ class Settings:
     break_even_stop_trigger_fraction_of_tp: float = 0.75
     profit_ratchet_enabled: bool = False
     profit_ratchet_max_steps: int = 0
-    profit_ratchet_require_entry_ready: bool = True
     max_daily_stop_losses: int = 0
     operator_pause_new_entries: bool = False
     bybit_recv_window: int = 5000
@@ -101,13 +99,11 @@ class Settings:
     momentum_lookback: int = 48
     momentum_skip: int = 4
     momentum_reference_mode: str = "cluster_relative"
-    momentum_reference_blend_btc_weight: float = 0.35
     curvature_ma_window: int = 8
     curvature_signal_window: int = 6
     hurst_window: int = 96
     hurst_cutoff: float = 0.55
     top_n: int = 3
-    cluster_assignment_mode: str = "dynamic"
     cluster_correlation_lookback_bars: int = 48
     cluster_correlation_threshold: float = 0.7
     intraday_regime_filter_enabled: bool = True
@@ -130,7 +126,6 @@ class Settings:
     emerging_cooldown_minutes: int = 60
     watchlist_cooldown_minutes: int = 30
     entry_ready_cooldown_minutes: int = 15
-    watchlist_telegram_enabled: bool = False
     emerging_min_observations: int = 3
     emerging_min_rank_improvement: int = 2
     entry_ready_min_observations: int = 4
@@ -228,7 +223,6 @@ def load_settings() -> Settings:
         risk_per_trade_pct=_get_float("RISK_PER_TRADE_PCT", 0.01),
         max_open_positions=_get_int("MAX_OPEN_POSITIONS", 3),
         max_positions_per_cluster=_get_int("MAX_POSITIONS_PER_CLUSTER", 1),
-        max_entries_per_rebalance=_get_int("MAX_ENTRIES_PER_REBALANCE", 0),
         take_profit_pct=_get_float("TAKE_PROFIT_PCT", 0.02),
         stop_loss_pct=_get_float("STOP_LOSS_PCT", 0.02),
         stale_position_max_minutes=_get_int("STALE_POSITION_MAX_MINUTES", 240),
@@ -239,10 +233,6 @@ def load_settings() -> Settings:
         ),
         profit_ratchet_enabled=_get_bool("PROFIT_RATCHET_ENABLED", False),
         profit_ratchet_max_steps=_get_int("PROFIT_RATCHET_MAX_STEPS", 0),
-        profit_ratchet_require_entry_ready=_get_bool(
-            "PROFIT_RATCHET_REQUIRE_ENTRY_READY",
-            True,
-        ),
         max_daily_stop_losses=_get_int("MAX_DAILY_STOP_LOSSES", 0),
         operator_pause_new_entries=_get_bool("OPERATOR_PAUSE_NEW_ENTRIES", False),
         bybit_recv_window=_get_int("BYBIT_RECV_WINDOW", 5000),
@@ -264,13 +254,11 @@ def load_settings() -> Settings:
         momentum_lookback=_get_int("MOMENTUM_LOOKBACK", 48),
         momentum_skip=_get_int("MOMENTUM_SKIP", 4),
         momentum_reference_mode=os.getenv("MOMENTUM_REFERENCE_MODE", "cluster_relative").strip().lower(),
-        momentum_reference_blend_btc_weight=_get_float("MOMENTUM_REFERENCE_BLEND_BTC_WEIGHT", 0.35),
         curvature_ma_window=_get_int("CURVATURE_MA_WINDOW", 8),
         curvature_signal_window=_get_int("CURVATURE_SIGNAL_WINDOW", 6),
         hurst_window=_get_int("HURST_WINDOW", 96),
         hurst_cutoff=_get_float("HURST_CUTOFF", 0.55),
         top_n=_get_int("TOP_N", 3),
-        cluster_assignment_mode=os.getenv("CLUSTER_ASSIGNMENT_MODE", "dynamic").strip().lower(),
         cluster_correlation_lookback_bars=_get_int("CLUSTER_CORRELATION_LOOKBACK_BARS", 48),
         cluster_correlation_threshold=_get_float("CLUSTER_CORRELATION_THRESHOLD", 0.7),
         intraday_regime_filter_enabled=_get_bool("INTRADAY_REGIME_FILTER_ENABLED", True),
@@ -296,7 +284,6 @@ def load_settings() -> Settings:
         emerging_cooldown_minutes=_get_int("EMERGING_COOLDOWN_MINUTES", 60),
         watchlist_cooldown_minutes=_get_int("WATCHLIST_COOLDOWN_MINUTES", 30),
         entry_ready_cooldown_minutes=_get_int("ENTRY_READY_COOLDOWN_MINUTES", 15),
-        watchlist_telegram_enabled=_get_bool("WATCHLIST_TELEGRAM_ENABLED", False),
         emerging_min_observations=_get_int("EMERGING_MIN_OBSERVATIONS", 3),
         emerging_min_rank_improvement=_get_int("EMERGING_MIN_RANK_IMPROVEMENT", 2),
         entry_ready_min_observations=_get_int("ENTRY_READY_MIN_OBSERVATIONS", 4),

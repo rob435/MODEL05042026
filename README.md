@@ -21,7 +21,7 @@ Use that document for the actual runtime contract. This README is now an operato
 - Uses BTC daily regime as a threshold modulator, not a hard block.
 - Uses a separate intraday tradeability gate on top of the BTC macro score so `entry_ready` is blocked on weak breadth / low-efficiency / anti-momentum sessions instead of pretending every day is a momentum day.
 - Uses residual momentum by default (`MOMENTUM_REFERENCE_MODE=cluster_relative`) so the ranking is less likely to collapse into raw alt beta.
-- Supports `absolute`, `btc_relative`, `basket_relative`, `cluster_relative`, and `hybrid_relative` momentum-reference modes.
+- Supports `absolute`, `btc_relative`, `basket_relative`, and `cluster_relative` momentum-reference modes.
 - Uses dynamic correlation clusters by default, so both residual momentum and the cluster-exposure cap can react to recent co-movement instead of only a static hand-maintained map.
 - Uses Binance BTCDOM futures history as the dominance rotation signal, normalized into `falling / neutral / rising` with a `+-0.2%` neutral zone.
 - Logs every evaluated ticker on each cycle to SQLite and optionally sends Telegram alerts with cooldown control.
@@ -131,7 +131,7 @@ The default mode is a minute-aware intrabar replay:
 - it replays each future 15m bar minute by minute using historical `1m` OHLC
 - `emerging` / `entry_ready` logic sees a provisional 15m close that evolves through the bar
 - existing positions can hit TP/SL on historical minute highs and lows before the next entry decision
-- portfolio sizing is equity-based, with configurable fees, slippage, and gross exposure caps
+- portfolio sizing is wallet-balance-based for new entries, with configurable fees, slippage, and gross exposure caps
 
 The fallback mode is still available if you only want a lightweight plumbing check:
 
@@ -214,8 +214,8 @@ python backtest.py \
   --cycles 35040 \
   --end-date 2026-04-11 \
   --variant-workers 4 \
-  --grid-setting momentum_reference_mode=basket_relative,cluster_relative,hybrid_relative \
-  --grid-setting cluster_assignment_mode=dynamic,hybrid
+  --grid-setting momentum_reference_mode=basket_relative,cluster_relative \
+  --grid-setting cluster_correlation_threshold=0.60,0.70,0.80
 ```
 
 The runner now prints blunt phase messages and cache/network stats while it works, so you can tell whether it is fetching history, building the replay plan, running variants, or exporting. Single-run comprehensive backtests now also emit replay progress lines with a text progress bar, completed bar count, elapsed time, and ETA during the actual simulation loop. Variant runs emit per-variant completion lines with the completed count, per-variant runtime, total elapsed time, average variant time, and an ETA for the remaining pending variants.
@@ -253,11 +253,16 @@ With `TAKE_PROFIT_PCT=0.02`, that builds `take_profit_pct=0.015`, `0.02`, and `0
 
 Comprehensive backtest exports now include more useful exit diagnostics by default:
 
+- `backtest_equity_curve.csv`: timestamped portfolio equity snapshots through the run
+- `backtest_equity_vs_btc_daily.csv`: one row per UTC day with starting/ending equity, strategy daily return, BTC close, and BTC daily return for chart overlay work
+- `backtest_equity_curve.png`: a ready-made equity-vs-BTC PNG with BTC washed into the background for quick visual comparison, using full replay equity/BTC traces when they are available
 - `backtest_exit_summary.csv`: counts, win rate, net PnL, holding time, and average MFE/MAE by exit reason
 - `backtest_break_even_summary.csv`: arm rate, minutes-to-arm, post-arm outcomes, and a blunt saved-vs-original-stop estimate
 - `backtest_daily_exit_mix.csv`: per-day exit counts and PnL split by exit reason
 - `backtest_trades.csv`: per-trade break-even and profit-ratchet fields so you can inspect which trades actually ratcheted
 - `backtest_position_events.csv`: in-place management events such as profit-ratchet step advances
+
+Grid/variant runs now also keep per-variant exports under `variants/<variant-name>/...`, and the grid root copies the best variant's overlay files up as `best_variant_*.csv/png` so you do not have to dig through subfolders just to inspect the winning equity curve.
 
 For built-in stress testing, add one or more `--stress-profile` flags:
 
@@ -464,18 +469,17 @@ For the first VPS validation run, use [SOAK_RUN.md](deploy/SOAK_RUN.md) and star
 - Execution is currently aligned with the momentum ranking again. The bot buys the strongest `entry_ready` names, then exits them at `+2%` take profit, `-2%` stop loss, a blunt stale-position timeout after `4` hours, an optional one-step break-even stop ratchet, or an optional laddered profit ratchet that extends TP and lifts SL in place instead of closing and reopening.
 - When `PROFIT_RATCHET_ENABLED=true`, the system is intentionally not using venue-owned take profit. The engine manages TP touches and ratchet decisions itself while Bybit still owns the current stop. That is the only honest way to extend a winner in place; venue TP would close it before the ratchet logic could act.
 - `INTRADAY_REGIME_*` is now the practical no-trade layer. It only blocks `entry_ready` promotion; the engine still logs broad intrabar context on bad days so you can see what it wanted to do without actually entering.
-- `MAX_OPEN_POSITIONS` is back as a blunt portfolio safety net. It caps the total number of simultaneously open positions, while `MAX_ENTRIES_PER_REBALANCE` separately caps how many new names one rebalance pass may add.
+- `MAX_OPEN_POSITIONS` is the blunt portfolio safety net. It caps the total number of simultaneously open positions.
 - `MAX_POSITIONS_PER_CLUSTER` is the more useful anti-pileup control. It stops the book from filling with multiple names from the same current cluster even when raw position count still looks safe.
-- `MAX_ENTRIES_PER_REBALANCE` is now the clean way to cap how many fresh positions one `emerging` rebalance pass may open. It does not change ranking; it just limits how many top-ranked `entry_ready` names are allowed through in that batch.
 - `TELEGRAM_SIGNAL_ALERTS_ENABLED=false` is the clean execution-only Telegram mode. With that off, chat can be reduced to entry/exit execution messages only.
 - `OPERATOR_PAUSE_NEW_ENTRIES=true` is the blunt manual brake. The bot keeps running, logging, and snapshotting, but it will stop opening new positions.
 - `monitor.py` is the fast way to check whether the service is actually alive, drifting from venue state, or repeatedly blocking entries for control reasons without reading raw logs.
 - If a candle gap is detected mid-stream, the supervisor falls back to a fresh REST bootstrap instead of pretending state is intact.
 - Cooldown only advances after a successful alert send; a failed Telegram request does not silently suppress the next valid signal.
 - The confirmed-cycle consumer still exists because closed bars still need to advance state cleanly. It no longer emits tradeable or operator-facing confirmed tiers.
-- Analytics and exit-management env knobs now include `MAX_DAILY_STOP_LOSSES`, `STALE_POSITION_MAX_MINUTES`, `BREAK_EVEN_STOP_ENABLED`, `BREAK_EVEN_STOP_TRIGGER_FRACTION_OF_TP`, `PROFIT_RATCHET_ENABLED`, `PROFIT_RATCHET_MAX_STEPS`, `PROFIT_RATCHET_REQUIRE_ENTRY_READY`, `ANALYTICS_POST_EXIT_BARS`, `ANALYTICS_LOG_POSITION_MARKS`, and `ANALYTICS_LOG_PORTFOLIO_SNAPSHOTS`.
+- Analytics and exit-management env knobs now include `MAX_DAILY_STOP_LOSSES`, `STALE_POSITION_MAX_MINUTES`, `BREAK_EVEN_STOP_ENABLED`, `BREAK_EVEN_STOP_TRIGGER_FRACTION_OF_TP`, `PROFIT_RATCHET_ENABLED`, `PROFIT_RATCHET_MAX_STEPS`, `ANALYTICS_POST_EXIT_BARS`, `ANALYTICS_LOG_POSITION_MARKS`, and `ANALYTICS_LOG_PORTFOLIO_SNAPSHOTS`.
 - Runtime control knobs now include `RUNTIME_HEALTH_SNAPSHOT_*` and `RUNTIME_DRIFT_CHECK_*`, which govern the SQLite control-plane cadence rather than alpha logic.
-- Execution throttles now include `MAX_ENTRIES_PER_REBALANCE` for per-batch entry control and `MAX_DAILY_STOP_LOSSES` for the UTC-day kill switch.
+- Execution throttles now include `MAX_OPEN_POSITIONS`, `MAX_POSITIONS_PER_CLUSTER`, and `MAX_DAILY_STOP_LOSSES`.
 - For VPS analysis, prefer pulling the SQLite backup to the Mac and regenerating CSVs locally rather than grepping raw logs. Example:
 
 ```bash

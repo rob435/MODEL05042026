@@ -40,14 +40,11 @@ def build_config_fingerprint(settings: Settings) -> str:
         "risk_per_trade_pct": settings.risk_per_trade_pct,
         "max_open_positions": settings.max_open_positions,
         "max_positions_per_cluster": settings.max_positions_per_cluster,
-        "max_entries_per_rebalance": settings.max_entries_per_rebalance,
         "take_profit_pct": settings.take_profit_pct,
         "stop_loss_pct": settings.stop_loss_pct,
         "max_daily_stop_losses": settings.max_daily_stop_losses,
         "operator_pause_new_entries": settings.operator_pause_new_entries,
         "momentum_reference_mode": settings.momentum_reference_mode,
-        "momentum_reference_blend_btc_weight": settings.momentum_reference_blend_btc_weight,
-        "cluster_assignment_mode": settings.cluster_assignment_mode,
         "cluster_correlation_lookback_bars": settings.cluster_correlation_lookback_bars,
         "cluster_correlation_threshold": settings.cluster_correlation_threshold,
         "intraday_regime_filter_enabled": settings.intraday_regime_filter_enabled,
@@ -169,7 +166,7 @@ def build_run_manifest(
         operator_pause_new_entries=settings.operator_pause_new_entries,
         universe_size=len(settings.universe),
         momentum_reference_mode=settings.momentum_reference_mode,
-        cluster_assignment_mode=settings.cluster_assignment_mode,
+        cluster_assignment_mode="dynamic",
     )
 
 

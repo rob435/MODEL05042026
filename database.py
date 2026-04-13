@@ -369,7 +369,7 @@ class SignalDatabase:
                 operator_pause_new_entries INTEGER NOT NULL DEFAULT 0,
                 universe_size INTEGER NOT NULL DEFAULT 0,
                 momentum_reference_mode TEXT NOT NULL DEFAULT 'absolute',
-                cluster_assignment_mode TEXT NOT NULL DEFAULT 'manual',
+                cluster_assignment_mode TEXT NOT NULL DEFAULT 'dynamic',
                 notes TEXT NOT NULL DEFAULT ''
             )
             """

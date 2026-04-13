@@ -1,5 +1,12 @@
 # Decisions
 
+## 2026-04-14
+
+- Remove weak or fake config choices instead of preserving them for compatibility theater. In this pass that meant deleting `hybrid_relative`, blend-weight tuning, `CLUSTER_ASSIGNMENT_MODE`, `MAX_ENTRIES_PER_REBALANCE`, `PROFIT_RATCHET_REQUIRE_ENTRY_READY`, and `WATCHLIST_TELEGRAM_ENABLED`.
+- Keep `MOMENTUM_SKIP` and the `INTRADAY_REGIME_*` family live. Those are still active research questions, unlike the deleted knobs above.
+- Hardcode profit-ratchet advancement to require `entry_ready`. If that condition is not defensible as the default, the ratchet itself is not ready to be live.
+- Keep correlation clustering dynamic everywhere. Carrying manual or hybrid assignment modes was extra narrative surface, not a distinct strategy worth tuning.
+
 ## 2026-04-03
 
 - Chose Bybit V5 as the concrete exchange target because the spec aligns with Bybit topic semantics and closed-candle `confirm` events.
@@ -169,3 +176,8 @@
 - When profit ratchet is enabled, take-profit ownership must move from Bybit to the engine. Leaving venue TP active would close the trade before the code could decide whether to ratchet or exit.
 - Use one shared pure management helper for live execution and backtest exit state. If TP/SL/ratchet math is duplicated, parity will drift and the reconciliation layer will end up diagnosing two different systems.
 - Reconciliation must treat still-open end-of-window positions and ratchet steps as first-class events. A closed-trades-only report is not good enough once the strategy can intentionally keep a winner open past the first TP.
+- Export BTC-overlay daily equity directly from the backtest instead of making later analysis merge strategy returns and BTC closes by hand. If the comparison matters, the repo should write the joined file itself.
+- If the overlay is useful often, export the chart too. A CSV-only workflow still creates friction and makes the operator redo the same plotting step by hand.
+- Persist the detailed equity and BTC overlay traces alongside the chart files. Regenerating PNGs from only the daily summary CSV is a downgrade that throws away the replay detail the backtest already computed.
+- Keep one canonical overlay PNG filename. Writing two identical charts under different names is just output clutter.
+- Size new backtest entries from realized wallet balance, not marked-to-market equity. Unrealized PnL should affect drawdown and current equity reporting, but it should not quietly lever up the next trade.

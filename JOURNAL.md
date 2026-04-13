@@ -1,5 +1,11 @@
 # Journal
 
+## 2026-04-14
+
+- Removed weak config surface in one pass: `hybrid_relative`, `MOMENTUM_REFERENCE_BLEND_BTC_WEIGHT`, `CLUSTER_ASSIGNMENT_MODE`, `MAX_ENTRIES_PER_REBALANCE`, `PROFIT_RATCHET_REQUIRE_ENTRY_READY`, and `WATCHLIST_TELEGRAM_ENABLED`.
+- Simplified the runtime contract so residual momentum now supports only distinct reference modes (`absolute`, `btc_relative`, `basket_relative`, `cluster_relative`), clustering is always correlation-based, watchlist signals never Telegram-alert, and profit ratchet advancement always requires `entry_ready`.
+- Updated runtime metadata, env tooling, tests, and active docs so the deleted knobs no longer appear as live system controls.
+
 ## 2026-04-03
 
 - Initialized the repository from a blank directory.
@@ -432,6 +438,12 @@
   - backtest and live event streams now normalize exit reasons
   - reconciliation can now match ratchet events and window-end still-open positions
   - event streams are sorted chronologically after merge so alignment does not lie by matching the right events in the wrong order
+- Added a BTC-overlay export for comprehensive backtests:
+  - `backtest_equity_curve.csv` already had timestamped equity snapshots, but that was awkward for direct chart comparison
+  - new `backtest_equity_vs_btc_daily.csv` now joins each UTC trading day with starting/ending equity, strategy daily return, BTC close, BTC daily return, and strategy-minus-BTC spread
+  - exports now also write `equity_vs_btc.png` and `backtest_equity_curve.png` automatically when plotting libraries are available, so the overlay is visible immediately inside the backtest folder instead of living only as a CSV
+  - grid/variant runs now also emit per-variant exports under `variants/<variant-name>/...` and copy the best variant's overlay files into the grid root as `best_variant_*.csv/png`
+  - the PNG renderer now prefers full replay equity snapshots plus the replayed BTC path when that data exists, instead of flattening both lines down to one daily point
 - Added direct regression coverage for the new failure-prone pieces instead of pretending the old suite was enough:
   - simulated forward profit-ratchet lifecycle through two ratchet steps and a ratchet-stop exit
   - backtest simulator ratchet lifecycle with exported position events
@@ -441,3 +453,17 @@
   - `pytest -q` -> `96 passed`
   - `python3 -m py_compile trade_management.py config.py database.py exchange.py execution.py backtest.py reconcile.py alerting.py tests/test_execution.py tests/test_backtest.py tests/test_reconcile.py`
   - `python3 backtest.py --cycles 8 --research-fast --export-dir /tmp/model050426-ratchet-smoke --end-date 2026-04-12`
+  - `pytest -q tests/test_backtest.py` -> `28 passed`
+  - `python3 -m py_compile backtest.py tests/test_backtest.py`
+- Fixed the chart-regeneration downgrade in `backtest.py`:
+  - comprehensive exports now also write `backtest_btc_overlay_curve.csv`
+  - `_ensure_equity_overlay_exports()` now reloads both detailed curve CSVs before redrawing `equity_vs_btc.png` / `backtest_equity_curve.png`
+  - fixed the follow-up renderer bug where CSV-loaded BTC timestamps were still strings, which broke Matplotlib when mixed with datetime equity timestamps
+  - added regression coverage so a later PNG rebuild does not silently fall back to coarse daily-step lines or crash on CSV-loaded detailed rows
+- Tightened the export/output contract again:
+  - comprehensive backtests now keep only `backtest_equity_curve.png` as the canonical overlay PNG and remove the redundant `equity_vs_btc.png`
+  - best-variant exports now copy only that single canonical PNG as well
+- Changed comprehensive backtest sizing to use realized wallet balance for fresh entries:
+  - unrealized PnL still affects reported equity and drawdown
+  - new entry notional and gross-cap budget no longer expand from open-position mark-to-market gains
+  - added regression coverage so unrealized gains do not inflate the next entry size

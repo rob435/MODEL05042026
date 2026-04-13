@@ -177,11 +177,7 @@ Execution handling:
   - `MOMENTUM_REFERENCE_MODE=btc_relative` uses symbol/BTC relative momentum
   - `MOMENTUM_REFERENCE_MODE=basket_relative` uses symbol-vs-rest-of-basket relative momentum
   - `MOMENTUM_REFERENCE_MODE=cluster_relative` uses symbol-vs-recent-correlation-cluster relative momentum
-  - `MOMENTUM_REFERENCE_MODE=hybrid_relative` blends BTC-relative and basket-relative references
-- cluster labels can come from:
-  - `CLUSTER_ASSIGNMENT_MODE=manual`
-  - `CLUSTER_ASSIGNMENT_MODE=dynamic`
-  - `CLUSTER_ASSIGNMENT_MODE=hybrid`
+- cluster labels are always based on recent correlation clusters
 - concentration is constrained both by total open positions and by current cluster labels:
   - `MAX_OPEN_POSITIONS`
   - `MAX_POSITIONS_PER_CLUSTER`
@@ -268,7 +264,6 @@ Constraints:
   - `btc_relative`: symbol price divided by BTC price
   - `basket_relative`: symbol price divided by the equal-weight normalized basket of the rest of the universe
   - `cluster_relative`: symbol price divided by the equal-weight normalized basket of recent correlation-cluster peers
-  - `hybrid_relative`: weighted blend of BTC-relative and basket-relative references
 
 ### 8.3 Curvature
 
@@ -540,21 +535,10 @@ Telegram alerting is handled by [alerting.py](alerting.py).
 
 Event alerts are sent for:
 
-- `watchlist`, only if enabled
 - `emerging`
 - `entry_ready`
 
-### 16.2 Watchlist Telegram suppression
-
-`watchlist` Telegram sends are controlled by:
-
-- `WATCHLIST_TELEGRAM_ENABLED`
-
-Default:
-
-- `false`
-
-Watchlist rows are still logged even when Telegram is disabled for them.
+Watchlist rows are still logged, but `watchlist` never sends Telegram alerts.
 
 The `entry_ready` tier uses the same intrabar observation history as `watchlist` and `emerging`, but it is emitted as its own signal kind with distinct promotion and cooldown thresholds.
 
@@ -650,7 +634,7 @@ Operator controls:
 
 - `OPERATOR_PAUSE_NEW_ENTRIES=true` blocks fresh entries without shutting the process down
 - `MAX_DAILY_STOP_LOSSES` blocks new entries after enough stop losses in the UTC day
-- `MAX_OPEN_POSITIONS`, `MAX_POSITIONS_PER_CLUSTER`, and `MAX_ENTRIES_PER_REBALANCE` remain live guardrails
+- `MAX_OPEN_POSITIONS`, `MAX_POSITIONS_PER_CLUSTER`, and `MAX_DAILY_STOP_LOSSES` remain live guardrails
 
 Position drift monitoring:
 

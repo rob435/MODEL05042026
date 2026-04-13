@@ -41,7 +41,6 @@ def test_localize_env_text_applies_safe_research_defaults() -> None:
             "SQLITE_PATH=/opt/MODEL05042026/data/signals.sqlite3",
             "BACKTEST_CACHE_PATH=/opt/MODEL05042026/data/backtest-candles.sqlite3",
             "TELEGRAM_SIGNAL_ALERTS_ENABLED=true",
-            "WATCHLIST_TELEGRAM_ENABLED=true",
             "BYBIT_API_KEY=REPLACE_WITH_DEMO_KEY",
         ]
     )
@@ -51,7 +50,6 @@ def test_localize_env_text_applies_safe_research_defaults() -> None:
     assert "SQLITE_PATH=signals.sqlite3" in localized
     assert "BACKTEST_CACHE_PATH=.cache/backtest_candles.sqlite3" in localized
     assert "TELEGRAM_SIGNAL_ALERTS_ENABLED=false" in localized
-    assert "WATCHLIST_TELEGRAM_ENABLED=false" in localized
     assert "BYBIT_API_KEY=" in localized
 
 

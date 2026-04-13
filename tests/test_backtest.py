@@ -4,6 +4,7 @@ import asyncio
 import pickle
 import sys
 from dataclasses import replace
+from datetime import datetime
 from pathlib import Path
 
 import pytest
@@ -84,11 +85,20 @@ def test_comprehensive_backtest_variants_can_resume_from_checkpoint(tmp_path: Pa
 def test_export_variant_run_result_writes_ranked_outputs(tmp_path: Path) -> None:
     db_path = tmp_path / "variant.sqlite3"
     _seed_trade_analytics_db(db_path)
+    best_export_dir = tmp_path / "best-variant-export"
+    best_export_dir.mkdir(parents=True, exist_ok=True)
+    for name in (
+        "backtest_equity_vs_btc_daily.csv",
+        "backtest_daily.csv",
+        "backtest_equity_curve.png",
+    ):
+        (best_export_dir / name).write_text("stub", encoding="utf-8")
     result = BacktestVariantRunResult(
         variants=[
             BacktestVariantSummary(
                 name="a",
                 database_path=str(db_path),
+                export_dir_path=str(best_export_dir),
                 run_seconds=12.5,
                 trade_count=3,
                 wins=2,
@@ -103,6 +113,7 @@ def test_export_variant_run_result_writes_ranked_outputs(tmp_path: Path) -> None
             BacktestVariantSummary(
                 name="b",
                 database_path=str(db_path),
+                export_dir_path=None,
                 run_seconds=10.0,
                 trade_count=2,
                 wins=1,
@@ -118,6 +129,7 @@ def test_export_variant_run_result_writes_ranked_outputs(tmp_path: Path) -> None
         best_variant=BacktestVariantSummary(
             name="a",
             database_path=str(db_path),
+            export_dir_path=str(best_export_dir),
             run_seconds=12.5,
             trade_count=3,
             wins=2,
@@ -142,6 +154,9 @@ def test_export_variant_run_result_writes_ranked_outputs(tmp_path: Path) -> None
     assert (tmp_path / "variant-export" / "variant_ranked_summary.csv").exists()
     assert (tmp_path / "variant-export" / "variant_best_summary.csv").exists()
     assert (tmp_path / "variant-export" / "best_variant_trades.csv").exists()
+    assert (tmp_path / "variant-export" / "best_variant_backtest_equity_vs_btc_daily.csv").exists()
+    assert (tmp_path / "variant-export" / "best_variant_backtest_daily.csv").exists()
+    assert (tmp_path / "variant-export" / "best_variant_backtest_equity_curve.png").exists()
 
 
 def test_format_variant_run_result_includes_elapsed_and_runtime() -> None:
@@ -302,7 +317,6 @@ def test_comprehensive_backtest_exports_detailed_exit_files(tmp_path: Path) -> N
             skipped_duplicate_ticker=0,
             skipped_max_open_positions=0,
             skipped_cluster_limit=0,
-            skipped_max_entries_per_rebalance=0,
             skipped_daily_stop_losses=0,
             skipped_gross_exposure_cap=0,
             skipped_too_small=0,
@@ -367,6 +381,15 @@ def test_comprehensive_backtest_exports_detailed_exit_files(tmp_path: Path) -> N
                 drawdown_pct=0.01,
             )
         ],
+        btc_daily_history=[
+            (int(datetime.fromisoformat("2026-04-11T00:00:00+00:00").timestamp() * 1000), 98_000.0),
+            (int(datetime.fromisoformat("2026-04-12T00:00:00+00:00").timestamp() * 1000), 100_000.0),
+        ],
+        btc_overlay_history=[
+            (int(datetime.fromisoformat("2026-04-12T00:00:00+00:00").timestamp() * 1000), 99_100.0),
+            (int(datetime.fromisoformat("2026-04-12T06:00:00+00:00").timestamp() * 1000), 100_300.0),
+            (int(datetime.fromisoformat("2026-04-12T12:00:00+00:00").timestamp() * 1000), 99_700.0),
+        ],
     )
 
     export_comprehensive_backtest(result, export_dir=str(tmp_path / "export"))
@@ -375,10 +398,170 @@ def test_comprehensive_backtest_exports_detailed_exit_files(tmp_path: Path) -> N
     assert (tmp_path / "export" / "backtest_exit_summary.csv").exists()
     assert (tmp_path / "export" / "backtest_break_even_summary.csv").exists()
     assert (tmp_path / "export" / "backtest_daily_exit_mix.csv").exists()
+    assert (tmp_path / "export" / "backtest_equity_vs_btc_daily.csv").exists()
+    assert (tmp_path / "export" / "backtest_btc_overlay_curve.csv").exists()
+    assert (tmp_path / "export" / "backtest_equity_curve.png").exists()
+    assert not (tmp_path / "export" / "equity_vs_btc.png").exists()
+    overlay_csv = (tmp_path / "export" / "backtest_equity_vs_btc_daily.csv").read_text(encoding="utf-8")
+    btc_curve_csv = (tmp_path / "export" / "backtest_btc_overlay_curve.csv").read_text(encoding="utf-8")
+    assert "day,trades,wins,losses,starting_equity_usd,ending_equity_usd,strategy_daily_return_pct,strategy_net_pnl_usd,btc_close,btc_daily_return_pct,strategy_minus_btc_return_pct" in overlay_csv
+    assert "timestamp,btc_close" in btc_curve_csv
+    assert "2026-04-12T06:00:00+00:00,100300.0" in btc_curve_csv
+    assert "2026-04-12,2,1,1,10000.0,10016.0,0.0016,16.0,100000.0,0.020408163265306145," in overlay_csv
     assert "Configured exits: tp=2.00% sl=2.00% break_even_trigger=1.50%" in rendered
     assert "Exit summary" in rendered
     assert "Break-even stop" in rendered
     assert "estimated_saved_vs_initial_stop_usd=20.00" in rendered
+
+
+def test_ensure_equity_overlay_exports_reuses_detailed_curve_csvs(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    export_dir = tmp_path / "export"
+    export_dir.mkdir()
+    (export_dir / "equity_vs_btc.png").write_text("legacy", encoding="utf-8")
+    backtest._write_csv(
+        export_dir / "backtest_equity_vs_btc_daily.csv",
+        [
+            {
+                "day": "2026-04-12",
+                "starting_equity_usd": 10_000.0,
+                "ending_equity_usd": 10_050.0,
+                "btc_close": 100_000.0,
+            }
+        ],
+    )
+    backtest._write_csv(
+        export_dir / "backtest_equity_curve.csv",
+        [
+            {"timestamp": "2026-04-12T00:00:00+00:00", "equity_usd": 10_000.0},
+            {"timestamp": "2026-04-12T00:01:00+00:00", "equity_usd": 10_025.0},
+        ],
+    )
+    backtest._write_csv(
+        export_dir / "backtest_btc_overlay_curve.csv",
+        [
+            {"timestamp": "2026-04-12T00:00:00+00:00", "btc_close": 99_500.0},
+            {"timestamp": "2026-04-12T00:01:00+00:00", "btc_close": 100_100.0},
+        ],
+    )
+
+    calls: list[dict[str, object]] = []
+
+    def _fake_export(
+        rows,
+        *,
+        output_path,
+        result=None,
+        detailed_equity_rows=None,
+        detailed_btc_rows=None,
+    ) -> None:
+        calls.append(
+            {
+                "name": output_path.name,
+                "rows": rows,
+                "result": result,
+                "detailed_equity_rows": detailed_equity_rows,
+                "detailed_btc_rows": detailed_btc_rows,
+            }
+        )
+
+    monkeypatch.setattr(backtest, "_export_equity_vs_btc_png", _fake_export)
+
+    backtest._ensure_equity_overlay_exports(export_dir)
+
+    assert [call["name"] for call in calls] == ["backtest_equity_curve.png"]
+    assert not (export_dir / "equity_vs_btc.png").exists()
+    for call in calls:
+        assert call["result"] is None
+        assert call["detailed_equity_rows"] == [
+            {"timestamp": "2026-04-12T00:00:00+00:00", "equity_usd": "10000.0"},
+            {"timestamp": "2026-04-12T00:01:00+00:00", "equity_usd": "10025.0"},
+        ]
+        assert call["detailed_btc_rows"] == [
+            {"timestamp": "2026-04-12T00:00:00+00:00", "btc_close": "99500.0"},
+            {"timestamp": "2026-04-12T00:01:00+00:00", "btc_close": "100100.0"},
+        ]
+
+
+def test_process_entries_uses_wallet_balance_not_unrealized_equity() -> None:
+    settings = Settings(
+        max_open_positions=2,
+        take_profit_pct=0.02,
+        stop_loss_pct=0.02,
+        risk_per_trade_pct=0.01,
+    )
+    simulator = HistoricalBacktestSimulator(settings)
+    simulator.positions["OPENUSDT"] = SimulatedPosition(
+        ticker="OPENUSDT",
+        quantity=10.0,
+        entry_price=100.0,
+        raw_entry_price=100.0,
+        notional_usd=1000.0,
+        opened_at_ms=0,
+        entry_stage="emerging",
+        entry_signal_kind="entry_ready",
+        cluster_label="manual:layer1",
+        entry_diagnostics="ref=cluster_relative:manual:layer1",
+        take_profit_price=102.0,
+        stop_loss_price=98.0,
+        entry_fee_usd=0.0,
+        entry_slippage_usd=0.0,
+    )
+
+    simulator.process_entries(
+        timestamp_ms=60_000,
+        ranked_signals=[
+            RankedSignal(
+                stage="emerging",
+                signal_kind="entry_ready",
+                ticker="NEWUSDT",
+                current_price=100.0,
+                momentum_z=2.0,
+                curvature=0.2,
+                hurst=0.7,
+                regime_score=2,
+                composite_score=1.4,
+                rank=1,
+                persistence_hits=0,
+                alerted=False,
+                cluster_label="manual:layer2",
+                entry_diagnostics="ref=cluster_relative:manual:layer2",
+            )
+        ],
+        mark_prices={"OPENUSDT": 120.0, "NEWUSDT": 100.0},
+    )
+
+    assert simulator.current_equity_usd({"OPENUSDT": 120.0, "NEWUSDT": 100.0}) > simulator.current_wallet_balance_usd()
+    assert simulator.current_wallet_balance_usd() == pytest.approx(100_000.0 - (50_000.0 * settings.backtest_fee_rate))
+    assert simulator.positions["NEWUSDT"].notional_usd == pytest.approx(50_000.0)
+
+
+def test_export_equity_vs_btc_png_accepts_csv_loaded_detailed_rows(tmp_path: Path) -> None:
+    rows = [
+        {
+            "day": "2026-04-12",
+            "starting_equity_usd": "10000.0",
+            "ending_equity_usd": "10050.0",
+            "btc_close": "100000.0",
+        }
+    ]
+
+    backtest._export_equity_vs_btc_png(
+        rows,
+        output_path=tmp_path / "chart.png",
+        detailed_equity_rows=[
+            {"timestamp": "2026-04-12T00:00:00+00:00", "equity_usd": "10000.0"},
+            {"timestamp": "2026-04-12T00:01:00+00:00", "equity_usd": "10025.0"},
+        ],
+        detailed_btc_rows=[
+            {"timestamp": "2026-04-12T00:00:00+00:00", "btc_close": "99500.0"},
+            {"timestamp": "2026-04-12T00:01:00+00:00", "btc_close": "100100.0"},
+        ],
+    )
+
+    assert (tmp_path / "chart.png").exists()
 
 
 def test_safe_variant_worker_count_caps_workers_on_low_memory(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1111,9 +1294,11 @@ async def _exercise_comprehensive_backtest_with_unchanged_provisional(tmp_path: 
         "CCCUSDT": list(zip(timestamps, [100.0 - (idx * 0.1) for idx in range(total_cycles)])),
         "BTCUSDT": list(zip(timestamps, [40_000.0 + (idx * 20.0) for idx in range(total_cycles)])),
     }
+    base_day_index = base_ms // day_ms
+    btc_start_index = max(0, base_day_index - settings.btc_daily_lookback - 5)
     btc_daily_history = [
-        (idx * day_ms, 20_000.0 + (idx * 15.0))
-        for idx in range(settings.btc_daily_lookback + 80)
+        ((btc_start_index + idx) * day_ms, 20_000.0 + (idx * 15.0))
+        for idx in range(settings.btc_daily_lookback + 20)
     ]
     confirmed_plan = build_replay_plan(
         history_by_symbol=history,
@@ -1308,11 +1493,21 @@ async def _exercise_comprehensive_backtest_variants(tmp_path: Path) -> None:
         sqlite_path=str(tmp_path / "variants.sqlite3"),
         variants=variants,
         max_workers=2,
+        export_base_dir=str(tmp_path / "variant-exports"),
     )
 
     assert {row.name for row in result.variants} == {"tp_2pct", "tp_4pct"}
     assert len(result.variants) == 2
     assert all(row.database_path.endswith(".sqlite3") for row in result.variants)
+    assert all(row.export_dir_path for row in result.variants)
+    assert all(
+        (Path(str(row.export_dir_path)) / "backtest_equity_vs_btc_daily.csv").exists()
+        for row in result.variants
+    )
+    assert all(
+        (Path(str(row.export_dir_path)) / "backtest_daily.csv").exists()
+        for row in result.variants
+    )
     assert result.best_variant is not None
 
 

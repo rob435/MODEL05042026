@@ -19,7 +19,6 @@ def test_load_settings_reads_dotenv_and_overrides_existing_env(monkeypatch, tmp_
         "ENTRY_NOTIONAL_USD=250\n"
         "RISK_PER_TRADE_PCT=0.015\n"
         "MAX_OPEN_POSITIONS=5\n"
-        "MAX_ENTRIES_PER_REBALANCE=2\n"
         "INTRADAY_REGIME_FILTER_ENABLED=false\n"
         "INTRADAY_REGIME_LOOKBACK_BARS=20\n"
         "INTRADAY_REGIME_MIN_BREADTH=0.6\n"
@@ -51,7 +50,6 @@ def test_load_settings_reads_dotenv_and_overrides_existing_env(monkeypatch, tmp_
     assert settings.entry_notional_usd == 250
     assert settings.risk_per_trade_pct == 0.015
     assert settings.max_open_positions == 5
-    assert settings.max_entries_per_rebalance == 2
     assert settings.intraday_regime_filter_enabled is False
     assert settings.intraday_regime_lookback_bars == 20
     assert settings.intraday_regime_min_breadth == 0.6
@@ -110,9 +108,7 @@ def test_load_settings_reads_backtest_controls(monkeypatch, tmp_path: Path) -> N
         "BACKTEST_UNIVERSE_POLICY=strict\n"
         "BACKTEST_MIN_ACTIVE_UNIVERSE=12\n"
         "MAX_POSITIONS_PER_CLUSTER=2\n"
-        "MOMENTUM_REFERENCE_MODE=hybrid_relative\n"
-        "MOMENTUM_REFERENCE_BLEND_BTC_WEIGHT=0.4\n"
-        "CLUSTER_ASSIGNMENT_MODE=hybrid\n"
+        "MOMENTUM_REFERENCE_MODE=cluster_relative\n"
         "CLUSTER_CORRELATION_LOOKBACK_BARS=64\n"
         "CLUSTER_CORRELATION_THRESHOLD=0.82\n",
         encoding="utf-8",
@@ -134,8 +130,6 @@ def test_load_settings_reads_backtest_controls(monkeypatch, tmp_path: Path) -> N
     assert settings.backtest_universe_policy == "strict"
     assert settings.backtest_min_active_universe == 12
     assert settings.max_positions_per_cluster == 2
-    assert settings.momentum_reference_mode == "hybrid_relative"
-    assert settings.momentum_reference_blend_btc_weight == 0.4
-    assert settings.cluster_assignment_mode == "hybrid"
+    assert settings.momentum_reference_mode == "cluster_relative"
     assert settings.cluster_correlation_lookback_bars == 64
     assert settings.cluster_correlation_threshold == 0.82

@@ -23,7 +23,6 @@ from trade_management import (
     profit_ratchet_can_advance,
     profit_ratchet_prices,
 )
-from universe import ticker_cluster
 
 LOGGER = logging.getLogger(__name__)
 
@@ -119,7 +118,7 @@ class ExecutionEngine:
             str(self.settings.risk_per_trade_pct)
         )
         if risk_budget_usd <= 0:
-            raise ValueError("Available balance is zero; cannot size a new trade")
+            raise ValueError("Available wallet balance is zero; cannot size a new trade")
         notional_usd = risk_budget_usd / Decimal(str(self.settings.stop_loss_pct))
         if notional_usd <= 0:
             raise ValueError("Computed risk notional is zero; cannot size a new trade")
@@ -343,11 +342,6 @@ class ExecutionEngine:
         return float(np.std(returns, ddof=1))
 
     def _current_cluster_labels(self, stage: str) -> dict[str, str]:
-        if self.settings.cluster_assignment_mode == "manual":
-            return {
-                symbol: f"manual:{ticker_cluster(symbol)}"
-                for symbol in self.settings.universe
-            }
         include_provisional = stage == "emerging"
         price_history_by_symbol = {
             symbol: self.state.get_prices(symbol, include_provisional=include_provisional)
@@ -360,18 +354,7 @@ class ExecutionEngine:
             lookback_bars=max(self.settings.cluster_correlation_lookback_bars, 3),
             threshold=self.settings.cluster_correlation_threshold,
         )
-        if self.settings.cluster_assignment_mode == "dynamic":
-            return labels
-        if self.settings.cluster_assignment_mode == "hybrid":
-            resolved: dict[str, str] = {}
-            for symbol in self.settings.universe:
-                label = labels.get(symbol)
-                if label is None or label.startswith("solo:"):
-                    resolved[symbol] = f"manual:{ticker_cluster(symbol)}"
-                else:
-                    resolved[symbol] = label
-            return resolved
-        raise ValueError(f"Unsupported CLUSTER_ASSIGNMENT_MODE: {self.settings.cluster_assignment_mode}")
+        return labels
 
     async def _log_runtime_event(
         self,
@@ -397,7 +380,7 @@ class ExecutionEngine:
         cluster_labels = self._current_cluster_labels(stage)
         counts: dict[str, int] = {}
         for ticker in open_positions:
-            cluster = cluster_labels.get(str(ticker), f"manual:{ticker_cluster(str(ticker))}")
+            cluster = cluster_labels.get(str(ticker), f"solo:{ticker}")
             counts[cluster] = counts.get(cluster, 0) + 1
         return counts
 
@@ -1336,7 +1319,6 @@ class ExecutionEngine:
         actions: list[ExecutionAction] = []
         now = self._now(cycle_time_ms=cycle_time_ms, stage="emerging")
         now_iso = now.isoformat()
-        entered_this_rebalance = 0
         open_positions = {
             row["ticker"]: row for row in await self.database.list_open_positions()
         }
@@ -1393,32 +1375,7 @@ class ExecutionEngine:
                     ticker=signal.ticker,
                 )
                 continue
-            if (
-                self.settings.max_entries_per_rebalance > 0
-                and entered_this_rebalance >= self.settings.max_entries_per_rebalance
-            ):
-                detail = (
-                    "max_entries_per_rebalance_reached "
-                    f"count={entered_this_rebalance} "
-                    f"limit={self.settings.max_entries_per_rebalance}"
-                )
-                actions.append(
-                    ExecutionAction(
-                        ticker=signal.ticker,
-                        action="skip_entry",
-                        signal_kind=signal.signal_kind,
-                        detail=detail,
-                    )
-                )
-                await self._log_runtime_event(
-                    severity="warning",
-                    event_type="entry_blocked",
-                    detail=detail,
-                    stage="emerging",
-                    ticker=signal.ticker,
-                )
-                continue
-            cluster = signal.cluster_label or f"manual:{ticker_cluster(signal.ticker)}"
+            cluster = signal.cluster_label or f"solo:{signal.ticker}"
             if (
                 self.settings.max_positions_per_cluster > 0
                 and cluster_counts.get(cluster, 0) >= self.settings.max_positions_per_cluster
@@ -1587,7 +1544,7 @@ class ExecutionEngine:
 
                 notes = (
                     f"Bybit live demo order placed. Risk={self.settings.risk_per_trade_pct * 100:.2f}% "
-                    f"of available balance. "
+                    f"of available wallet balance. "
                     + (
                         "Venue TP=disabled (engine-managed profit ratchet/local TP). "
                         if self.settings.profit_ratchet_enabled
@@ -1680,7 +1637,6 @@ class ExecutionEngine:
                     phase="open",
                 )
                 open_positions[signal.ticker] = {"id": position_id}
-                entered_this_rebalance += 1
                 continue
 
             quantity = self._estimate_quantity(signal.current_price)
@@ -1830,5 +1786,4 @@ class ExecutionEngine:
             )
             open_positions[signal.ticker] = {"id": position_id}
             cluster_counts[cluster] = cluster_counts.get(cluster, 0) + 1
-            entered_this_rebalance += 1
         return actions

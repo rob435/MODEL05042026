@@ -10,7 +10,6 @@ SAFE_LOCAL_OVERRIDES = {
     "SQLITE_PATH": "signals.sqlite3",
     "BACKTEST_CACHE_PATH": ".cache/backtest_candles.sqlite3",
     "TELEGRAM_SIGNAL_ALERTS_ENABLED": "false",
-    "WATCHLIST_TELEGRAM_ENABLED": "false",
     "BYBIT_API_KEY": "",
     "BYBIT_API_SECRET": "",
     "TELEGRAM_BOT_TOKEN": "",

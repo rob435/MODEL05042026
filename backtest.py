@@ -14,7 +14,7 @@ import tempfile
 import time
 from collections import defaultdict
 from concurrent.futures import ProcessPoolExecutor
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -46,6 +46,14 @@ from replay import ReplayPlan, build_replay_plan, fetch_replay_plan
 from report import ReportSummary, format_report, load_report_summary
 from signal_engine import RankedSignal, SignalEngine
 from state import MarketState
+from trade_management import (
+    break_even_trigger_price,
+    infer_exit_event,
+    initial_stop_loss_price,
+    initial_take_profit_price,
+    profit_ratchet_can_advance,
+    profit_ratchet_prices,
+)
 from universe import ticker_cluster
 
 
@@ -188,10 +196,27 @@ class SimulatedPosition:
     stop_loss_price: float
     entry_fee_usd: float
     entry_slippage_usd: float
+    initial_take_profit_price: float | None = None
+    initial_stop_loss_price: float | None = None
+    break_even_stop_active: bool = False
+    break_even_armed_at_ms: int | None = None
+    profit_ratchet_step: int = 0
+    profit_ratchet_adjustments: int = 0
+    last_profit_ratchet_at_ms: int | None = None
     mfe_pct: float = 0.0
     mae_pct: float = 0.0
     peak_favorable_price: float | None = None
     peak_adverse_price: float | None = None
+
+
+@dataclass(slots=True)
+class BacktestPositionEvent:
+    timestamp: str
+    ticker: str
+    side: str
+    event: str
+    reason: str | None = None
+    detail: str = ""
 
 
 @dataclass(slots=True)
@@ -222,6 +247,16 @@ class BacktestTrade:
     post_exit_best_pct: float | None = None
     post_exit_worst_pct: float | None = None
     volatility_pct: float | None = None
+    take_profit_price_at_entry: float | None = None
+    stop_loss_price_at_entry: float | None = None
+    take_profit_price_at_exit: float | None = None
+    stop_loss_price_at_exit: float | None = None
+    break_even_stop_armed: bool = False
+    break_even_armed_at: str | None = None
+    minutes_to_break_even_arm: float | None = None
+    profit_ratchet_step: int = 0
+    profit_ratchet_adjustments: int = 0
+    last_profit_ratchet_at: str | None = None
 
 
 @dataclass(slots=True)
@@ -273,11 +308,20 @@ class TickerBacktestSummary:
     gross_pnl_usd: float
     net_pnl_usd: float
     avg_pnl_pct: float
+    take_profit_count: int
+    stop_loss_count: int
+    break_even_stop_count: int
+    profit_ratchet_stop_count: int
+    stale_timeout_count: int
+    forced_exit_count: int
 
 
 @dataclass(slots=True)
 class ComprehensiveBacktestSummary:
     mode: str
+    configured_take_profit_pct: float
+    configured_stop_loss_pct: float
+    configured_break_even_trigger_pct: float | None
     starting_equity_usd: float
     ending_equity_usd: float
     total_return_pct: float
@@ -302,6 +346,10 @@ class ComprehensiveBacktestSummary:
     avg_volatility_pct: float | None
     take_profits: int
     stop_losses: int
+    break_even_stop_exits: int
+    profit_ratchet_stop_exits: int
+    profit_ratchet_adjustments: int
+    stale_timeouts: int
     forced_exits: int
     entry_ready_signals: int
     entries_filled: int
@@ -324,6 +372,7 @@ class ComprehensiveBacktestResult:
     summary: ComprehensiveBacktestSummary
     trades: list[BacktestTrade]
     equity_curve: list[EquitySnapshot]
+    position_events: list[BacktestPositionEvent] = field(default_factory=list)
 
 
 @dataclass(slots=True)
@@ -829,6 +878,35 @@ def _build_stress_variant_specs(
     return specs
 
 
+def _build_take_profit_neighbor_specs(
+    settings: Settings,
+    *,
+    step_pct: float | None,
+    neighbor_count: int,
+) -> list[BacktestVariantSpec]:
+    if step_pct is None:
+        return []
+    if step_pct <= 0:
+        raise ValueError("--tp-neighbor-step-pct must be positive")
+    if neighbor_count <= 0:
+        raise ValueError("--tp-neighbor-count must be positive")
+    base_tp = settings.take_profit_pct
+    neighbors: list[BacktestVariantSpec] = []
+    seen: set[float] = set()
+    for offset in range(-neighbor_count, neighbor_count + 1):
+        take_profit_pct = round(base_tp + (offset * step_pct), 10)
+        if take_profit_pct <= 0 or take_profit_pct in seen:
+            continue
+        seen.add(take_profit_pct)
+        neighbors.append(
+            BacktestVariantSpec(
+                name=f"take_profit_pct={take_profit_pct}",
+                overrides={"take_profit_pct": take_profit_pct},
+            )
+        )
+    return neighbors
+
+
 def _combine_variant_specs(
     grid_variants: list[BacktestVariantSpec],
     stress_variants: list[BacktestVariantSpec],
@@ -1215,6 +1293,16 @@ def _mean(values: list[float]) -> float | None:
     return sum(values) / len(values) if values else None
 
 
+def _median(values: list[float]) -> float | None:
+    if not values:
+        return None
+    ordered = sorted(values)
+    midpoint = len(ordered) // 2
+    if len(ordered) % 2 == 1:
+        return ordered[midpoint]
+    return (ordered[midpoint - 1] + ordered[midpoint]) / 2.0
+
+
 def _set_btc_daily_state(
     state: MarketState,
     btc_daily_history: list[tuple[int, float]],
@@ -1278,6 +1366,7 @@ class HistoricalBacktestSimulator:
         self.max_open_positions_observed = 0
         self.stop_loss_exits_by_day: dict[str, int] = defaultdict(int)
         self.post_exit_trackers: list[PostExitTracker] = []
+        self.position_events: list[BacktestPositionEvent] = []
 
     @property
     def slippage_rate(self) -> float:
@@ -1288,6 +1377,68 @@ class HistoricalBacktestSimulator:
 
     def _exit_fill_price(self, raw_price: float) -> float:
         return raw_price * (1.0 - self.slippage_rate)
+
+    def _break_even_trigger_price(self, position: SimulatedPosition) -> float | None:
+        return break_even_trigger_price(position.entry_price, self.settings)
+
+    def _stale_reference_ms(self, position: SimulatedPosition) -> int:
+        return position.last_profit_ratchet_at_ms or position.opened_at_ms
+
+    def _eligible_signal_map(
+        self,
+        ranked_signals: list[RankedSignal],
+    ) -> dict[str, RankedSignal]:
+        return {
+            signal.ticker: signal
+            for signal in ranked_signals
+            if signal.signal_kind == "entry_ready"
+        }
+
+    def _should_advance_profit_ratchet(
+        self,
+        *,
+        position: SimulatedPosition,
+        signal: RankedSignal | None,
+    ) -> bool:
+        return profit_ratchet_can_advance(
+            self.settings,
+            current_step=position.profit_ratchet_step,
+            signal_kind=signal.signal_kind if signal is not None else None,
+        )
+
+    def _advance_profit_ratchet(
+        self,
+        *,
+        position: SimulatedPosition,
+        ticker: str,
+        timestamp_ms: int,
+        signal: RankedSignal | None,
+    ) -> None:
+        next_step = position.profit_ratchet_step + 1
+        new_take_profit_price, new_stop_loss_price = profit_ratchet_prices(
+            position.entry_price,
+            self.settings,
+            next_step=next_step,
+        )
+        position.take_profit_price = new_take_profit_price
+        position.stop_loss_price = new_stop_loss_price
+        position.break_even_stop_active = True
+        position.profit_ratchet_step = next_step
+        position.profit_ratchet_adjustments += 1
+        position.last_profit_ratchet_at_ms = timestamp_ms
+        self.position_events.append(
+            BacktestPositionEvent(
+                timestamp=_timestamp_iso(timestamp_ms),
+                ticker=ticker,
+                side="LONG",
+                event="ratchet",
+                reason=f"step={next_step}",
+                detail=(
+                    f"signal_kind={(signal.signal_kind if signal is not None else 'none')} "
+                    f"tp={new_take_profit_price:.6f} sl={new_stop_loss_price:.6f}"
+                ),
+            )
+        )
 
     def _unrealized_pnl_usd(self, mark_prices: dict[str, float]) -> float:
         pnl = 0.0
@@ -1448,6 +1599,28 @@ class HistoricalBacktestSimulator:
             holding_minutes=holding_minutes,
             mfe_pct=position.mfe_pct,
             mae_pct=position.mae_pct,
+            take_profit_price_at_entry=position.initial_take_profit_price,
+            stop_loss_price_at_entry=position.initial_stop_loss_price,
+            take_profit_price_at_exit=position.take_profit_price,
+            stop_loss_price_at_exit=position.stop_loss_price,
+            break_even_stop_armed=position.break_even_stop_active,
+            break_even_armed_at=(
+                _timestamp_iso(position.break_even_armed_at_ms)
+                if position.break_even_armed_at_ms is not None
+                else None
+            ),
+            minutes_to_break_even_arm=(
+                (position.break_even_armed_at_ms - position.opened_at_ms) / 60_000.0
+                if position.break_even_armed_at_ms is not None
+                else None
+            ),
+            profit_ratchet_step=position.profit_ratchet_step,
+            profit_ratchet_adjustments=position.profit_ratchet_adjustments,
+            last_profit_ratchet_at=(
+                _timestamp_iso(position.last_profit_ratchet_at_ms)
+                if position.last_profit_ratchet_at_ms is not None
+                else None
+            ),
         )
         self.trades.append(trade)
         self._track_post_exit_trade(len(self.trades) - 1, ticker, exit_price)
@@ -1460,9 +1633,11 @@ class HistoricalBacktestSimulator:
         timestamp_ms: int,
         intrabar_candles: dict[str, HistoricalCandle],
         mark_prices: dict[str, float],
+        ranked_signals: list[RankedSignal] | None = None,
     ) -> set[str]:
         closed_tickers: set[str] = set()
         self.update_post_exit_trackers(intrabar_candles)
+        signal_map = self._eligible_signal_map(ranked_signals or [])
         for ticker in list(self.positions):
             position = self.positions.get(ticker)
             candle = intrabar_candles.get(ticker)
@@ -1470,33 +1645,66 @@ class HistoricalBacktestSimulator:
                 continue
             self._update_position_excursions(position, candle)
             hit_stop = candle.low_price <= position.stop_loss_price
-            hit_take_profit = candle.high_price >= position.take_profit_price
-            if hit_stop and hit_take_profit:
-                self._close_position(
-                    ticker=ticker,
-                    raw_exit_price=position.stop_loss_price,
-                    timestamp_ms=timestamp_ms,
-                    exit_reason="stop_loss",
-                    intrabar_candle=candle,
-                )
-                closed_tickers.add(ticker)
-                continue
+            stop_exit_reason = infer_exit_event(
+                entry_price=position.entry_price,
+                exit_price=position.stop_loss_price,
+                take_profit_price=position.take_profit_price,
+                stop_loss_price=position.stop_loss_price,
+                ratchet_step=position.profit_ratchet_step,
+                break_even_stop_active=position.break_even_stop_active,
+            ).replace("_exit", "")
             if hit_stop:
                 self._close_position(
                     ticker=ticker,
                     raw_exit_price=position.stop_loss_price,
                     timestamp_ms=timestamp_ms,
-                    exit_reason="stop_loss",
+                    exit_reason=stop_exit_reason,
                     intrabar_candle=candle,
                 )
                 closed_tickers.add(ticker)
                 continue
-            if hit_take_profit:
+            if candle.close_price >= position.take_profit_price:
+                signal = signal_map.get(ticker)
+                if self._should_advance_profit_ratchet(position=position, signal=signal):
+                    self._advance_profit_ratchet(
+                        position=position,
+                        ticker=ticker,
+                        timestamp_ms=timestamp_ms,
+                        signal=signal,
+                    )
+                    continue
                 self._close_position(
                     ticker=ticker,
-                    raw_exit_price=position.take_profit_price,
+                    raw_exit_price=(
+                        candle.close_price
+                        if self.settings.profit_ratchet_enabled
+                        else position.take_profit_price
+                    ),
                     timestamp_ms=timestamp_ms,
                     exit_reason="take_profit",
+                    intrabar_candle=candle,
+                )
+                closed_tickers.add(ticker)
+                continue
+            trigger_price = self._break_even_trigger_price(position)
+            if (
+                not position.break_even_stop_active
+                and trigger_price is not None
+                and candle.close_price >= trigger_price
+            ):
+                position.break_even_stop_active = True
+                position.break_even_armed_at_ms = timestamp_ms
+                position.stop_loss_price = position.entry_price
+            if (
+                self.settings.stale_position_max_minutes > 0
+                and (timestamp_ms - self._stale_reference_ms(position))
+                >= (self.settings.stale_position_max_minutes * 60_000)
+            ):
+                self._close_position(
+                    ticker=ticker,
+                    raw_exit_price=mark_prices.get(ticker, candle.close_price),
+                    timestamp_ms=timestamp_ms,
+                    exit_reason="stale_timeout",
                     intrabar_candle=candle,
                 )
                 closed_tickers.add(ticker)
@@ -1580,10 +1788,13 @@ class HistoricalBacktestSimulator:
                 entry_signal_kind=signal.signal_kind,
                 cluster_label=cluster,
                 entry_diagnostics=signal.entry_diagnostics,
-                take_profit_price=entry_price * (1.0 + self.settings.take_profit_pct),
-                stop_loss_price=entry_price * (1.0 - self.settings.stop_loss_pct),
+                take_profit_price=initial_take_profit_price(entry_price, self.settings),
+                stop_loss_price=initial_stop_loss_price(entry_price, self.settings),
                 entry_fee_usd=entry_fee_usd,
                 entry_slippage_usd=entry_slippage_usd,
+                initial_take_profit_price=initial_take_profit_price(entry_price, self.settings),
+                initial_stop_loss_price=initial_stop_loss_price(entry_price, self.settings),
+                break_even_stop_active=False,
             )
             self.entries_filled += 1
             cluster_counts[cluster] = cluster_counts.get(cluster, 0) + 1
@@ -1672,9 +1883,123 @@ def _ticker_summaries(trades: list[BacktestTrade]) -> list[TickerBacktestSummary
                 gross_pnl_usd=sum(trade.gross_pnl_usd for trade in ticker_trades),
                 net_pnl_usd=sum(trade.net_pnl_usd for trade in ticker_trades),
                 avg_pnl_pct=_mean([trade.pnl_pct for trade in ticker_trades]) or 0.0,
+                take_profit_count=sum(
+                    1 for trade in ticker_trades if trade.exit_reason == "take_profit"
+                ),
+                stop_loss_count=sum(
+                    1 for trade in ticker_trades if trade.exit_reason == "stop_loss"
+                ),
+                break_even_stop_count=sum(
+                    1 for trade in ticker_trades if trade.exit_reason == "break_even_stop"
+                ),
+                profit_ratchet_stop_count=sum(
+                    1 for trade in ticker_trades if trade.exit_reason == "profit_ratchet_stop"
+                ),
+                stale_timeout_count=sum(
+                    1 for trade in ticker_trades if trade.exit_reason == "stale_timeout"
+                ),
+                forced_exit_count=sum(
+                    1 for trade in ticker_trades if trade.exit_reason == "end_of_backtest"
+                ),
             )
         )
     rows.sort(key=lambda item: item.net_pnl_usd, reverse=True)
+    return rows
+
+
+def _exit_reason_summary_rows(trades: list[BacktestTrade]) -> list[dict[str, object]]:
+    grouped: dict[str, list[BacktestTrade]] = defaultdict(list)
+    for trade in trades:
+        grouped[trade.exit_reason].append(trade)
+    rows: list[dict[str, object]] = []
+    for exit_reason, reason_trades in sorted(
+        grouped.items(),
+        key=lambda item: (
+            -len(item[1]),
+            -sum(trade.net_pnl_usd for trade in item[1]),
+            item[0],
+        ),
+    ):
+        wins = sum(1 for trade in reason_trades if trade.net_pnl_usd > 0)
+        losses = sum(1 for trade in reason_trades if trade.net_pnl_usd < 0)
+        rows.append(
+            {
+                "exit_reason": exit_reason,
+                "trades": len(reason_trades),
+                "wins": wins,
+                "losses": losses,
+                "win_rate": (wins / len(reason_trades)) if reason_trades else 0.0,
+                "gross_pnl_usd": sum(trade.gross_pnl_usd for trade in reason_trades),
+                "net_pnl_usd": sum(trade.net_pnl_usd for trade in reason_trades),
+                "avg_net_pnl_usd": _mean([trade.net_pnl_usd for trade in reason_trades]),
+                "avg_holding_minutes": _mean([trade.holding_minutes for trade in reason_trades]),
+                "avg_mfe_pct": _mean([trade.mfe_pct for trade in reason_trades]),
+                "avg_mae_pct": _mean([trade.mae_pct for trade in reason_trades]),
+            }
+        )
+    return rows
+
+
+def _break_even_summary_row(
+    trades: list[BacktestTrade],
+    *,
+    configured_stop_loss_pct: float,
+    configured_trigger_pct: float | None,
+) -> dict[str, object]:
+    armed_trades = [trade for trade in trades if trade.break_even_stop_armed]
+    break_even_exits = [trade for trade in trades if trade.exit_reason == "break_even_stop"]
+    estimated_saved_usd = 0.0
+    for trade in break_even_exits:
+        initial_stop = trade.stop_loss_price_at_entry
+        if initial_stop is None and configured_stop_loss_pct > 0:
+            initial_stop = trade.entry_price * (1.0 - configured_stop_loss_pct)
+        if initial_stop is None:
+            continue
+        estimated_saved_usd += max(trade.exit_price - initial_stop, 0.0) * trade.quantity
+    return {
+        "break_even_enabled": int(configured_trigger_pct is not None),
+        "break_even_trigger_pct": configured_trigger_pct,
+        "armed_count": len(armed_trades),
+        "armed_fraction_of_trades": (len(armed_trades) / len(trades)) if trades else 0.0,
+        "avg_minutes_to_arm": _mean(
+            [trade.minutes_to_break_even_arm for trade in armed_trades if trade.minutes_to_break_even_arm is not None]
+        ),
+        "median_minutes_to_arm": _median(
+            [trade.minutes_to_break_even_arm for trade in armed_trades if trade.minutes_to_break_even_arm is not None]
+        ),
+        "take_profit_after_arm": sum(
+            1 for trade in armed_trades if trade.exit_reason == "take_profit"
+        ),
+        "break_even_stop_after_arm": sum(
+            1 for trade in armed_trades if trade.exit_reason == "break_even_stop"
+        ),
+        "stale_timeout_after_arm": sum(
+            1 for trade in armed_trades if trade.exit_reason == "stale_timeout"
+        ),
+        "forced_after_arm": sum(
+            1 for trade in armed_trades if trade.exit_reason == "end_of_backtest"
+        ),
+        "estimated_saved_vs_initial_stop_usd": estimated_saved_usd,
+    }
+
+
+def _daily_exit_mix_rows(trades: list[BacktestTrade]) -> list[dict[str, object]]:
+    grouped: dict[tuple[str, str], list[BacktestTrade]] = defaultdict(list)
+    for trade in trades:
+        grouped[(trade.closed_at[:10], trade.exit_reason)].append(trade)
+    rows: list[dict[str, object]] = []
+    for (day, exit_reason), bucket in sorted(grouped.items()):
+        rows.append(
+            {
+                "day": day,
+                "exit_reason": exit_reason,
+                "trades": len(bucket),
+                "wins": sum(1 for trade in bucket if trade.net_pnl_usd > 0),
+                "losses": sum(1 for trade in bucket if trade.net_pnl_usd < 0),
+                "gross_pnl_usd": sum(trade.gross_pnl_usd for trade in bucket),
+                "net_pnl_usd": sum(trade.net_pnl_usd for trade in bucket),
+            }
+        )
     return rows
 
 
@@ -1882,15 +2207,44 @@ def export_comprehensive_backtest(
     _write_csv(export_path / "backtest_equity_curve.csv", [asdict(row) for row in result.equity_curve])
     _write_csv(export_path / "backtest_daily.csv", [asdict(row) for row in result.summary.daily])
     _write_csv(export_path / "backtest_tickers.csv", [asdict(row) for row in result.summary.tickers])
+    _write_csv(export_path / "backtest_position_events.csv", [asdict(row) for row in result.position_events])
+    _write_csv(export_path / "backtest_exit_summary.csv", _exit_reason_summary_rows(result.trades))
+    _write_csv(
+        export_path / "backtest_break_even_summary.csv",
+        [
+            _break_even_summary_row(
+                result.trades,
+                configured_stop_loss_pct=result.summary.configured_stop_loss_pct,
+                configured_trigger_pct=result.summary.configured_break_even_trigger_pct,
+            )
+        ],
+    )
+    _write_csv(export_path / "backtest_daily_exit_mix.csv", _daily_exit_mix_rows(result.trades))
 
 
 def format_comprehensive_backtest(result: ComprehensiveBacktestResult) -> str:
     summary = result.summary
+    exit_rows = _exit_reason_summary_rows(result.trades)
+    break_even_row = _break_even_summary_row(
+        result.trades,
+        configured_stop_loss_pct=summary.configured_stop_loss_pct,
+        configured_trigger_pct=summary.configured_break_even_trigger_pct,
+    )
     profit_factor = "inf" if summary.profit_factor == float("inf") else (
         f"{summary.profit_factor:.3f}" if summary.profit_factor is not None else "n/a"
     )
     lines = [
         f"Backtest mode: {summary.mode}",
+        (
+            f"Configured exits: tp={summary.configured_take_profit_pct * 100:.2f}% "
+            f"sl={summary.configured_stop_loss_pct * 100:.2f}% "
+            f"break_even_trigger={summary.configured_break_even_trigger_pct * 100:.2f}%"
+            if summary.configured_break_even_trigger_pct is not None
+            else (
+                f"Configured exits: tp={summary.configured_take_profit_pct * 100:.2f}% "
+                f"sl={summary.configured_stop_loss_pct * 100:.2f}% break_even=off"
+            )
+        ),
         f"Starting equity: {summary.starting_equity_usd:.2f}",
         f"Ending equity: {summary.ending_equity_usd:.2f}",
         f"Total return: {summary.total_return_pct * 100:.2f}%",
@@ -1924,7 +2278,10 @@ def format_comprehensive_backtest(result: ComprehensiveBacktestResult) -> str:
         ),
         (
             f"Exits: take_profit={summary.take_profits} stop_loss={summary.stop_losses} "
-            f"forced={summary.forced_exits}"
+            f"break_even={summary.break_even_stop_exits} "
+            f"profit_ratchet_stop={summary.profit_ratchet_stop_exits} "
+            f"ratchet_adjustments={summary.profit_ratchet_adjustments} "
+            f"stale_timeout={summary.stale_timeouts} forced={summary.forced_exits}"
         ),
         (
             f"Entry flow: entry_ready_signals={summary.entry_ready_signals} filled={summary.entries_filled} "
@@ -1938,6 +2295,35 @@ def format_comprehensive_backtest(result: ComprehensiveBacktestResult) -> str:
         "Signal report",
         format_report(summary.signal_summary),
     ]
+    if exit_rows:
+        lines.append("")
+        lines.append("Exit summary")
+        for row in exit_rows:
+            lines.append(
+                f"  {row['exit_reason']}: trades={row['trades']} wins={row['wins']} losses={row['losses']} "
+                f"win_rate={(row['win_rate'] or 0.0) * 100:.1f}% "
+                f"net_pnl_usd={(row['net_pnl_usd'] or 0.0):.2f} "
+                f"avg_net_pnl_usd={(row['avg_net_pnl_usd'] or 0.0):.2f} "
+                f"avg_holding_min={(row['avg_holding_minutes'] or 0.0):.1f}"
+            )
+    lines.append("")
+    lines.append("Break-even stop")
+    lines.append(
+        f"  armed={break_even_row['armed_count']} "
+        f"armed_fraction={(break_even_row['armed_fraction_of_trades'] or 0.0) * 100:.1f}% "
+        f"avg_minutes_to_arm={(break_even_row['avg_minutes_to_arm'] or 0.0):.1f} "
+        f"median_minutes_to_arm={(break_even_row['median_minutes_to_arm'] or 0.0):.1f}"
+    )
+    lines.append(
+        f"  outcomes_after_arm: take_profit={break_even_row['take_profit_after_arm']} "
+        f"break_even_stop={break_even_row['break_even_stop_after_arm']} "
+        f"stale_timeout={break_even_row['stale_timeout_after_arm']} "
+        f"forced={break_even_row['forced_after_arm']}"
+    )
+    lines.append(
+        f"  estimated_saved_vs_initial_stop_usd="
+        f"{(break_even_row['estimated_saved_vs_initial_stop_usd'] or 0.0):.2f}"
+    )
     if summary.daily:
         lines.append("")
         lines.append("Daily results")
@@ -1953,7 +2339,10 @@ def format_comprehensive_backtest(result: ComprehensiveBacktestResult) -> str:
         for row in summary.tickers[:10]:
             lines.append(
                 f"  {row.ticker}: trades={row.trades} wins={row.wins} losses={row.losses} "
-                f"net_pnl_usd={row.net_pnl_usd:.2f} avg_pnl_pct={row.avg_pnl_pct * 100:.2f}%"
+                f"net_pnl_usd={row.net_pnl_usd:.2f} avg_pnl_pct={row.avg_pnl_pct * 100:.2f}% "
+                f"tp={row.take_profit_count} sl={row.stop_loss_count} "
+                f"be={row.break_even_stop_count} prs={row.profit_ratchet_stop_count} "
+                f"stale={row.stale_timeout_count}"
             )
     return "\n".join(lines)
 
@@ -1977,6 +2366,8 @@ def _format_comprehensive_comparison(
             f"  max_drawdown_pct: on={left.max_drawdown_pct * 100:.2f} off={right.max_drawdown_pct * 100:.2f}",
             f"  stop_losses: on={left.stop_losses} off={right.stop_losses}",
             f"  take_profits: on={left.take_profits} off={right.take_profits}",
+            f"  break_even_stop_exits: on={left.break_even_stop_exits} off={right.break_even_stop_exits}",
+            f"  stale_timeouts: on={left.stale_timeouts} off={right.stale_timeouts}",
             f"  entry_ready_signals: on={left.entry_ready_signals} off={right.entry_ready_signals}",
             f"  entries_filled: on={left.entries_filled} off={right.entries_filled}",
         ]
@@ -2085,6 +2476,7 @@ async def run_comprehensive_backtest_plan(
                     timestamp_ms=minute_close_ms,
                     intrabar_candles=intrabar_candles,
                     mark_prices=mark_prices,
+                    ranked_signals=emerging_signals,
                 )
                 simulator.process_entries(
                     timestamp_ms=minute_close_ms,
@@ -2157,6 +2549,14 @@ async def run_comprehensive_backtest_plan(
             f"{backtest_settings.backtest_intrabar_interval}m intrabar replay"
             + (" [research-fast]" if backtest_settings.backtest_research_fast else "")
         ),
+        configured_take_profit_pct=backtest_settings.take_profit_pct,
+        configured_stop_loss_pct=backtest_settings.stop_loss_pct,
+        configured_break_even_trigger_pct=(
+            backtest_settings.take_profit_pct
+            * min(max(backtest_settings.break_even_stop_trigger_fraction_of_tp, 0.0), 1.0)
+            if backtest_settings.break_even_stop_enabled and backtest_settings.take_profit_pct > 0
+            else None
+        ),
         starting_equity_usd=backtest_settings.backtest_starting_equity_usd,
         ending_equity_usd=ending_equity_usd,
         total_return_pct=(
@@ -2191,6 +2591,16 @@ async def run_comprehensive_backtest_plan(
         ),
         take_profits=sum(1 for trade in simulator.trades if trade.exit_reason == "take_profit"),
         stop_losses=sum(1 for trade in simulator.trades if trade.exit_reason == "stop_loss"),
+        break_even_stop_exits=sum(
+            1 for trade in simulator.trades if trade.exit_reason == "break_even_stop"
+        ),
+        profit_ratchet_stop_exits=sum(
+            1 for trade in simulator.trades if trade.exit_reason == "profit_ratchet_stop"
+        ),
+        profit_ratchet_adjustments=sum(
+            trade.profit_ratchet_adjustments for trade in simulator.trades
+        ),
+        stale_timeouts=sum(1 for trade in simulator.trades if trade.exit_reason == "stale_timeout"),
         forced_exits=sum(1 for trade in simulator.trades if trade.exit_reason == "end_of_backtest"),
         entry_ready_signals=simulator.entry_ready_signals,
         entries_filled=simulator.entries_filled,
@@ -2211,6 +2621,7 @@ async def run_comprehensive_backtest_plan(
         summary=summary,
         trades=simulator.trades,
         equity_curve=simulator.equity_curve,
+        position_events=simulator.position_events,
     )
 
 
@@ -3260,6 +3671,18 @@ def parse_args() -> argparse.Namespace:
         help="Run multiple variants against one reused replay plan. Format: KEY=value1,value2,... May be repeated.",
     )
     parser.add_argument(
+        "--tp-neighbor-step-pct",
+        type=float,
+        default=None,
+        help="Build take-profit variants around the current TAKE_PROFIT_PCT. Example: 0.005 turns 2.0%% into 1.5%% / 2.0%% / 2.5%% when --tp-neighbor-count=1.",
+    )
+    parser.add_argument(
+        "--tp-neighbor-count",
+        type=int,
+        default=1,
+        help="How many neighboring TP steps on each side to include with --tp-neighbor-step-pct.",
+    )
+    parser.add_argument(
         "--variant-workers",
         type=int,
         default=None,
@@ -3397,9 +3820,21 @@ def main() -> None:
     if args.reconcile_telegram_html and args.reconcile_live_db:
         raise ValueError("Use only one reconciliation source: --reconcile-telegram-html or --reconcile-live-db")
     db_path = str(Path(args.db).expanduser())
+    if args.tp_neighbor_step_pct is not None and any(
+        raw.split("=", 1)[0].strip() == "take_profit_pct" for raw in args.grid_setting
+    ):
+        raise ValueError("Use either --tp-neighbor-step-pct or --grid-setting take_profit_pct=..., not both")
     grid_specs = _build_variant_specs(settings, args.grid_setting)
+    tp_neighbor_specs = _build_take_profit_neighbor_specs(
+        settings,
+        step_pct=args.tp_neighbor_step_pct,
+        neighbor_count=args.tp_neighbor_count,
+    )
     stress_specs = _build_stress_variant_specs(settings, args.stress_profile)
-    variant_specs = _combine_variant_specs(grid_specs, stress_specs)
+    variant_specs = _combine_variant_specs(
+        _combine_variant_specs(grid_specs, tp_neighbor_specs),
+        stress_specs,
+    )
 
     if args.prefetch_lookback_days is not None:
         _progress(

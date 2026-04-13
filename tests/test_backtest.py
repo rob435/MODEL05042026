@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import pickle
 import sys
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -10,6 +11,10 @@ import pytest
 import backtest
 from backtest import (
     BacktestTrade,
+    ComprehensiveBacktestResult,
+    ComprehensiveBacktestSummary,
+    DailyBacktestSummary,
+    EquitySnapshot,
     BacktestVariantRunResult,
     BacktestVariantSummary,
     BacktestVariantSpec,
@@ -17,7 +22,13 @@ from backtest import (
     InMemorySignalDatabase,
     MinuteReplayPlan,
     ReplayProgressTracker,
+    SimulatedPosition,
+    TickerBacktestSummary,
+    _build_take_profit_neighbor_specs,
+    _empty_report_summary,
+    export_comprehensive_backtest,
     export_variant_run_result,
+    format_comprehensive_backtest,
     fetch_minute_replay_plan,
     format_variant_run_result,
     parse_args,
@@ -39,6 +50,7 @@ from config import Settings
 from database import SignalRecord
 from exchange import HistoricalCandle, interval_to_milliseconds
 from replay import build_replay_plan
+from signal_engine import RankedSignal
 
 
 def test_backtest_plan_generates_closed_trades(tmp_path: Path) -> None:
@@ -162,6 +174,211 @@ def test_format_variant_run_result_includes_elapsed_and_runtime() -> None:
     assert "elapsed=12.5s" in output
     assert "avg_variant=12.5s" in output
     assert "runtime=12.5s" in output
+
+
+def test_build_take_profit_neighbor_specs_uses_current_tp() -> None:
+    settings = Settings(take_profit_pct=0.02)
+    specs = _build_take_profit_neighbor_specs(
+        settings,
+        step_pct=0.005,
+        neighbor_count=1,
+    )
+    assert [spec.name for spec in specs] == [
+        "take_profit_pct=0.015",
+        "take_profit_pct=0.02",
+        "take_profit_pct=0.025",
+    ]
+
+
+def test_comprehensive_backtest_exports_detailed_exit_files(tmp_path: Path) -> None:
+    trades = [
+        BacktestTrade(
+            ticker="AAAUSDT",
+            side="LONG",
+            opened_at="2026-04-12T00:00:00+00:00",
+            closed_at="2026-04-12T01:00:00+00:00",
+            entry_stage="entry_ready",
+            entry_signal_kind="entry_ready",
+            cluster_label="L1",
+            entry_diagnostics="score=1.2",
+            exit_reason="break_even_stop",
+            quantity=10.0,
+            entry_price=100.0,
+            exit_price=100.0,
+            notional_usd=1000.0,
+            gross_pnl_usd=0.0,
+            net_pnl_usd=-2.0,
+            pnl_pct=0.0,
+            entry_fee_usd=1.0,
+            exit_fee_usd=1.0,
+            entry_slippage_usd=0.5,
+            exit_slippage_usd=0.5,
+            holding_minutes=60.0,
+            mfe_pct=0.018,
+            mae_pct=-0.004,
+            post_exit_best_pct=0.003,
+            post_exit_worst_pct=-0.002,
+            volatility_pct=0.01,
+            take_profit_price_at_entry=102.0,
+            stop_loss_price_at_entry=98.0,
+            stop_loss_price_at_exit=100.0,
+            break_even_stop_armed=True,
+            break_even_armed_at="2026-04-12T00:30:00+00:00",
+            minutes_to_break_even_arm=30.0,
+        ),
+        BacktestTrade(
+            ticker="BBBUSDT",
+            side="LONG",
+            opened_at="2026-04-12T02:00:00+00:00",
+            closed_at="2026-04-12T04:00:00+00:00",
+            entry_stage="entry_ready",
+            entry_signal_kind="entry_ready",
+            cluster_label="L2",
+            entry_diagnostics="score=0.9",
+            exit_reason="take_profit",
+            quantity=5.0,
+            entry_price=200.0,
+            exit_price=204.0,
+            notional_usd=1000.0,
+            gross_pnl_usd=20.0,
+            net_pnl_usd=18.0,
+            pnl_pct=0.02,
+            entry_fee_usd=1.0,
+            exit_fee_usd=1.0,
+            entry_slippage_usd=0.5,
+            exit_slippage_usd=0.5,
+            holding_minutes=120.0,
+            mfe_pct=0.025,
+            mae_pct=-0.006,
+            post_exit_best_pct=0.004,
+            post_exit_worst_pct=-0.003,
+            volatility_pct=0.012,
+            take_profit_price_at_entry=204.0,
+            stop_loss_price_at_entry=196.0,
+            stop_loss_price_at_exit=196.0,
+            break_even_stop_armed=True,
+            break_even_armed_at="2026-04-12T03:00:00+00:00",
+            minutes_to_break_even_arm=60.0,
+        ),
+    ]
+    result = ComprehensiveBacktestResult(
+        database_path=str(tmp_path / "sample.sqlite3"),
+        summary=ComprehensiveBacktestSummary(
+            mode="1m intrabar replay",
+            configured_take_profit_pct=0.02,
+            configured_stop_loss_pct=0.02,
+            configured_break_even_trigger_pct=0.015,
+            starting_equity_usd=10_000.0,
+            ending_equity_usd=10_016.0,
+            total_return_pct=0.0016,
+            gross_pnl_usd=20.0,
+            net_pnl_usd=16.0,
+            fees_usd=4.0,
+            slippage_usd=2.0,
+            max_drawdown_pct=0.01,
+            trade_count=2,
+            wins=1,
+            losses=1,
+            win_rate=0.5,
+            profit_factor=9.0,
+            avg_win_usd=18.0,
+            avg_loss_usd=-2.0,
+            expectancy_usd=8.0,
+            avg_holding_minutes=90.0,
+            avg_mfe_pct=0.0215,
+            avg_mae_pct=-0.005,
+            avg_post_exit_best_pct=0.0035,
+            avg_post_exit_worst_pct=-0.0025,
+            avg_volatility_pct=0.011,
+            take_profits=1,
+            stop_losses=0,
+            break_even_stop_exits=1,
+            profit_ratchet_stop_exits=0,
+            profit_ratchet_adjustments=0,
+            stale_timeouts=0,
+            forced_exits=0,
+            entry_ready_signals=3,
+            entries_filled=2,
+            skipped_duplicate_ticker=0,
+            skipped_max_open_positions=0,
+            skipped_cluster_limit=0,
+            skipped_max_entries_per_rebalance=0,
+            skipped_daily_stop_losses=0,
+            skipped_gross_exposure_cap=0,
+            skipped_too_small=0,
+            max_open_positions_observed=2,
+            signal_summary=_empty_report_summary(),
+            daily=[
+                DailyBacktestSummary(
+                    day="2026-04-12",
+                    trades=2,
+                    wins=1,
+                    losses=1,
+                    gross_pnl_usd=20.0,
+                    net_pnl_usd=16.0,
+                    fees_usd=4.0,
+                    return_pct=0.0016,
+                )
+            ],
+            tickers=[
+                TickerBacktestSummary(
+                    ticker="BBBUSDT",
+                    trades=1,
+                    wins=1,
+                    losses=0,
+                    gross_pnl_usd=20.0,
+                    net_pnl_usd=18.0,
+                avg_pnl_pct=0.02,
+                take_profit_count=1,
+                stop_loss_count=0,
+                break_even_stop_count=0,
+                profit_ratchet_stop_count=0,
+                stale_timeout_count=0,
+                forced_exit_count=0,
+            ),
+                TickerBacktestSummary(
+                    ticker="AAAUSDT",
+                    trades=1,
+                    wins=0,
+                    losses=1,
+                    gross_pnl_usd=0.0,
+                    net_pnl_usd=-2.0,
+                avg_pnl_pct=0.0,
+                take_profit_count=0,
+                stop_loss_count=0,
+                break_even_stop_count=1,
+                profit_ratchet_stop_count=0,
+                stale_timeout_count=0,
+                forced_exit_count=0,
+            ),
+            ],
+        ),
+        trades=trades,
+        equity_curve=[
+            EquitySnapshot(
+                timestamp="2026-04-12T04:00:00+00:00",
+                equity_usd=10_016.0,
+                gross_exposure_usd=0.0,
+                realized_gross_pnl_usd=20.0,
+                realized_net_pnl_usd=16.0,
+                unrealized_pnl_usd=0.0,
+                fees_usd=4.0,
+                open_positions=0,
+                drawdown_pct=0.01,
+            )
+        ],
+    )
+
+    export_comprehensive_backtest(result, export_dir=str(tmp_path / "export"))
+    rendered = format_comprehensive_backtest(result)
+
+    assert (tmp_path / "export" / "backtest_exit_summary.csv").exists()
+    assert (tmp_path / "export" / "backtest_break_even_summary.csv").exists()
+    assert (tmp_path / "export" / "backtest_daily_exit_mix.csv").exists()
+    assert "Configured exits: tp=2.00% sl=2.00% break_even_trigger=1.50%" in rendered
+    assert "Exit summary" in rendered
+    assert "Break-even stop" in rendered
+    assert "estimated_saved_vs_initial_stop_usd=20.00" in rendered
 
 
 def test_safe_variant_worker_count_caps_workers_on_low_memory(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -341,6 +558,206 @@ def test_post_exit_tracking_populates_trade_follow_through_metrics() -> None:
     assert trade.volatility_pct is not None
     assert trade.volatility_pct > 0.0
     assert simulator.post_exit_trackers == []
+
+
+def test_stale_timeout_closes_trade_in_simulator() -> None:
+    settings = Settings(stale_position_max_minutes=240)
+    simulator = HistoricalBacktestSimulator(settings)
+    simulator.positions["AAAUSDT"] = SimulatedPosition(
+        ticker="AAAUSDT",
+        quantity=1.0,
+        entry_price=100.0,
+        raw_entry_price=100.0,
+        notional_usd=100.0,
+        opened_at_ms=0,
+        entry_stage="emerging",
+        entry_signal_kind="entry_ready",
+        cluster_label="manual:layer1",
+        entry_diagnostics="ref=cluster_relative:manual:layer1",
+        take_profit_price=102.0,
+        stop_loss_price=98.0,
+        entry_fee_usd=0.0,
+        entry_slippage_usd=0.0,
+    )
+
+    closed_tickers = simulator.process_intrabar_exits(
+        timestamp_ms=240 * 60_000,
+        intrabar_candles={
+            "AAAUSDT": HistoricalCandle(
+                start_time_ms=239 * 60_000,
+                open_price=100.4,
+                high_price=101.0,
+                low_price=100.1,
+                close_price=100.6,
+            )
+        },
+        mark_prices={"AAAUSDT": 100.6},
+    )
+
+    assert closed_tickers == {"AAAUSDT"}
+    assert simulator.trades[-1].exit_reason == "stale_timeout"
+
+
+def test_break_even_stop_arms_then_exits_next_bar_in_simulator() -> None:
+    settings = Settings(
+        take_profit_pct=0.02,
+        stop_loss_pct=0.02,
+        break_even_stop_enabled=True,
+        break_even_stop_trigger_fraction_of_tp=0.75,
+    )
+    simulator = HistoricalBacktestSimulator(settings)
+    simulator.positions["AAAUSDT"] = SimulatedPosition(
+        ticker="AAAUSDT",
+        quantity=1.0,
+        entry_price=100.0,
+        raw_entry_price=100.0,
+        notional_usd=100.0,
+        opened_at_ms=0,
+        entry_stage="emerging",
+        entry_signal_kind="entry_ready",
+        cluster_label="manual:layer1",
+        entry_diagnostics="ref=cluster_relative:manual:layer1",
+        take_profit_price=102.0,
+        stop_loss_price=98.0,
+        entry_fee_usd=0.0,
+        entry_slippage_usd=0.0,
+    )
+
+    first_closed = simulator.process_intrabar_exits(
+        timestamp_ms=60_000,
+        intrabar_candles={
+                "AAAUSDT": HistoricalCandle(
+                    start_time_ms=0,
+                    open_price=100.3,
+                    high_price=101.6,
+                    low_price=100.2,
+                    close_price=101.6,
+                )
+            },
+            mark_prices={"AAAUSDT": 101.6},
+        )
+    assert first_closed == set()
+    assert simulator.positions["AAAUSDT"].break_even_stop_active is True
+    assert simulator.positions["AAAUSDT"].stop_loss_price == pytest.approx(100.0)
+
+    second_closed = simulator.process_intrabar_exits(
+        timestamp_ms=120_000,
+        intrabar_candles={
+            "AAAUSDT": HistoricalCandle(
+                start_time_ms=60_000,
+                open_price=101.3,
+                high_price=101.4,
+                low_price=99.9,
+                close_price=100.0,
+            )
+        },
+        mark_prices={"AAAUSDT": 100.0},
+    )
+    assert second_closed == {"AAAUSDT"}
+    assert simulator.trades[-1].exit_reason == "break_even_stop"
+    assert simulator.trades[-1].break_even_stop_armed is True
+    assert simulator.trades[-1].minutes_to_break_even_arm == pytest.approx(1.0)
+
+
+def test_profit_ratchet_advances_and_hits_latched_stop_in_simulator() -> None:
+    settings = Settings(
+        take_profit_pct=0.02,
+        stop_loss_pct=0.02,
+        profit_ratchet_enabled=True,
+        profit_ratchet_max_steps=2,
+    )
+    simulator = HistoricalBacktestSimulator(settings)
+    simulator.positions["AAAUSDT"] = SimulatedPosition(
+        ticker="AAAUSDT",
+        quantity=1.0,
+        entry_price=100.0,
+        raw_entry_price=100.0,
+        notional_usd=100.0,
+        opened_at_ms=0,
+        entry_stage="emerging",
+        entry_signal_kind="entry_ready",
+        cluster_label="manual:layer1",
+        entry_diagnostics="ref=cluster_relative:manual:layer1",
+        take_profit_price=102.0,
+        stop_loss_price=98.0,
+        initial_take_profit_price=102.0,
+        initial_stop_loss_price=98.0,
+        entry_fee_usd=0.0,
+        entry_slippage_usd=0.0,
+    )
+    ranked_signal = RankedSignal(
+        stage="emerging",
+        signal_kind="entry_ready",
+        ticker="AAAUSDT",
+        current_price=102.1,
+        momentum_z=2.0,
+        curvature=0.2,
+        hurst=0.7,
+        regime_score=2,
+        composite_score=1.4,
+        rank=1,
+        persistence_hits=0,
+        alerted=False,
+    )
+
+    first_closed = simulator.process_intrabar_exits(
+        timestamp_ms=60_000,
+        intrabar_candles={
+            "AAAUSDT": HistoricalCandle(
+                start_time_ms=0,
+                open_price=100.5,
+                high_price=102.2,
+                low_price=100.4,
+                close_price=102.1,
+            )
+        },
+        mark_prices={"AAAUSDT": 102.1},
+        ranked_signals=[ranked_signal],
+    )
+    assert first_closed == set()
+    assert simulator.positions["AAAUSDT"].profit_ratchet_step == 1
+    assert simulator.positions["AAAUSDT"].take_profit_price == pytest.approx(104.0)
+    assert simulator.positions["AAAUSDT"].stop_loss_price == pytest.approx(100.0)
+
+    second_closed = simulator.process_intrabar_exits(
+        timestamp_ms=120_000,
+        intrabar_candles={
+            "AAAUSDT": HistoricalCandle(
+                start_time_ms=60_000,
+                open_price=102.3,
+                high_price=104.3,
+                low_price=102.2,
+                close_price=104.2,
+            )
+        },
+        mark_prices={"AAAUSDT": 104.2},
+        ranked_signals=[replace(ranked_signal, current_price=104.2)],
+    )
+    assert second_closed == set()
+    assert simulator.positions["AAAUSDT"].profit_ratchet_step == 2
+    assert simulator.positions["AAAUSDT"].take_profit_price == pytest.approx(106.0)
+    assert simulator.positions["AAAUSDT"].stop_loss_price == pytest.approx(102.0)
+
+    final_closed = simulator.process_intrabar_exits(
+        timestamp_ms=180_000,
+        intrabar_candles={
+            "AAAUSDT": HistoricalCandle(
+                start_time_ms=120_000,
+                open_price=104.0,
+                high_price=104.1,
+                low_price=101.9,
+                close_price=102.0,
+            )
+        },
+        mark_prices={"AAAUSDT": 102.0},
+        ranked_signals=[],
+    )
+    assert final_closed == {"AAAUSDT"}
+    assert simulator.trades[-1].exit_reason == "profit_ratchet_stop"
+    assert simulator.trades[-1].profit_ratchet_step == 2
+    assert simulator.trades[-1].profit_ratchet_adjustments == 2
+    assert simulator.trades[-1].stop_loss_price_at_exit == pytest.approx(102.0)
+    assert [event.reason for event in simulator.position_events] == ["step=1", "step=2"]
 
 
 def test_build_sweep_window_end_times_honors_spacing_and_limit() -> None:

@@ -76,6 +76,12 @@ class Settings:
     max_entries_per_rebalance: int = 0
     take_profit_pct: float = 0.02
     stop_loss_pct: float = 0.02
+    stale_position_max_minutes: int = 240
+    break_even_stop_enabled: bool = False
+    break_even_stop_trigger_fraction_of_tp: float = 0.75
+    profit_ratchet_enabled: bool = False
+    profit_ratchet_max_steps: int = 0
+    profit_ratchet_require_entry_ready: bool = True
     max_daily_stop_losses: int = 0
     operator_pause_new_entries: bool = False
     bybit_recv_window: int = 5000
@@ -225,6 +231,18 @@ def load_settings() -> Settings:
         max_entries_per_rebalance=_get_int("MAX_ENTRIES_PER_REBALANCE", 0),
         take_profit_pct=_get_float("TAKE_PROFIT_PCT", 0.02),
         stop_loss_pct=_get_float("STOP_LOSS_PCT", 0.02),
+        stale_position_max_minutes=_get_int("STALE_POSITION_MAX_MINUTES", 240),
+        break_even_stop_enabled=_get_bool("BREAK_EVEN_STOP_ENABLED", False),
+        break_even_stop_trigger_fraction_of_tp=_get_float(
+            "BREAK_EVEN_STOP_TRIGGER_FRACTION_OF_TP",
+            0.75,
+        ),
+        profit_ratchet_enabled=_get_bool("PROFIT_RATCHET_ENABLED", False),
+        profit_ratchet_max_steps=_get_int("PROFIT_RATCHET_MAX_STEPS", 0),
+        profit_ratchet_require_entry_ready=_get_bool(
+            "PROFIT_RATCHET_REQUIRE_ENTRY_READY",
+            True,
+        ),
         max_daily_stop_losses=_get_int("MAX_DAILY_STOP_LOSSES", 0),
         operator_pause_new_entries=_get_bool("OPERATOR_PAUSE_NEW_ENTRIES", False),
         bybit_recv_window=_get_int("BYBIT_RECV_WINDOW", 5000),

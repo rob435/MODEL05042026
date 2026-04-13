@@ -35,7 +35,7 @@
 - `main.py` supports bounded live runs with runtime counters for soak validation.
 - Deployment docs now include a dedicated soak-run guide and production env template.
 - Deployment scaffold exists for `systemd`.
-- Local verification is green: `84` tests passing.
+- Local verification is green: `96` tests passing.
 - Cycle processing now batches DB writes and waits briefly for the WebSocket close wave before scoring.
 - Confirmed logs and cooldown are tied to candle event time; emerging alerts use wall-clock detection time because they fire before candle close.
 - Default universe was live-validated against Bybit; `FETUSDT` and `FTMUSDT` were removed after failing validation.
@@ -65,6 +65,9 @@
   - exchange-native TP/SL via `Set Trading Stop`
   - local exit reconciliation via closed-PnL sync
 - The execution layer is long again and aligned with the ranking engine. Live and simulated trades now buy `entry_ready` names, sell to exit, target `+2%`, and stop at `-2%`.
+- Live and simulated trades now also have a blunt stale-position deadline. `STALE_POSITION_MAX_MINUTES=240` closes a still-open trade after `4` hours if TP or SL has not been reached first; `0` disables it.
+- Live and simulated trades now also support an optional one-step break-even ratchet. When `BREAK_EVEN_STOP_ENABLED=true`, the stop lifts to entry after price reaches `TAKE_PROFIT_PCT * BREAK_EVEN_STOP_TRIGGER_FRACTION_OF_TP`; the default trigger fraction is `0.75`.
+- Live and simulated trades now also support an optional laddered profit ratchet. When `PROFIT_RATCHET_ENABLED=true`, a TP touch can extend the position in place, lift the stop rung by rung, and emit explicit ratchet events for later reconciliation.
 - Execution analytics now persist closed-trade summaries, open-position marks, post-exit follow-through, and portfolio snapshots directly into SQLite.
 - `MAX_DAILY_STOP_LOSSES` is now a live execution guard; once the UTC-day stop-loss count reaches the configured limit, new entries are skipped for the rest of that day.
 - `MAX_ENTRIES_PER_REBALANCE` is now a live execution guard; once an emerging cycle has opened the configured number of fresh positions, lower-ranked `entry_ready` candidates are skipped for that rebalance pass.
@@ -112,6 +115,7 @@
   - Telegram-vs-backtest reconciliation in `reconcile.py`
 - Backtesting now also has built-in stress variants (`--stress-profile`) and richer walk-forward exports, including `walk_forward_candidates.csv`.
 - Reconciliation now reports precision/recall, timestamp deltas, exit-reason agreement, and matched-entry / matched-exit CSVs instead of only a raw overlap count.
+- Reconciliation now also compares ratchet events and window-end still-open positions, not just closed entries/exits, so forward-vs-backtest alignment can be judged on the actual managed state machine.
 - Trade analytics exports now preserve live entry diagnostics in `trade_analytics.notes`, so later TP/SL or filter reviews can see why a trade passed.
 - Dead config surface has been trimmed again: confirmed-only lifecycle knobs and Telegram summary knobs were removed instead of being left as inert env theater.
 - The live runtime now has a real control plane:
@@ -166,6 +170,12 @@
 - There are still intentional legacy compatibility paths in reporting and schema handling for old `confirmed`/`confirmed_strong` data. They are not live-strategy logic anymore, but they are still serving historical DB reads, so they were left in place deliberately.
 - Existing SQLite databases may still physically contain `confirmation_signal_kind` / `confirmed_at` columns from older runs. The new code no longer writes or depends on them, but cleaning the on-disk schema itself would require an explicit SQLite table-rebuild migration.
 - TP/SL is checked only when the runtime processes a cycle. There is no separate sub-second price watcher, so a violent move can still gap through the exact configured threshold.
+- The stale-position timeout is intentionally dumb. It may cut winners that simply needed more time, but that is still better than pretending a stale trade has no carrying cost while adding more discretionary exit logic.
+- The break-even ratchet is intentionally not a true trailing stop. It only moves once, to entry, and the backtest arms it for later candles rather than assuming an intraminute high can instantly rewrite stop state and save the same candle.
+- The profit ratchet is also intentionally not a true trailing stop. It is a rung-based state machine that moves only on TP touches and only while the ticker still satisfies the configured hold rule.
+- With profit ratchet enabled, venue TP is deliberately disabled and engine-managed. That is necessary for in-place extension, but it also means TP advancement remains bound to engine cycle cadence rather than true tick-by-tick exchange ownership.
+- Comprehensive backtests now expose richer exit diagnostics through both stdout and CSV export, including exit-reason summaries, break-even arm behavior, and daily exit mix.
+- `backtest_trades.csv` now includes break-even arm metadata, and the backtester can build neighboring TP variants directly with `--tp-neighbor-step-pct` for quick local TP checks.
 - Venue exit reconciliation is polling-based, not websocket-based. Telegram exit messages and SQLite close state will lag until the next engine cycle sees that Bybit has already closed the position.
 - A real demo smoke entry was executed successfully on `SOLUSDT`; the venue accepted the order and TP/SL were installed. There is now a live demo position unless it has already exited on Bybit.
 - Because Telegram remains unset in this local `.env`, a run from this checkout will trade on the demo venue but will not send Telegram notifications until those credentials are added.

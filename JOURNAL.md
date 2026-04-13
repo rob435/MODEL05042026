@@ -395,3 +395,49 @@
 - Added real replay-loop progress output for single comprehensive runs:
   - stdout now prints a text progress bar plus completed bars, elapsed time, and ETA during the actual replay loop instead of going silent after `replay plan ready`
   - kept it dependency-free and time-gated so the terminal gets useful updates without dumping a line for every bar
+- Reintroduced stale-trade exits in the bluntest acceptable form:
+  - added `STALE_POSITION_MAX_MINUTES` with a default of `240`
+  - live/simulated execution now closes a long if it is still open after that deadline without having hit TP or SL first
+  - the minute-aware backtest simulator now applies the same deadline and reports `stale_timeout` exits explicitly in the summary
+- Added regression coverage for both runtime and backtest stale-timeout exits.
+- Added an optional one-step break-even stop ratchet:
+  - `BREAK_EVEN_STOP_ENABLED` turns it on/off cleanly for testing
+  - `BREAK_EVEN_STOP_TRIGGER_FRACTION_OF_TP` defaults to `0.75`, so with a `2%` TP the ratchet arms at `+1.5%`
+  - live venue execution now sends a second `set_trading_stop` update when that trigger is reached
+  - the minute-aware backtest arms the stop only for subsequent candles after a qualifying high, which avoids cheating same-candle reversal order
+- Added regression coverage for simulated break-even exits, live venue stop updates, and backtest break-even stop behavior.
+- Added richer exit diagnostics to comprehensive backtests:
+  - console output now includes an exit-reason block plus a break-even block with arm rate, minutes-to-arm, post-arm outcomes, and a blunt saved-vs-original-stop estimate
+  - CSV exports now also write `backtest_exit_summary.csv`, `backtest_break_even_summary.csv`, and `backtest_daily_exit_mix.csv`
+  - per-trade exports now keep break-even arm metadata so later TP/SL review is not guesswork
+- Added a built-in neighboring take-profit sweep helper:
+  - `--tp-neighbor-step-pct` builds TP variants around the current `TAKE_PROFIT_PCT`
+  - with the default count, a `2%` TP plus `0.5%` step becomes `1.5%`, `2.0%`, and `2.5%`
+  - this is intentionally separate from generic `--grid-setting take_profit_pct=...` so quick local TP checks stay low-friction
+
+## 2026-04-13
+
+- Replaced the old close-and-reopen winner behavior with an in-place laddered profit ratchet:
+  - once the current TP rung is touched and the ticker still qualifies to hold, the engine extends TP by one base-TP rung and lifts SL one rung behind
+  - the first ratchet step moves the stop to entry, the next step locks `+1R`, then `+2R`, and so on
+  - this is intentionally a discrete state machine, not a continuous trailing stop
+- Added `trade_management.py` as the shared pure rules module for break-even trigger math, initial TP/SL prices, profit-ratchet rung prices, and exit-event inference so live execution and backtest use the same management logic.
+- Extended persistence so positions and trade analytics now keep current TP/SL, initial TP/SL, break-even arm state, ratchet step/count, and last ratchet timestamp instead of leaving management state implicit.
+- Changed live profit management honestly:
+  - when `PROFIT_RATCHET_ENABLED=true`, Bybit no longer owns take profit
+  - the engine now evaluates TP touches, decides whether to ratchet or exit, and only leaves the stop venue-managed
+  - pending live exits now preserve the intended exit reason so later venue sync does not collapse everything into a vague exchange-close label
+- Extended the minute-aware backtester with the same ratchet state machine, `backtest_position_events.csv`, richer exit summaries, and daily exit-mix exports so forward and backtest are explainable instead of just comparable by net PnL.
+- Tightened reconciliation so it can compare more than closed trades:
+  - backtest and live event streams now normalize exit reasons
+  - reconciliation can now match ratchet events and window-end still-open positions
+  - event streams are sorted chronologically after merge so alignment does not lie by matching the right events in the wrong order
+- Added direct regression coverage for the new failure-prone pieces instead of pretending the old suite was enough:
+  - simulated forward profit-ratchet lifecycle through two ratchet steps and a ratchet-stop exit
+  - backtest simulator ratchet lifecycle with exported position events
+  - reconciliation merge/load coverage for ratchet events plus open-window positions
+- Verification after the ratchet/reconciliation pass:
+  - `pytest -q tests/test_execution.py tests/test_backtest.py tests/test_reconcile.py` -> `49 passed`
+  - `pytest -q` -> `96 passed`
+  - `python3 -m py_compile trade_management.py config.py database.py exchange.py execution.py backtest.py reconcile.py alerting.py tests/test_execution.py tests/test_backtest.py tests/test_reconcile.py`
+  - `python3 backtest.py --cycles 8 --research-fast --export-dir /tmp/model050426-ratchet-smoke --end-date 2026-04-12`

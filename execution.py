@@ -15,6 +15,14 @@ from exchange import BybitTradeClient, WalletBalance, round_decimal
 from indicators import correlation_cluster_labels
 from signal_engine import RankedSignal
 from state import MarketState
+from trade_management import (
+    break_even_trigger_price,
+    infer_exit_event,
+    initial_stop_loss_price,
+    initial_take_profit_price,
+    profit_ratchet_can_advance,
+    profit_ratchet_prices,
+)
 from universe import ticker_cluster
 
 LOGGER = logging.getLogger(__name__)
@@ -120,14 +128,43 @@ class ExecutionEngine:
     def _client_order_id(self, lifecycle: str, ticker: str) -> str:
         return f"{lifecycle}-{ticker.lower()}-{uuid4().hex[:12]}"
 
-    def _infer_exit_event(self, entry_price: float, exit_price: float) -> str:
-        tp_price = entry_price * (1 + self.settings.take_profit_pct)
-        sl_price = entry_price * (1 - self.settings.stop_loss_pct)
-        if exit_price >= tp_price:
-            return "take_profit_exit"
-        if exit_price <= sl_price:
-            return "stop_loss_exit"
-        return "exchange_exit"
+    def _break_even_trigger_price(self, entry_price: float) -> float | None:
+        return break_even_trigger_price(entry_price, self.settings)
+
+    def _break_even_stop_active(self, position) -> bool:
+        return bool(position["break_even_stop_active"])
+
+    def _profit_ratchet_step(self, position) -> int:
+        return int(position["profit_ratchet_step"] or 0)
+
+    def _current_take_profit_price(self, position) -> float:
+        value = position["take_profit_price"]
+        if value is None:
+            return initial_take_profit_price(float(position["entry_price"]), self.settings)
+        return float(value)
+
+    def _current_stop_loss_price(self, position) -> float:
+        value = position["stop_loss_price"]
+        if value is None:
+            return initial_stop_loss_price(float(position["entry_price"]), self.settings)
+        return float(value)
+
+    def _infer_exit_event_for_position(
+        self,
+        position,
+        exit_price: float,
+        *,
+        explicit_reason: str | None = None,
+    ) -> str:
+        return infer_exit_event(
+            entry_price=float(position["entry_price"]),
+            exit_price=exit_price,
+            take_profit_price=self._current_take_profit_price(position),
+            stop_loss_price=self._current_stop_loss_price(position),
+            ratchet_step=self._profit_ratchet_step(position),
+            break_even_stop_active=self._break_even_stop_active(position),
+            explicit_reason=explicit_reason,
+        )
 
     def _directional_pnl_pct(self, side: str, entry_price: float, price: float) -> float:
         if entry_price <= 0:
@@ -146,6 +183,156 @@ class ExecutionEngine:
         favorable = max(pnl_pct, 0.0)
         adverse = max(-pnl_pct, 0.0)
         return favorable, adverse
+
+    def _holding_minutes(self, position, *, closed_at: datetime) -> float:
+        opened_at = datetime.fromisoformat(str(position["opened_at"]))
+        return (closed_at - opened_at).total_seconds() / 60.0
+
+    def _stale_reference_iso(self, position) -> str:
+        return str(position["last_profit_ratchet_at"] or position["opened_at"])
+
+    def _eligible_signal_map(
+        self,
+        ranked_signals: list[RankedSignal],
+    ) -> dict[str, RankedSignal]:
+        return {
+            signal.ticker: signal
+            for signal in ranked_signals
+            if signal.signal_kind == "entry_ready"
+        }
+
+    def _should_advance_profit_ratchet(
+        self,
+        *,
+        position,
+        signal: RankedSignal | None,
+    ) -> bool:
+        return profit_ratchet_can_advance(
+            self.settings,
+            current_step=self._profit_ratchet_step(position),
+            signal_kind=signal.signal_kind if signal is not None else None,
+        )
+
+    async def _advance_position_profit_ratchet(
+        self,
+        *,
+        position,
+        now_iso: str,
+        stage: str,
+        ticker: str,
+        signal: RankedSignal | None,
+    ) -> None:
+        next_step = self._profit_ratchet_step(position) + 1
+        new_take_profit_price, new_stop_loss_price = profit_ratchet_prices(
+            float(position["entry_price"]),
+            self.settings,
+            next_step=next_step,
+        )
+        await self.database.update_position_management(
+            int(position["id"]),
+            updated_at=now_iso,
+            take_profit_price=new_take_profit_price,
+            stop_loss_price=new_stop_loss_price,
+            break_even_stop_active=True,
+            profit_ratchet_step=next_step,
+            profit_ratchet_adjustments=int(position["profit_ratchet_adjustments"] or 0) + 1,
+            last_profit_ratchet_at=now_iso,
+            notes=(
+                f"profit_ratchet_step={next_step} "
+                f"tp={new_take_profit_price:.6f} sl={new_stop_loss_price:.6f}"
+            ),
+        )
+        await self._log_runtime_event(
+            severity="info",
+            event_type="profit_ratchet_advanced",
+            detail=(
+                f"step={next_step} ticker={ticker} "
+                f"signal_kind={(signal.signal_kind if signal is not None else 'none')} "
+                f"tp={new_take_profit_price:.6f} sl={new_stop_loss_price:.6f}"
+            ),
+            stage=stage,
+            ticker=ticker,
+        )
+
+    async def _maybe_activate_local_break_even_stop(
+        self,
+        *,
+        position,
+        current_price: float,
+        now_iso: str,
+    ) -> bool:
+        if self._break_even_stop_active(position):
+            return False
+        trigger_price = self._break_even_trigger_price(float(position["entry_price"]))
+        if trigger_price is None or current_price < trigger_price:
+            return False
+        await self.database.activate_break_even_stop(
+            int(position["id"]),
+            updated_at=now_iso,
+            stop_loss_price=float(position["entry_price"]),
+            notes="break_even_stop_armed",
+        )
+        return True
+
+    async def _maybe_activate_live_break_even_stops(
+        self,
+        *,
+        stage: str,
+        cycle_time_ms: int | None,
+    ) -> None:
+        if not self._using_live_venue():
+            return
+        now_iso = self._now(cycle_time_ms=cycle_time_ms, stage=stage).isoformat()
+        for position in await self.database.list_open_positions():
+            if self._break_even_stop_active(position):
+                continue
+            ticker = str(position["ticker"])
+            current_price = self._latest_price(ticker, stage=stage)
+            if current_price is None:
+                continue
+            trigger_price = self._break_even_trigger_price(float(position["entry_price"]))
+            if trigger_price is None or current_price < trigger_price:
+                continue
+            venue_position = await self.client.get_position(ticker)
+            if venue_position is None or venue_position.size <= 0:
+                continue
+            spec = await self.client.fetch_instrument_spec(ticker)
+            take_profit = round_decimal(
+                Decimal(
+                    "0"
+                    if self.settings.profit_ratchet_enabled
+                    else str(self._current_take_profit_price(position))
+                ),
+                spec.tick_size,
+                ROUND_HALF_UP,
+            )
+            stop_loss = round_decimal(
+                Decimal(str(float(position["entry_price"]))),
+                spec.tick_size,
+                ROUND_HALF_UP,
+            )
+            await self.client.set_trading_stop(
+                symbol=ticker,
+                position_idx=venue_position.position_idx,
+                take_profit=take_profit,
+                stop_loss=stop_loss,
+            )
+            await self.database.activate_break_even_stop(
+                int(position["id"]),
+                updated_at=now_iso,
+                stop_loss_price=float(position["entry_price"]),
+                notes="break_even_stop_armed",
+            )
+            await self._log_runtime_event(
+                severity="info",
+                event_type="break_even_stop_armed",
+                detail=(
+                    f"trigger_price={trigger_price:.4f} "
+                    f"entry_price={float(position['entry_price']):.4f}"
+                ),
+                stage=stage,
+                ticker=ticker,
+            )
 
     def _rolling_volatility(self, prices: list[float]) -> float | None:
         if len(prices) < 3:
@@ -337,9 +524,10 @@ class ExecutionEngine:
         quantity = float(position["quantity"])
         realized_pnl_pct = self._directional_pnl_pct(side, entry_price, exit_price)
         realized_pnl_usd = realized_pnl_pct * float(position["notional_usd"])
-        holding_minutes = (
-            datetime.fromisoformat(closed_at_iso) - datetime.fromisoformat(str(position["opened_at"]))
-        ).total_seconds() / 60.0
+        holding_minutes = self._holding_minutes(
+            position,
+            closed_at=datetime.fromisoformat(closed_at_iso),
+        )
         if open_marks:
             mfe_pct = max(float(mark["favorable_excursion_pct"]) for mark in open_marks)
             mae_pct = max(float(mark["adverse_excursion_pct"]) for mark in open_marks)
@@ -377,6 +565,10 @@ class ExecutionEngine:
             notional_usd=float(position["notional_usd"]),
             entry_price=entry_price,
             exit_price=exit_price,
+            take_profit_price_at_entry=position["initial_take_profit_price"],
+            stop_loss_price_at_entry=position["initial_stop_loss_price"],
+            take_profit_price_at_exit=position["take_profit_price"],
+            stop_loss_price_at_exit=position["stop_loss_price"],
             realized_pnl_pct=realized_pnl_pct,
             realized_pnl_usd=realized_pnl_usd,
             mfe_pct=mfe_pct,
@@ -392,6 +584,10 @@ class ExecutionEngine:
             entry_momentum_z=position["entry_momentum_z"],
             entry_curvature=position["entry_curvature"],
             entry_hurst=position["entry_hurst"],
+            break_even_stop_armed=int(bool(position["break_even_stop_active"])),
+            profit_ratchet_step=int(position["profit_ratchet_step"] or 0),
+            profit_ratchet_adjustments=int(position["profit_ratchet_adjustments"] or 0),
+            last_profit_ratchet_at=position["last_profit_ratchet_at"],
             notes=str(position["notes"] or ""),
             post_exit_bars_target=max(self.settings.analytics_post_exit_bars, 0),
             post_exit_bars_observed=0,
@@ -627,7 +823,11 @@ class ExecutionEngine:
         )
         realized_price = float(submission.fill_price or exit_price)
         pnl_pct = (realized_price / float(position["entry_price"])) - 1.0
-        exit_event = self._infer_exit_event(float(position["entry_price"]), realized_price)
+        exit_event = self._infer_exit_event_for_position(
+            position,
+            realized_price,
+            explicit_reason=exit_reason,
+        )
         await self.database.close_position(
             int(position["id"]),
             exit_order_id=order_id,
@@ -665,23 +865,258 @@ class ExecutionEngine:
             position_id=int(position["id"]),
         )
 
+    async def _latest_closed_pnl_since(
+        self,
+        *,
+        ticker: str,
+        opened_at_ms: int,
+    ):
+        for _ in range(self.settings.trade_fill_poll_attempts):
+            closed = await self.client.get_latest_closed_pnl(ticker)
+            if closed is not None and closed.updated_time_ms >= opened_at_ms:
+                return closed
+            await asyncio.sleep(self.settings.trade_fill_poll_delay_seconds)
+        return None
+
+    async def _submit_live_exit(
+        self,
+        *,
+        position,
+        ticker: str,
+        stage: str,
+        now_iso: str,
+        exit_reason: str,
+        signal_kind: str = "none",
+    ) -> ExecutionAction:
+        venue_position = await self.client.get_position(ticker)
+        if venue_position is None or venue_position.size <= 0:
+            await self.database.mark_position_exit_pending(
+                int(position["id"]),
+                updated_at=now_iso,
+                pending_exit_reason=exit_reason,
+                notes=f"pending_exit_without_visible_venue_position reason={exit_reason}",
+            )
+            return ExecutionAction(
+                ticker=ticker,
+                action="exit_pending",
+                signal_kind=signal_kind,
+                detail=exit_reason,
+                position_id=int(position["id"]),
+            )
+        order_link_id = self._client_order_id("exit", ticker)
+        ack = await self.client.place_market_order(
+            symbol=ticker,
+            side="Sell",
+            quantity=venue_position.size,
+            order_link_id=order_link_id,
+            reduce_only=True,
+        )
+        await self.database.mark_position_exit_pending(
+            int(position["id"]),
+            updated_at=now_iso,
+            pending_exit_reason=exit_reason,
+            notes=f"pending_live_exit reason={exit_reason}",
+        )
+        try:
+            await self.client.wait_for_position_closed(ticker)
+            opened_at_ms = int(datetime.fromisoformat(position["opened_at"]).timestamp() * 1000)
+            closed = await self._latest_closed_pnl_since(
+                ticker=ticker,
+                opened_at_ms=opened_at_ms,
+            )
+            if closed is None:
+                raise RuntimeError(f"Timed out waiting for closed PnL on {ticker}")
+        except Exception as exc:
+            await self._log_runtime_event(
+                severity="warning",
+                event_type="exit_sync_pending",
+                detail=f"ticker={ticker} reason={exit_reason} error={exc}",
+                stage=stage,
+                ticker=ticker,
+            )
+            return ExecutionAction(
+                ticker=ticker,
+                action="exit_pending",
+                signal_kind=signal_kind,
+                detail=f"{exit_reason} pending_sync",
+                position_id=int(position["id"]),
+            )
+        closed_at_iso = datetime.fromtimestamp(closed.updated_time_ms / 1000, tz=timezone.utc).isoformat()
+        exit_price = float(closed.avg_exit_price)
+        order_id = await self.database.create_order(
+            client_order_id=order_link_id,
+            ticker=ticker,
+            side="Sell",
+            order_type="Market",
+            lifecycle="exit",
+            status="filled_live",
+            stage=stage,
+            signal_kind=signal_kind,
+            requested_qty=float(venue_position.size),
+            requested_notional_usd=float(position["notional_usd"]),
+            requested_price=exit_price,
+            venue="bybit",
+            is_demo=self.settings.demo_mode,
+            created_at=now_iso,
+            updated_at=closed_at_iso,
+            fill_price=exit_price,
+            external_order_id=ack.order_id,
+            filled_at=closed_at_iso,
+            notes=f"Live reduce-only market exit. reason={exit_reason}",
+        )
+        await self.database.close_position(
+            int(position["id"]),
+            exit_order_id=order_id,
+            exit_price=exit_price,
+            closed_at=closed_at_iso,
+            updated_at=closed_at_iso,
+            notes=exit_reason,
+        )
+        exit_event = self._infer_exit_event_for_position(
+            position,
+            exit_price,
+            explicit_reason=exit_reason,
+        )
+        pnl_pct = (exit_price / float(position["entry_price"])) - 1.0
+        await self._record_trade_analytics(
+            position=position,
+            exit_stage=stage,
+            exit_signal_kind=signal_kind,
+            exit_event=exit_event,
+            exit_reason=exit_reason,
+            closed_at_iso=closed_at_iso,
+            exit_price=exit_price,
+        )
+        await self._send_execution_notification(
+            event=exit_event,
+            ticker=ticker,
+            stage=stage,
+            signal_kind=signal_kind,
+            quantity=float(position["quantity"]),
+            entry_price=float(position["entry_price"]),
+            exit_price=exit_price,
+            pnl_pct=pnl_pct,
+            notes="Live reduce-only market exit",
+        )
+        return ExecutionAction(
+            ticker=ticker,
+            action="exit_long",
+            signal_kind=signal_kind,
+            detail=exit_reason,
+            order_id=order_id,
+            position_id=int(position["id"]),
+        )
+
+    async def _manage_live_profit_targets(
+        self,
+        *,
+        stage: str,
+        cycle_time_ms: int | None,
+        ranked_signals: list[RankedSignal],
+        blocked_tickers: set[str],
+    ) -> tuple[list[ExecutionAction], set[str]]:
+        actions: list[ExecutionAction] = []
+        closed_tickers: set[str] = set()
+        if not self._using_live_venue() or not self.settings.profit_ratchet_enabled:
+            return actions, closed_tickers
+        now_iso = self._now(cycle_time_ms=cycle_time_ms, stage=stage).isoformat()
+        signal_map = self._eligible_signal_map(ranked_signals)
+        for position in await self.database.list_open_positions():
+            ticker = str(position["ticker"])
+            if ticker in blocked_tickers or position["pending_exit_reason"] not in (None, ""):
+                continue
+            current_price = self._latest_price(ticker, stage=stage)
+            if current_price is None or current_price < self._current_take_profit_price(position):
+                continue
+            signal = signal_map.get(ticker)
+            if self._should_advance_profit_ratchet(position=position, signal=signal):
+                venue_position = await self.client.get_position(ticker)
+                if venue_position is None or venue_position.size <= 0:
+                    continue
+                spec = await self.client.fetch_instrument_spec(ticker)
+                next_step = self._profit_ratchet_step(position) + 1
+                new_take_profit_price, new_stop_loss_price = profit_ratchet_prices(
+                    float(position["entry_price"]),
+                    self.settings,
+                    next_step=next_step,
+                )
+                await self.client.set_trading_stop(
+                    symbol=ticker,
+                    position_idx=venue_position.position_idx,
+                    take_profit=round_decimal(Decimal("0"), spec.tick_size, ROUND_HALF_UP),
+                    stop_loss=round_decimal(
+                        Decimal(str(new_stop_loss_price)),
+                        spec.tick_size,
+                        ROUND_HALF_UP,
+                    ),
+                )
+                await self._advance_position_profit_ratchet(
+                    position=position,
+                    now_iso=now_iso,
+                    stage=stage,
+                    ticker=ticker,
+                    signal=signal,
+                )
+                actions.append(
+                    ExecutionAction(
+                        ticker=ticker,
+                        action="profit_ratchet_advanced",
+                        signal_kind=signal.signal_kind if signal is not None else "none",
+                        detail=f"step={next_step}",
+                        position_id=int(position["id"]),
+                    )
+                )
+                continue
+            action = await self._submit_live_exit(
+                position=position,
+                ticker=ticker,
+                stage=stage,
+                now_iso=now_iso,
+                exit_reason="take_profit_hit",
+                signal_kind=signal.signal_kind if signal is not None else "none",
+            )
+            actions.append(action)
+            if action.action == "exit_long":
+                closed_tickers.add(ticker)
+        return actions, closed_tickers
+
     async def _process_risk_exits(
         self,
         *,
         stage: str,
         cycle_time_ms: int | None,
+        ranked_signals: list[RankedSignal],
     ) -> tuple[list[ExecutionAction], set[str]]:
         actions: list[ExecutionAction] = []
         closed_tickers: set[str] = set()
         now_iso = self._now(cycle_time_ms=cycle_time_ms, stage=stage).isoformat()
+        now = datetime.fromisoformat(now_iso)
+        signal_map = self._eligible_signal_map(ranked_signals)
         for position in await self.database.list_open_positions():
             ticker = str(position["ticker"])
             current_price = self._latest_price(ticker, stage=stage)
             if current_price is None:
                 continue
+            armed_now = await self._maybe_activate_local_break_even_stop(
+                position=position,
+                current_price=current_price,
+                now_iso=now_iso,
+            )
+            if armed_now:
+                position = await self.database.get_open_position(ticker) or position
             entry_price = float(position["entry_price"])
             pnl_pct = (current_price / entry_price) - 1.0
-            if pnl_pct >= self.settings.take_profit_pct:
+            if current_price >= self._current_take_profit_price(position):
+                signal = signal_map.get(ticker)
+                if self._should_advance_profit_ratchet(position=position, signal=signal):
+                    await self._advance_position_profit_ratchet(
+                        position=position,
+                        now_iso=now_iso,
+                        stage=stage,
+                        ticker=ticker,
+                        signal=signal,
+                    )
+                    continue
                 actions.append(
                     await self._submit_simulated_exit(
                         position=position,
@@ -690,11 +1125,13 @@ class ExecutionEngine:
                         now_iso=now_iso,
                         exit_price=current_price,
                         exit_reason="take_profit_hit",
+                        signal_kind=signal.signal_kind if signal is not None else "none",
                     )
                 )
                 closed_tickers.add(ticker)
                 continue
-            if pnl_pct <= -self.settings.stop_loss_pct:
+            stop_price = self._current_stop_loss_price(position)
+            if current_price <= stop_price:
                 actions.append(
                     await self._submit_simulated_exit(
                         position=position,
@@ -702,7 +1139,29 @@ class ExecutionEngine:
                         stage=stage,
                         now_iso=now_iso,
                         exit_price=current_price,
-                        exit_reason="stop_loss_hit",
+                        exit_reason=self._infer_exit_event_for_position(
+                            position,
+                            stop_price,
+                        ).replace("_exit", "_hit"),
+                    )
+                )
+                closed_tickers.add(ticker)
+                continue
+            if (
+                self.settings.stale_position_max_minutes > 0
+                and (
+                    now - datetime.fromisoformat(self._stale_reference_iso(position))
+                ).total_seconds() / 60.0
+                >= self.settings.stale_position_max_minutes
+            ):
+                actions.append(
+                    await self._submit_simulated_exit(
+                        position=position,
+                        ticker=ticker,
+                        stage=stage,
+                        now_iso=now_iso,
+                        exit_price=current_price,
+                        exit_reason="stale_timeout_hit",
                     )
                 )
                 closed_tickers.add(ticker)
@@ -759,15 +1218,20 @@ class ExecutionEngine:
                 exit_price=exit_price,
                 closed_at=now_iso,
                 updated_at=now_iso,
-                notes="closed on Bybit venue",
+                notes=str(position["pending_exit_reason"] or "closed on Bybit venue"),
             )
-            event = self._infer_exit_event(entry_price, exit_price)
+            exit_reason = str(position["pending_exit_reason"] or "closed on Bybit venue")
+            event = self._infer_exit_event_for_position(
+                position,
+                exit_price,
+                explicit_reason=exit_reason,
+            )
             await self._record_trade_analytics(
                 position=position,
                 exit_stage=stage,
                 exit_signal_kind="none",
                 exit_event=event,
-                exit_reason="closed on Bybit venue",
+                exit_reason=exit_reason,
                 closed_at_iso=now_iso,
                 exit_price=exit_price,
             )
@@ -812,10 +1276,24 @@ class ExecutionEngine:
         await self._record_open_position_marks(stage=stage, cycle_time_ms=cycle_time_ms)
         if self._using_live_venue():
             sync_actions, closed_tickers = await self._sync_live_closed_positions(stage=stage)
+            await self._maybe_activate_live_break_even_stops(
+                stage=stage,
+                cycle_time_ms=cycle_time_ms,
+            )
+            if stage == "emerging":
+                target_actions, target_closed_tickers = await self._manage_live_profit_targets(
+                    stage=stage,
+                    cycle_time_ms=cycle_time_ms,
+                    ranked_signals=ranked_signals,
+                    blocked_tickers=closed_tickers,
+                )
+                sync_actions = sync_actions + target_actions
+                closed_tickers |= target_closed_tickers
         else:
             sync_actions, closed_tickers = await self._process_risk_exits(
                 stage=stage,
                 cycle_time_ms=cycle_time_ms,
+                ranked_signals=ranked_signals,
             )
         if stage == "emerging":
             stage_actions = await self._process_entries(
@@ -1059,7 +1537,9 @@ class ExecutionEngine:
                     venue_position = await self.client.wait_for_position(signal.ticker)
                     entry_price = venue_position.avg_price
                     tp_price = round_decimal(
-                        entry_price * Decimal(str(1 + self.settings.take_profit_pct)),
+                        Decimal("0")
+                        if self.settings.profit_ratchet_enabled
+                        else entry_price * Decimal(str(1 + self.settings.take_profit_pct)),
                         spec.tick_size,
                         ROUND_HALF_UP,
                     )
@@ -1107,8 +1587,13 @@ class ExecutionEngine:
 
                 notes = (
                     f"Bybit live demo order placed. Risk={self.settings.risk_per_trade_pct * 100:.2f}% "
-                    f"of available balance. Venue TP={format(tp_price.normalize(), 'f')} "
-                    f"SL={format(sl_price.normalize(), 'f')}. {signal.entry_diagnostics}"
+                    f"of available balance. "
+                    + (
+                        "Venue TP=disabled (engine-managed profit ratchet/local TP). "
+                        if self.settings.profit_ratchet_enabled
+                        else f"Venue TP={format(tp_price.normalize(), 'f')} "
+                    )
+                    + f"SL={format(sl_price.normalize(), 'f')}. {signal.entry_diagnostics}"
                 )
                 order_id = await self.database.create_order(
                     client_order_id=order_link_id,
@@ -1142,6 +1627,10 @@ class ExecutionEngine:
                     quantity=float(venue_position.size),
                     notional_usd=float(venue_position.size * entry_price),
                     entry_price=float(entry_price),
+                    take_profit_price=float(initial_take_profit_price(float(entry_price), self.settings)),
+                    stop_loss_price=float(initial_stop_loss_price(float(entry_price), self.settings)),
+                    initial_take_profit_price=float(initial_take_profit_price(float(entry_price), self.settings)),
+                    initial_stop_loss_price=float(initial_stop_loss_price(float(entry_price), self.settings)),
                     regime_score_at_entry=signal.regime_score,
                     dom_state_at_entry=(
                         "falling"
@@ -1287,6 +1776,10 @@ class ExecutionEngine:
                 quantity=quantity,
                 notional_usd=self.settings.entry_notional_usd,
                 entry_price=submission.fill_price,
+                take_profit_price=initial_take_profit_price(submission.fill_price, self.settings),
+                stop_loss_price=initial_stop_loss_price(submission.fill_price, self.settings),
+                initial_take_profit_price=initial_take_profit_price(submission.fill_price, self.settings),
+                initial_stop_loss_price=initial_stop_loss_price(submission.fill_price, self.settings),
                 regime_score_at_entry=signal.regime_score,
                 dom_state_at_entry=(
                     "falling"

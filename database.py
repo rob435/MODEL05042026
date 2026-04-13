@@ -145,6 +145,10 @@ class SignalDatabase:
                 notional_usd REAL NOT NULL,
                 entry_price REAL NOT NULL,
                 exit_price REAL,
+                take_profit_price REAL,
+                stop_loss_price REAL,
+                initial_take_profit_price REAL,
+                initial_stop_loss_price REAL,
                 regime_score_at_entry INTEGER,
                 dom_state_at_entry TEXT,
                 dom_change_pct_at_entry REAL,
@@ -153,6 +157,12 @@ class SignalDatabase:
                 entry_momentum_z REAL,
                 entry_curvature REAL,
                 entry_hurst REAL,
+                profit_ratchet_step INTEGER NOT NULL DEFAULT 0,
+                profit_ratchet_adjustments INTEGER NOT NULL DEFAULT 0,
+                last_profit_ratchet_at TEXT,
+                break_even_stop_active INTEGER NOT NULL DEFAULT 0,
+                pending_exit_reason TEXT,
+                pending_exit_requested_at TEXT,
                 notes TEXT NOT NULL DEFAULT '',
                 FOREIGN KEY (entry_order_id) REFERENCES orders(id),
                 FOREIGN KEY (exit_order_id) REFERENCES orders(id)
@@ -202,6 +212,46 @@ class SignalDatabase:
             self._conn.execute(
                 "ALTER TABLE positions ADD COLUMN entry_hurst REAL"
             )
+        if "take_profit_price" not in position_columns:
+            self._conn.execute(
+                "ALTER TABLE positions ADD COLUMN take_profit_price REAL"
+            )
+        if "stop_loss_price" not in position_columns:
+            self._conn.execute(
+                "ALTER TABLE positions ADD COLUMN stop_loss_price REAL"
+            )
+        if "initial_take_profit_price" not in position_columns:
+            self._conn.execute(
+                "ALTER TABLE positions ADD COLUMN initial_take_profit_price REAL"
+            )
+        if "initial_stop_loss_price" not in position_columns:
+            self._conn.execute(
+                "ALTER TABLE positions ADD COLUMN initial_stop_loss_price REAL"
+            )
+        if "profit_ratchet_step" not in position_columns:
+            self._conn.execute(
+                "ALTER TABLE positions ADD COLUMN profit_ratchet_step INTEGER NOT NULL DEFAULT 0"
+            )
+        if "profit_ratchet_adjustments" not in position_columns:
+            self._conn.execute(
+                "ALTER TABLE positions ADD COLUMN profit_ratchet_adjustments INTEGER NOT NULL DEFAULT 0"
+            )
+        if "last_profit_ratchet_at" not in position_columns:
+            self._conn.execute(
+                "ALTER TABLE positions ADD COLUMN last_profit_ratchet_at TEXT"
+            )
+        if "break_even_stop_active" not in position_columns:
+            self._conn.execute(
+                "ALTER TABLE positions ADD COLUMN break_even_stop_active INTEGER NOT NULL DEFAULT 0"
+            )
+        if "pending_exit_reason" not in position_columns:
+            self._conn.execute(
+                "ALTER TABLE positions ADD COLUMN pending_exit_reason TEXT"
+            )
+        if "pending_exit_requested_at" not in position_columns:
+            self._conn.execute(
+                "ALTER TABLE positions ADD COLUMN pending_exit_requested_at TEXT"
+            )
         self._conn.execute(
             """
             CREATE TABLE IF NOT EXISTS trade_analytics (
@@ -222,6 +272,10 @@ class SignalDatabase:
                 notional_usd REAL NOT NULL,
                 entry_price REAL NOT NULL,
                 exit_price REAL NOT NULL,
+                take_profit_price_at_entry REAL,
+                stop_loss_price_at_entry REAL,
+                take_profit_price_at_exit REAL,
+                stop_loss_price_at_exit REAL,
                 realized_pnl_pct REAL NOT NULL,
                 realized_pnl_usd REAL NOT NULL,
                 mfe_pct REAL NOT NULL DEFAULT 0,
@@ -237,6 +291,10 @@ class SignalDatabase:
                 entry_momentum_z REAL,
                 entry_curvature REAL,
                 entry_hurst REAL,
+                break_even_stop_armed INTEGER NOT NULL DEFAULT 0,
+                profit_ratchet_step INTEGER NOT NULL DEFAULT 0,
+                profit_ratchet_adjustments INTEGER NOT NULL DEFAULT 0,
+                last_profit_ratchet_at TEXT,
                 notes TEXT NOT NULL DEFAULT '',
                 post_exit_bars_target INTEGER NOT NULL DEFAULT 0,
                 post_exit_bars_observed INTEGER NOT NULL DEFAULT 0,
@@ -384,6 +442,16 @@ class SignalDatabase:
                 matched_exits INTEGER NOT NULL DEFAULT 0,
                 exit_precision REAL NOT NULL DEFAULT 0,
                 exit_recall REAL NOT NULL DEFAULT 0,
+                actual_window_open_positions INTEGER NOT NULL DEFAULT 0,
+                backtest_window_open_positions INTEGER NOT NULL DEFAULT 0,
+                matched_window_open_positions INTEGER NOT NULL DEFAULT 0,
+                window_open_precision REAL NOT NULL DEFAULT 0,
+                window_open_recall REAL NOT NULL DEFAULT 0,
+                actual_ratchets INTEGER NOT NULL DEFAULT 0,
+                backtest_ratchets INTEGER NOT NULL DEFAULT 0,
+                matched_ratchets INTEGER NOT NULL DEFAULT 0,
+                ratchet_precision REAL NOT NULL DEFAULT 0,
+                ratchet_recall REAL NOT NULL DEFAULT 0,
                 matched_exit_reason_count INTEGER NOT NULL DEFAULT 0,
                 mismatched_exit_reason_count INTEGER NOT NULL DEFAULT 0,
                 actual_unique_tickers INTEGER NOT NULL DEFAULT 0,
@@ -396,6 +464,49 @@ class SignalDatabase:
             )
             """
         )
+        reconciliation_columns = {
+            row[1] for row in self._conn.execute("PRAGMA table_info(reconciliation_runs)")
+        }
+        if "actual_window_open_positions" not in reconciliation_columns:
+            self._conn.execute(
+                "ALTER TABLE reconciliation_runs ADD COLUMN actual_window_open_positions INTEGER NOT NULL DEFAULT 0"
+            )
+        if "backtest_window_open_positions" not in reconciliation_columns:
+            self._conn.execute(
+                "ALTER TABLE reconciliation_runs ADD COLUMN backtest_window_open_positions INTEGER NOT NULL DEFAULT 0"
+            )
+        if "matched_window_open_positions" not in reconciliation_columns:
+            self._conn.execute(
+                "ALTER TABLE reconciliation_runs ADD COLUMN matched_window_open_positions INTEGER NOT NULL DEFAULT 0"
+            )
+        if "window_open_precision" not in reconciliation_columns:
+            self._conn.execute(
+                "ALTER TABLE reconciliation_runs ADD COLUMN window_open_precision REAL NOT NULL DEFAULT 0"
+            )
+        if "window_open_recall" not in reconciliation_columns:
+            self._conn.execute(
+                "ALTER TABLE reconciliation_runs ADD COLUMN window_open_recall REAL NOT NULL DEFAULT 0"
+            )
+        if "actual_ratchets" not in reconciliation_columns:
+            self._conn.execute(
+                "ALTER TABLE reconciliation_runs ADD COLUMN actual_ratchets INTEGER NOT NULL DEFAULT 0"
+            )
+        if "backtest_ratchets" not in reconciliation_columns:
+            self._conn.execute(
+                "ALTER TABLE reconciliation_runs ADD COLUMN backtest_ratchets INTEGER NOT NULL DEFAULT 0"
+            )
+        if "matched_ratchets" not in reconciliation_columns:
+            self._conn.execute(
+                "ALTER TABLE reconciliation_runs ADD COLUMN matched_ratchets INTEGER NOT NULL DEFAULT 0"
+            )
+        if "ratchet_precision" not in reconciliation_columns:
+            self._conn.execute(
+                "ALTER TABLE reconciliation_runs ADD COLUMN ratchet_precision REAL NOT NULL DEFAULT 0"
+            )
+        if "ratchet_recall" not in reconciliation_columns:
+            self._conn.execute(
+                "ALTER TABLE reconciliation_runs ADD COLUMN ratchet_recall REAL NOT NULL DEFAULT 0"
+            )
         self._conn.execute(
             """
             CREATE INDEX IF NOT EXISTS idx_signals_ticker_timestamp
@@ -433,6 +544,38 @@ class SignalDatabase:
         if "notes" not in trade_columns:
             self._conn.execute(
                 "ALTER TABLE trade_analytics ADD COLUMN notes TEXT NOT NULL DEFAULT ''"
+            )
+        if "take_profit_price_at_entry" not in trade_columns:
+            self._conn.execute(
+                "ALTER TABLE trade_analytics ADD COLUMN take_profit_price_at_entry REAL"
+            )
+        if "stop_loss_price_at_entry" not in trade_columns:
+            self._conn.execute(
+                "ALTER TABLE trade_analytics ADD COLUMN stop_loss_price_at_entry REAL"
+            )
+        if "take_profit_price_at_exit" not in trade_columns:
+            self._conn.execute(
+                "ALTER TABLE trade_analytics ADD COLUMN take_profit_price_at_exit REAL"
+            )
+        if "stop_loss_price_at_exit" not in trade_columns:
+            self._conn.execute(
+                "ALTER TABLE trade_analytics ADD COLUMN stop_loss_price_at_exit REAL"
+            )
+        if "break_even_stop_armed" not in trade_columns:
+            self._conn.execute(
+                "ALTER TABLE trade_analytics ADD COLUMN break_even_stop_armed INTEGER NOT NULL DEFAULT 0"
+            )
+        if "profit_ratchet_step" not in trade_columns:
+            self._conn.execute(
+                "ALTER TABLE trade_analytics ADD COLUMN profit_ratchet_step INTEGER NOT NULL DEFAULT 0"
+            )
+        if "profit_ratchet_adjustments" not in trade_columns:
+            self._conn.execute(
+                "ALTER TABLE trade_analytics ADD COLUMN profit_ratchet_adjustments INTEGER NOT NULL DEFAULT 0"
+            )
+        if "last_profit_ratchet_at" not in trade_columns:
+            self._conn.execute(
+                "ALTER TABLE trade_analytics ADD COLUMN last_profit_ratchet_at TEXT"
             )
         self._conn.execute(
             """
@@ -689,6 +832,10 @@ class SignalDatabase:
         quantity: float,
         notional_usd: float,
         entry_price: float,
+        take_profit_price: float | None = None,
+        stop_loss_price: float | None = None,
+        initial_take_profit_price: float | None = None,
+        initial_stop_loss_price: float | None = None,
         regime_score_at_entry: int | None = None,
         dom_state_at_entry: str | None = None,
         dom_change_pct_at_entry: float | None = None,
@@ -697,6 +844,10 @@ class SignalDatabase:
         entry_momentum_z: float | None = None,
         entry_curvature: float | None = None,
         entry_hurst: float | None = None,
+        profit_ratchet_step: int = 0,
+        profit_ratchet_adjustments: int = 0,
+        last_profit_ratchet_at: str | None = None,
+        break_even_stop_active: bool = False,
         notes: str = "",
     ) -> int:
         return await asyncio.to_thread(
@@ -711,6 +862,10 @@ class SignalDatabase:
             quantity,
             notional_usd,
             entry_price,
+            take_profit_price,
+            stop_loss_price,
+            initial_take_profit_price,
+            initial_stop_loss_price,
             regime_score_at_entry,
             dom_state_at_entry,
             dom_change_pct_at_entry,
@@ -719,6 +874,10 @@ class SignalDatabase:
             entry_momentum_z,
             entry_curvature,
             entry_hurst,
+            profit_ratchet_step,
+            profit_ratchet_adjustments,
+            last_profit_ratchet_at,
+            break_even_stop_active,
             notes,
         )
 
@@ -734,6 +893,10 @@ class SignalDatabase:
         quantity: float,
         notional_usd: float,
         entry_price: float,
+        take_profit_price: float | None,
+        stop_loss_price: float | None,
+        initial_take_profit_price: float | None,
+        initial_stop_loss_price: float | None,
         regime_score_at_entry: int | None,
         dom_state_at_entry: str | None,
         dom_change_pct_at_entry: float | None,
@@ -742,6 +905,10 @@ class SignalDatabase:
         entry_momentum_z: float | None,
         entry_curvature: float | None,
         entry_hurst: float | None,
+        profit_ratchet_step: int,
+        profit_ratchet_adjustments: int,
+        last_profit_ratchet_at: str | None,
+        break_even_stop_active: bool,
         notes: str,
     ) -> int:
         cursor = self._conn.execute(
@@ -758,6 +925,10 @@ class SignalDatabase:
                 quantity,
                 notional_usd,
                 entry_price,
+                take_profit_price,
+                stop_loss_price,
+                initial_take_profit_price,
+                initial_stop_loss_price,
                 regime_score_at_entry,
                 dom_state_at_entry,
                 dom_change_pct_at_entry,
@@ -766,9 +937,13 @@ class SignalDatabase:
                 entry_momentum_z,
                 entry_curvature,
                 entry_hurst,
+                profit_ratchet_step,
+                profit_ratchet_adjustments,
+                last_profit_ratchet_at,
+                break_even_stop_active,
                 notes
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 ticker,
@@ -782,6 +957,10 @@ class SignalDatabase:
                 quantity,
                 notional_usd,
                 entry_price,
+                take_profit_price,
+                stop_loss_price,
+                initial_take_profit_price,
+                initial_stop_loss_price,
                 regime_score_at_entry,
                 dom_state_at_entry,
                 dom_change_pct_at_entry,
@@ -790,11 +969,181 @@ class SignalDatabase:
                 entry_momentum_z,
                 entry_curvature,
                 entry_hurst,
+                profit_ratchet_step,
+                profit_ratchet_adjustments,
+                last_profit_ratchet_at,
+                int(break_even_stop_active),
                 notes,
             ),
         )
         self._conn.commit()
         return int(cursor.lastrowid)
+
+    async def activate_break_even_stop(
+        self,
+        position_id: int,
+        *,
+        updated_at: str,
+        stop_loss_price: float | None = None,
+        notes: str = "",
+    ) -> None:
+        await asyncio.to_thread(
+            self._activate_break_even_stop_sync,
+            position_id,
+            updated_at,
+            stop_loss_price,
+            notes,
+        )
+
+    def _activate_break_even_stop_sync(
+        self,
+        position_id: int,
+        updated_at: str,
+        stop_loss_price: float | None,
+        notes: str,
+    ) -> None:
+        self._conn.execute(
+            """
+            UPDATE positions
+            SET break_even_stop_active = 1,
+                updated_at = ?,
+                stop_loss_price = COALESCE(?, stop_loss_price),
+                notes = CASE
+                    WHEN ? = '' THEN notes
+                    WHEN notes = '' THEN ?
+                    ELSE notes || ' | ' || ?
+                END
+            WHERE id = ?
+            """,
+            (
+                updated_at,
+                stop_loss_price,
+                notes,
+                notes,
+                notes,
+                position_id,
+            ),
+        )
+        self._conn.commit()
+
+    async def update_position_management(
+        self,
+        position_id: int,
+        *,
+        updated_at: str,
+        take_profit_price: float | None = None,
+        stop_loss_price: float | None = None,
+        break_even_stop_active: bool | None = None,
+        profit_ratchet_step: int | None = None,
+        profit_ratchet_adjustments: int | None = None,
+        last_profit_ratchet_at: str | None = None,
+        notes: str = "",
+    ) -> None:
+        await asyncio.to_thread(
+            self._update_position_management_sync,
+            position_id,
+            updated_at,
+            take_profit_price,
+            stop_loss_price,
+            break_even_stop_active,
+            profit_ratchet_step,
+            profit_ratchet_adjustments,
+            last_profit_ratchet_at,
+            notes,
+        )
+
+    def _update_position_management_sync(
+        self,
+        position_id: int,
+        updated_at: str,
+        take_profit_price: float | None,
+        stop_loss_price: float | None,
+        break_even_stop_active: bool | None,
+        profit_ratchet_step: int | None,
+        profit_ratchet_adjustments: int | None,
+        last_profit_ratchet_at: str | None,
+        notes: str,
+    ) -> None:
+        self._conn.execute(
+            """
+            UPDATE positions
+            SET updated_at = ?,
+                take_profit_price = COALESCE(?, take_profit_price),
+                stop_loss_price = COALESCE(?, stop_loss_price),
+                break_even_stop_active = COALESCE(?, break_even_stop_active),
+                profit_ratchet_step = COALESCE(?, profit_ratchet_step),
+                profit_ratchet_adjustments = COALESCE(?, profit_ratchet_adjustments),
+                last_profit_ratchet_at = COALESCE(?, last_profit_ratchet_at),
+                notes = CASE
+                    WHEN ? = '' THEN notes
+                    WHEN notes = '' THEN ?
+                    ELSE notes || ' | ' || ?
+                END
+            WHERE id = ?
+            """,
+            (
+                updated_at,
+                take_profit_price,
+                stop_loss_price,
+                int(break_even_stop_active) if break_even_stop_active is not None else None,
+                profit_ratchet_step,
+                profit_ratchet_adjustments,
+                last_profit_ratchet_at,
+                notes,
+                notes,
+                notes,
+                position_id,
+            ),
+        )
+        self._conn.commit()
+
+    async def mark_position_exit_pending(
+        self,
+        position_id: int,
+        *,
+        updated_at: str,
+        pending_exit_reason: str,
+        notes: str = "",
+    ) -> None:
+        await asyncio.to_thread(
+            self._mark_position_exit_pending_sync,
+            position_id,
+            updated_at,
+            pending_exit_reason,
+            notes,
+        )
+
+    def _mark_position_exit_pending_sync(
+        self,
+        position_id: int,
+        updated_at: str,
+        pending_exit_reason: str,
+        notes: str,
+    ) -> None:
+        self._conn.execute(
+            """
+            UPDATE positions
+            SET updated_at = ?,
+                pending_exit_reason = ?,
+                pending_exit_requested_at = ?,
+                notes = CASE
+                    WHEN ? = '' THEN notes
+                    WHEN notes = '' THEN ?
+                    ELSE notes || ' | ' || ?
+                END
+            WHERE id = ?
+            """,
+            (
+                updated_at,
+                pending_exit_reason,
+                updated_at,
+                notes,
+                notes,
+                notes,
+                position_id,
+            ),
+        )
+        self._conn.commit()
 
     async def get_open_position(self, ticker: str) -> sqlite3.Row | None:
         return await asyncio.to_thread(self._get_open_position_sync, ticker)
@@ -861,6 +1210,8 @@ class SignalDatabase:
                 exit_price = ?,
                 closed_at = ?,
                 updated_at = ?,
+                pending_exit_reason = NULL,
+                pending_exit_requested_at = NULL,
                 notes = CASE
                     WHEN ? = '' THEN notes
                     WHEN notes = '' THEN ?
@@ -1041,6 +1392,10 @@ class SignalDatabase:
                 notional_usd,
                 entry_price,
                 exit_price,
+                take_profit_price_at_entry,
+                stop_loss_price_at_entry,
+                take_profit_price_at_exit,
+                stop_loss_price_at_exit,
                 realized_pnl_pct,
                 realized_pnl_usd,
                 mfe_pct,
@@ -1056,6 +1411,10 @@ class SignalDatabase:
                 entry_momentum_z,
                 entry_curvature,
                 entry_hurst,
+                break_even_stop_armed,
+                profit_ratchet_step,
+                profit_ratchet_adjustments,
+                last_profit_ratchet_at,
                 notes,
                 post_exit_bars_target,
                 post_exit_bars_observed,
@@ -1087,6 +1446,10 @@ class SignalDatabase:
                 :notional_usd,
                 :entry_price,
                 :exit_price,
+                :take_profit_price_at_entry,
+                :stop_loss_price_at_entry,
+                :take_profit_price_at_exit,
+                :stop_loss_price_at_exit,
                 :realized_pnl_pct,
                 :realized_pnl_usd,
                 :mfe_pct,
@@ -1102,6 +1465,10 @@ class SignalDatabase:
                 :entry_momentum_z,
                 :entry_curvature,
                 :entry_hurst,
+                :break_even_stop_armed,
+                :profit_ratchet_step,
+                :profit_ratchet_adjustments,
+                :last_profit_ratchet_at,
                 :notes,
                 :post_exit_bars_target,
                 :post_exit_bars_observed,
@@ -1648,6 +2015,16 @@ class SignalDatabase:
         matched_exits: int,
         exit_precision: float,
         exit_recall: float,
+        actual_window_open_positions: int,
+        backtest_window_open_positions: int,
+        matched_window_open_positions: int,
+        window_open_precision: float,
+        window_open_recall: float,
+        actual_ratchets: int,
+        backtest_ratchets: int,
+        matched_ratchets: int,
+        ratchet_precision: float,
+        ratchet_recall: float,
         matched_exit_reason_count: int,
         mismatched_exit_reason_count: int,
         actual_unique_tickers: int,
@@ -1674,6 +2051,16 @@ class SignalDatabase:
             matched_exits,
             exit_precision,
             exit_recall,
+            actual_window_open_positions,
+            backtest_window_open_positions,
+            matched_window_open_positions,
+            window_open_precision,
+            window_open_recall,
+            actual_ratchets,
+            backtest_ratchets,
+            matched_ratchets,
+            ratchet_precision,
+            ratchet_recall,
             matched_exit_reason_count,
             mismatched_exit_reason_count,
             actual_unique_tickers,
@@ -1701,6 +2088,16 @@ class SignalDatabase:
         matched_exits: int,
         exit_precision: float,
         exit_recall: float,
+        actual_window_open_positions: int,
+        backtest_window_open_positions: int,
+        matched_window_open_positions: int,
+        window_open_precision: float,
+        window_open_recall: float,
+        actual_ratchets: int,
+        backtest_ratchets: int,
+        matched_ratchets: int,
+        ratchet_precision: float,
+        ratchet_recall: float,
         matched_exit_reason_count: int,
         mismatched_exit_reason_count: int,
         actual_unique_tickers: int,
@@ -1728,6 +2125,16 @@ class SignalDatabase:
                 matched_exits,
                 exit_precision,
                 exit_recall,
+                actual_window_open_positions,
+                backtest_window_open_positions,
+                matched_window_open_positions,
+                window_open_precision,
+                window_open_recall,
+                actual_ratchets,
+                backtest_ratchets,
+                matched_ratchets,
+                ratchet_precision,
+                ratchet_recall,
                 matched_exit_reason_count,
                 mismatched_exit_reason_count,
                 actual_unique_tickers,
@@ -1738,7 +2145,7 @@ class SignalDatabase:
                 export_dir,
                 notes
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 created_at,
@@ -1755,6 +2162,16 @@ class SignalDatabase:
                 matched_exits,
                 exit_precision,
                 exit_recall,
+                actual_window_open_positions,
+                backtest_window_open_positions,
+                matched_window_open_positions,
+                window_open_precision,
+                window_open_recall,
+                actual_ratchets,
+                backtest_ratchets,
+                matched_ratchets,
+                ratchet_precision,
+                ratchet_recall,
                 matched_exit_reason_count,
                 mismatched_exit_reason_count,
                 actual_unique_tickers,

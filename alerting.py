@@ -102,6 +102,9 @@ class TelegramNotifier:
             "enter_long": "entered new long position",
             "take_profit_exit": "take-profit exit",
             "stop_loss_exit": "stop-loss exit",
+            "break_even_stop_exit": "break-even stop exit",
+            "profit_ratchet_stop_exit": "profit-ratchet stop exit",
+            "stale_timeout_exit": "stale-timeout exit",
             "exchange_exit": "venue-managed exit",
         }
         price_lines = []

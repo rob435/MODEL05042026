@@ -279,6 +279,7 @@ class BybitTradeClient:
         side: str,
         quantity: Decimal,
         order_link_id: str,
+        reduce_only: bool = False,
     ) -> OrderAck:
         result = await self._request(
             "POST",
@@ -291,7 +292,7 @@ class BybitTradeClient:
                 "qty": format(quantity.normalize(), "f"),
                 "positionIdx": 0,
                 "orderLinkId": order_link_id,
-                "reduceOnly": False,
+                "reduceOnly": reduce_only,
             },
         )
         return OrderAck(
@@ -332,6 +333,14 @@ class BybitTradeClient:
                 return position
             await asyncio.sleep(self.settings.trade_fill_poll_delay_seconds)
         raise RuntimeError(f"Timed out waiting for filled Bybit position on {symbol}")
+
+    async def wait_for_position_closed(self, symbol: str) -> None:
+        for _ in range(self.settings.trade_fill_poll_attempts):
+            position = await self.get_position(symbol)
+            if position is None or position.size <= 0:
+                return
+            await asyncio.sleep(self.settings.trade_fill_poll_delay_seconds)
+        raise RuntimeError(f"Timed out waiting for Bybit position to close on {symbol}")
 
 
 class BybitMarketDataClient:

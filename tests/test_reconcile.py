@@ -35,7 +35,7 @@ def test_parse_telegram_trade_events_extracts_entries_and_exits() -> None:
         ("SOLUSDT", "entry", "LONG"),
         ("SOLUSDT", "exit", "LONG"),
     ]
-    assert events[1].reason == "take-profit exit"
+    assert events[1].reason == "take_profit"
 
 
 def test_reconcile_trade_events_matches_by_ticker_and_time(tmp_path: Path) -> None:
@@ -108,6 +108,26 @@ def test_reconciliation_exports_ticker_summary(tmp_path: Path) -> None:
 
 def test_load_actual_trade_events_from_db_filters_one_utc_day(tmp_path: Path) -> None:
     asyncio.run(_exercise_load_actual_trade_events_from_db(tmp_path))
+
+
+def test_load_backtest_trade_events_merges_ratchets_and_window_open(tmp_path: Path) -> None:
+    trades_csv = tmp_path / "backtest_trades.csv"
+    trades_csv.write_text(
+        "ticker,side,opened_at,closed_at,exit_reason\n"
+        "SOLUSDT,LONG,2026-04-11T01:00:00+00:00,2026-04-12T00:00:00+00:00,end_of_backtest\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "backtest_position_events.csv").write_text(
+        "timestamp,ticker,side,event,reason,detail\n"
+        "2026-04-11T03:00:00+00:00,SOLUSDT,LONG,ratchet,step=1,step=1 ticker=SOLUSDT\n",
+        encoding="utf-8",
+    )
+    events = load_backtest_trade_events(str(trades_csv))
+    assert [(event.ticker, event.event, event.reason) for event in events] == [
+        ("SOLUSDT", "entry", "entry"),
+        ("SOLUSDT", "ratchet", "step=1"),
+        ("SOLUSDT", "open_window_end", "open_window_end"),
+    ]
 
 
 def test_log_reconciliation_result_persists_summary_row(tmp_path: Path) -> None:

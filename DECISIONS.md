@@ -157,3 +157,15 @@
 - Treat this as a first-pass memory fix, not a fantasy claim that worker duplication is solved completely. Workers still rebuild their own replay plan in memory; the point of this change is to cut snapshot size and load overhead materially without a bigger data-layout rewrite.
 - Keep local research artifacts in a dedicated ignored folder, not in the repo root. Big backtest DBs and export trees are operational data, not source files, and mixing them into the top-level workspace just makes cleanup and inspection worse.
 - Single-run backtests need progress output inside the replay loop, not just phase banners before and after it. The useful contract is percent complete, completed bars, elapsed time, and ETA while the actual simulation is running.
+- If stale-trade logic is brought back, keep it blunt and time-based instead of sneaking in another discretionary signal exit. The current compromise is a hard `4`-hour deadline: if TP or SL has not been hit by then, close the trade.
+- Do not call the new stop-to-entry ratchet a trailing stop. The honest implementation is a one-step break-even stop that arms at a configurable fraction of the TP distance and then stays there. That keeps the rule explainable and testable instead of sliding into continuous discretionary stop movement.
+- Keep exit diagnostics first-class in the backtest output. Once TP, SL, break-even, and stale exits all coexist, aggregate PnL alone is too lossy to guide tuning honestly.
+- For quick TP exploration, provide a small neighboring-TP helper around the current configured target instead of pushing every simple question through a generic optimizer or a hand-written grid. The repo needs fast local comparisons, not parameter-search theater.
+
+## 2026-04-13
+
+- Do not extend winners by closing at TP and instantly reopening if the signal still looks good. That fakes continuity, double-counts fills/slippage, and makes live-vs-backtest alignment worse. The honest approach is to mutate the existing position in place.
+- Keep the profit-ratchet deterministic and laddered off the original entry price, not off drifting percentages of the latest price. Fixed rungs are explainable, reproducible, and easier to reconcile than a pseudo-trailing rule that moves continuously.
+- When profit ratchet is enabled, take-profit ownership must move from Bybit to the engine. Leaving venue TP active would close the trade before the code could decide whether to ratchet or exit.
+- Use one shared pure management helper for live execution and backtest exit state. If TP/SL/ratchet math is duplicated, parity will drift and the reconciliation layer will end up diagnosing two different systems.
+- Reconciliation must treat still-open end-of-window positions and ratchet steps as first-class events. A closed-trades-only report is not good enough once the strategy can intentionally keep a winner open past the first TP.

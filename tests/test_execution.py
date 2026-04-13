@@ -31,6 +31,14 @@ def test_execution_engine_stops_out_with_telegram(tmp_path: Path) -> None:
     asyncio.run(_exercise_stop_loss_lifecycle(tmp_path))
 
 
+def test_execution_engine_closes_stale_position_on_deadline(tmp_path: Path) -> None:
+    asyncio.run(_exercise_stale_timeout_lifecycle(tmp_path))
+
+
+def test_execution_engine_arms_and_hits_break_even_stop(tmp_path: Path) -> None:
+    asyncio.run(_exercise_break_even_stop_lifecycle(tmp_path))
+
+
 def test_execution_engine_allows_multiple_tickers_but_only_one_position_per_ticker(tmp_path: Path) -> None:
     asyncio.run(_exercise_per_ticker_entry_guard(tmp_path))
 
@@ -59,12 +67,20 @@ def test_execution_engine_places_real_demo_order_and_syncs_exchange_exit(tmp_pat
     asyncio.run(_exercise_live_demo_path(tmp_path))
 
 
+def test_execution_engine_updates_live_stop_to_break_even(tmp_path: Path) -> None:
+    asyncio.run(_exercise_live_break_even_stop_update(tmp_path))
+
+
 def test_execution_engine_skips_live_entry_when_venue_position_exists(tmp_path: Path) -> None:
     asyncio.run(_exercise_live_duplicate_position_guard(tmp_path))
 
 
 def test_execution_engine_detects_position_drift(tmp_path: Path) -> None:
     asyncio.run(_exercise_detect_position_drift(tmp_path))
+
+
+def test_execution_engine_profit_ratchet_advances_and_exits_on_latched_stop(tmp_path: Path) -> None:
+    asyncio.run(_exercise_profit_ratchet_lifecycle(tmp_path))
 
 
 async def _exercise_execution_take_profit_lifecycle(tmp_path: Path) -> None:
@@ -227,6 +243,290 @@ async def _exercise_stop_loss_lifecycle(tmp_path: Path) -> None:
     assert position == ("closed", 98.9)
 
 
+async def _exercise_stale_timeout_lifecycle(tmp_path: Path) -> None:
+    settings = Settings(
+        sqlite_path=str(tmp_path / "execution-stale.db"),
+        universe=["AAAUSDT"],
+        execution_enabled=True,
+        demo_mode=True,
+        execution_submit_orders=False,
+        entry_notional_usd=200.0,
+        take_profit_pct=0.02,
+        stop_loss_pct=0.02,
+        stale_position_max_minutes=240,
+    )
+    state = MarketState(settings=settings)
+    state.replace_history(
+        "BTCUSDT",
+        [(0, 20_000.0), (settings.ticker_interval_ms, 20_100.0)],
+    )
+    state.replace_history(
+        "AAAUSDT",
+        [(0, 100.0), (settings.ticker_interval_ms, 101.0)],
+    )
+
+    database = SignalDatabase(settings.sqlite_path)
+    await database.initialize()
+    notifier = RecordingNotifier()
+    execution = ExecutionEngine(
+        settings=settings,
+        state=state,
+        database=database,
+        notifier=notifier,
+    )
+
+    current_time = datetime(2026, 4, 9, 12, 0, tzinfo=timezone.utc)
+
+    def fake_now(*, cycle_time_ms, stage):
+        return current_time
+
+    execution._now = fake_now  # type: ignore[method-assign]
+
+    await execution.process_cycle(
+        stage="emerging",
+        cycle_time_ms=settings.ticker_interval_ms * 2,
+        ranked_signals=[
+            RankedSignal(
+                stage="emerging",
+                signal_kind="entry_ready",
+                ticker="AAAUSDT",
+                current_price=101.0,
+                momentum_z=2.0,
+                curvature=0.2,
+                hurst=0.7,
+                regime_score=2,
+                composite_score=1.4,
+                rank=1,
+                persistence_hits=0,
+                alerted=False,
+            )
+        ],
+    )
+
+    current_time = datetime(2026, 4, 9, 16, 0, tzinfo=timezone.utc)
+    assert state.update_provisional("AAAUSDT", settings.ticker_interval_ms * 2, 101.5) is True
+    assert state.update_provisional("BTCUSDT", settings.ticker_interval_ms * 2, 20_200.0) is True
+
+    exit_actions = await execution.process_cycle(
+        stage="emerging",
+        cycle_time_ms=settings.ticker_interval_ms * 18,
+        ranked_signals=[],
+    )
+    assert [(action.action, action.ticker, action.detail) for action in exit_actions] == [
+        ("exit_long", "AAAUSDT", "stale_timeout_hit")
+    ]
+
+    with sqlite3.connect(settings.sqlite_path) as connection:
+        position = connection.execute(
+            "SELECT status, exit_price, notes FROM positions WHERE ticker = 'AAAUSDT'"
+        ).fetchone()
+    assert position[0] == "closed"
+    assert position[1] == 101.5
+    assert "stale_timeout_hit" in position[2]
+    assert notifier.events == [("enter_long", "AAAUSDT"), ("stale_timeout_exit", "AAAUSDT")]
+
+
+async def _exercise_break_even_stop_lifecycle(tmp_path: Path) -> None:
+    settings = Settings(
+        sqlite_path=str(tmp_path / "execution-break-even.db"),
+        universe=["AAAUSDT"],
+        execution_enabled=True,
+        demo_mode=True,
+        execution_submit_orders=False,
+        entry_notional_usd=200.0,
+        take_profit_pct=0.02,
+        stop_loss_pct=0.02,
+        break_even_stop_enabled=True,
+        break_even_stop_trigger_fraction_of_tp=0.75,
+    )
+    state = MarketState(settings=settings)
+    state.replace_history(
+        "BTCUSDT",
+        [(0, 20_000.0), (settings.ticker_interval_ms, 20_100.0)],
+    )
+    state.replace_history(
+        "AAAUSDT",
+        [(0, 100.0), (settings.ticker_interval_ms, 101.0)],
+    )
+
+    database = SignalDatabase(settings.sqlite_path)
+    await database.initialize()
+    notifier = RecordingNotifier()
+    execution = ExecutionEngine(
+        settings=settings,
+        state=state,
+        database=database,
+        notifier=notifier,
+    )
+
+    await execution.process_cycle(
+        stage="emerging",
+        cycle_time_ms=settings.ticker_interval_ms * 2,
+        ranked_signals=[
+            RankedSignal(
+                stage="emerging",
+                signal_kind="entry_ready",
+                ticker="AAAUSDT",
+                current_price=101.0,
+                momentum_z=2.0,
+                curvature=0.2,
+                hurst=0.7,
+                regime_score=2,
+                composite_score=1.4,
+                rank=1,
+                persistence_hits=0,
+                alerted=False,
+            )
+        ],
+    )
+
+    assert state.update_provisional("AAAUSDT", settings.ticker_interval_ms * 2, 102.6) is True
+    assert state.update_provisional("BTCUSDT", settings.ticker_interval_ms * 2, 20_200.0) is True
+    arm_actions = await execution.process_cycle(
+        stage="emerging",
+        cycle_time_ms=settings.ticker_interval_ms * 2,
+        ranked_signals=[],
+    )
+    assert arm_actions == []
+
+    with sqlite3.connect(settings.sqlite_path) as connection:
+        armed_flag = connection.execute(
+            "SELECT break_even_stop_active FROM positions WHERE ticker = 'AAAUSDT'"
+        ).fetchone()[0]
+    assert armed_flag == 1
+
+    assert state.update_provisional("AAAUSDT", settings.ticker_interval_ms * 2, 100.9) is True
+    exit_actions = await execution.process_cycle(
+        stage="emerging",
+        cycle_time_ms=settings.ticker_interval_ms * 3,
+        ranked_signals=[],
+    )
+    assert [(action.action, action.ticker, action.detail) for action in exit_actions] == [
+        ("exit_long", "AAAUSDT", "break_even_stop_hit")
+    ]
+    assert notifier.events == [("enter_long", "AAAUSDT"), ("break_even_stop_exit", "AAAUSDT")]
+
+
+async def _exercise_profit_ratchet_lifecycle(tmp_path: Path) -> None:
+    settings = Settings(
+        sqlite_path=str(tmp_path / "execution-profit-ratchet.db"),
+        universe=["AAAUSDT"],
+        execution_enabled=True,
+        demo_mode=True,
+        execution_submit_orders=False,
+        entry_notional_usd=200.0,
+        take_profit_pct=0.02,
+        stop_loss_pct=0.02,
+        profit_ratchet_enabled=True,
+        profit_ratchet_max_steps=2,
+    )
+    state = MarketState(settings=settings)
+    state.replace_history(
+        "BTCUSDT",
+        [(0, 20_000.0), (settings.ticker_interval_ms, 20_100.0)],
+    )
+    state.replace_history(
+        "AAAUSDT",
+        [(0, 100.0), (settings.ticker_interval_ms, 101.0)],
+    )
+
+    database = SignalDatabase(settings.sqlite_path)
+    await database.initialize()
+    notifier = RecordingNotifier()
+    execution = ExecutionEngine(
+        settings=settings,
+        state=state,
+        database=database,
+        notifier=notifier,
+    )
+
+    def ratchet_signal(price: float) -> RankedSignal:
+        return RankedSignal(
+            stage="emerging",
+            signal_kind="entry_ready",
+            ticker="AAAUSDT",
+            current_price=price,
+            momentum_z=2.0,
+            curvature=0.2,
+            hurst=0.7,
+            regime_score=2,
+            composite_score=1.4,
+            rank=1,
+            persistence_hits=0,
+            alerted=False,
+        )
+
+    await execution.process_cycle(
+        stage="emerging",
+        cycle_time_ms=settings.ticker_interval_ms * 2,
+        ranked_signals=[ratchet_signal(101.0)],
+    )
+
+    assert state.update_provisional("AAAUSDT", settings.ticker_interval_ms * 2, 103.2) is True
+    assert state.update_provisional("BTCUSDT", settings.ticker_interval_ms * 2, 20_200.0) is True
+    first_ratchet_actions = await execution.process_cycle(
+        stage="emerging",
+        cycle_time_ms=settings.ticker_interval_ms * 2,
+        ranked_signals=[ratchet_signal(103.2)],
+    )
+    assert [(action.action, action.ticker) for action in first_ratchet_actions] == [
+        ("skip_entry", "AAAUSDT")
+    ]
+
+    with sqlite3.connect(settings.sqlite_path) as connection:
+        first_ratchet = connection.execute(
+            """
+            SELECT take_profit_price, stop_loss_price, profit_ratchet_step, profit_ratchet_adjustments, break_even_stop_active
+            FROM positions
+            WHERE ticker = 'AAAUSDT'
+            """
+        ).fetchone()
+    assert first_ratchet == (105.04, 101.0, 1, 1, 1)
+
+    assert state.update_provisional("AAAUSDT", settings.ticker_interval_ms * 2, 105.3) is True
+    second_ratchet_actions = await execution.process_cycle(
+        stage="emerging",
+        cycle_time_ms=settings.ticker_interval_ms * 2,
+        ranked_signals=[ratchet_signal(105.3)],
+    )
+    assert [(action.action, action.ticker) for action in second_ratchet_actions] == [
+        ("skip_entry", "AAAUSDT")
+    ]
+
+    with sqlite3.connect(settings.sqlite_path) as connection:
+        second_ratchet = connection.execute(
+            """
+            SELECT take_profit_price, stop_loss_price, profit_ratchet_step, profit_ratchet_adjustments
+            FROM positions
+            WHERE ticker = 'AAAUSDT'
+            """
+        ).fetchone()
+        ratchet_events = connection.execute(
+            """
+            SELECT event_type, detail
+            FROM runtime_events
+            WHERE ticker = 'AAAUSDT' AND event_type = 'profit_ratchet_advanced'
+            ORDER BY id
+            """
+        ).fetchall()
+    assert second_ratchet == (107.06, 103.02, 2, 2)
+    assert [detail for _, detail in ratchet_events] == [
+        "step=1 ticker=AAAUSDT signal_kind=entry_ready tp=105.040000 sl=101.000000",
+        "step=2 ticker=AAAUSDT signal_kind=entry_ready tp=107.060000 sl=103.020000",
+    ]
+
+    assert state.update_provisional("AAAUSDT", settings.ticker_interval_ms * 2, 103.0) is True
+    exit_actions = await execution.process_cycle(
+        stage="emerging",
+        cycle_time_ms=settings.ticker_interval_ms * 2,
+        ranked_signals=[],
+    )
+    assert [(action.action, action.ticker, action.detail) for action in exit_actions] == [
+        ("exit_long", "AAAUSDT", "profit_ratchet_stop_hit")
+    ]
+    assert notifier.events == [("enter_long", "AAAUSDT"), ("profit_ratchet_stop_exit", "AAAUSDT")]
+
+
 async def _exercise_per_ticker_entry_guard(tmp_path: Path) -> None:
     settings = Settings(
         sqlite_path=str(tmp_path / "execution-cap.db"),
@@ -350,7 +650,15 @@ async def _exercise_live_demo_path(tmp_path: Path) -> None:
                 tick_size=Decimal("0.1"),
             )
 
-        async def place_market_order(self, *, symbol: str, side: str, quantity: Decimal, order_link_id: str):
+        async def place_market_order(
+            self,
+            *,
+            symbol: str,
+            side: str,
+            quantity: Decimal,
+            order_link_id: str,
+            reduce_only: bool = False,
+        ):
             self.last_quantity = quantity
             return type("Ack", (), {"order_id": "demo-order-1", "order_link_id": order_link_id})()
 
@@ -467,6 +775,142 @@ async def _exercise_live_demo_path(tmp_path: Path) -> None:
     assert requested_notional == 500.0
     assert position == ("closed", 101.0, 103.1)
     assert notifier.events == [("enter_long", "AAAUSDT"), ("take_profit_exit", "AAAUSDT")]
+
+
+async def _exercise_live_break_even_stop_update(tmp_path: Path) -> None:
+    class FakeLiveClient:
+        def __init__(self) -> None:
+            self.position_open = False
+            self.stops: list[tuple[str, str, str]] = []
+
+        def enabled(self) -> bool:
+            return True
+
+        async def get_wallet_balance(self):
+            return type(
+                "WalletBalance",
+                (),
+                {
+                    "total_equity_usd": Decimal("1000"),
+                    "total_available_balance_usd": Decimal("1000"),
+                },
+            )()
+
+        async def fetch_instrument_spec(self, symbol: str) -> InstrumentSpec:
+            return InstrumentSpec(
+                symbol=symbol,
+                qty_step=Decimal("0.001"),
+                min_order_qty=Decimal("0.001"),
+                tick_size=Decimal("0.1"),
+            )
+
+        async def place_market_order(
+            self,
+            *,
+            symbol: str,
+            side: str,
+            quantity: Decimal,
+            order_link_id: str,
+            reduce_only: bool = False,
+        ):
+            return type("Ack", (), {"order_id": "demo-order-1", "order_link_id": order_link_id})()
+
+        async def wait_for_position(self, symbol: str) -> VenuePosition:
+            self.position_open = True
+            return VenuePosition(
+                symbol=symbol,
+                side="Buy",
+                size=Decimal("1.980"),
+                avg_price=Decimal("101.0"),
+                position_idx=0,
+            )
+
+        async def set_trading_stop(self, *, symbol: str, position_idx: int, take_profit: Decimal, stop_loss: Decimal) -> None:
+            self.stops.append((symbol, format(take_profit, "f"), format(stop_loss, "f")))
+
+        async def get_position(self, symbol: str):
+            if self.position_open:
+                return VenuePosition(
+                    symbol=symbol,
+                    side="Buy",
+                    size=Decimal("1.980"),
+                    avg_price=Decimal("101.0"),
+                    position_idx=0,
+                )
+            return None
+
+        async def get_latest_closed_pnl(self, symbol: str):
+            return None
+
+    settings = Settings(
+        sqlite_path=str(tmp_path / "execution-live-break-even.db"),
+        universe=["AAAUSDT"],
+        execution_enabled=True,
+        demo_mode=True,
+        execution_submit_orders=True,
+        risk_per_trade_pct=0.01,
+        take_profit_pct=0.02,
+        stop_loss_pct=0.02,
+        break_even_stop_enabled=True,
+        break_even_stop_trigger_fraction_of_tp=0.75,
+    )
+    state = MarketState(settings=settings)
+    state.replace_history(
+        "BTCUSDT",
+        [(0, 20_000.0), (settings.ticker_interval_ms, 20_100.0)],
+    )
+    state.replace_history(
+        "AAAUSDT",
+        [(0, 100.0), (settings.ticker_interval_ms, 101.0)],
+    )
+
+    database = SignalDatabase(settings.sqlite_path)
+    await database.initialize()
+    fake_client = FakeLiveClient()
+    execution = ExecutionEngine(
+        settings=settings,
+        state=state,
+        database=database,
+        client=fake_client,
+    )
+
+    await execution.process_cycle(
+        stage="emerging",
+        cycle_time_ms=settings.ticker_interval_ms * 2,
+        ranked_signals=[
+            RankedSignal(
+                stage="emerging",
+                signal_kind="entry_ready",
+                ticker="AAAUSDT",
+                current_price=101.0,
+                momentum_z=2.0,
+                curvature=0.2,
+                hurst=0.7,
+                regime_score=2,
+                composite_score=1.4,
+                rank=1,
+                persistence_hits=0,
+                alerted=False,
+            )
+        ],
+    )
+
+    assert state.update_provisional("AAAUSDT", settings.ticker_interval_ms * 2, 102.6) is True
+    await execution.process_cycle(
+        stage="emerging",
+        cycle_time_ms=settings.ticker_interval_ms * 3,
+        ranked_signals=[],
+    )
+
+    assert fake_client.stops == [
+        ("AAAUSDT", "103.0", "99.0"),
+        ("AAAUSDT", "103.0", "101.0"),
+    ]
+    with sqlite3.connect(settings.sqlite_path) as connection:
+        armed_flag = connection.execute(
+            "SELECT break_even_stop_active FROM positions WHERE ticker = 'AAAUSDT'"
+        ).fetchone()[0]
+    assert armed_flag == 1
 
 
 async def _exercise_max_entries_per_rebalance(tmp_path: Path) -> None:

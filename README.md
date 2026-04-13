@@ -27,7 +27,7 @@ Use that document for the actual runtime contract. This README is now an operato
 - Logs every evaluated ticker on each cycle to SQLite and optionally sends Telegram alerts with cooldown control.
 - Logs the top-ranked names each cycle so you can see the leaders even when no symbol passes the final alert filters.
 - Keeps provisional intrabar prices isolated from the confirmed 15m history so early alerts do not contaminate the closed-bar history used for the next intrabar cycle.
-- Executes the current signal stack as a momentum long strategy: buy to open, sell to exit, TP at `2%` up, SL at `2%` down.
+- Executes the current signal stack as a momentum long strategy: buy to open, sell to exit, TP at `2%` up, SL at `2%` down, with optional stale-timeout, break-even, and laddered profit-ratchet management.
 - Caps correlated pile-up with cluster-level exposure control as well as raw position count.
 - Persists analytics for closed trades, open-position marks, post-exit follow-through, portfolio snapshots, and richer entry diagnostics so TP/SL and capacity can be studied from real runtime data instead of screenshots.
 
@@ -239,6 +239,26 @@ python backtest.py \
 
 That resumes from `./backtest-runs/year-grid/variant_summary.csv` and skips variants that already completed.
 
+For blunt neighboring TP checks around the current configured target, use `--tp-neighbor-step-pct` instead of hand-writing a one-off TP grid:
+
+```bash
+python backtest.py \
+  --cycles 192 \
+  --research-fast \
+  --tp-neighbor-step-pct 0.005 \
+  --export-dir ./backtest-runs/tp-neighbors
+```
+
+With `TAKE_PROFIT_PCT=0.02`, that builds `take_profit_pct=0.015`, `0.02`, and `0.025`. Increase `--tp-neighbor-count` if you want a wider ring around the current TP. Do not mix this helper with `--grid-setting take_profit_pct=...`; that is just duplicated intent.
+
+Comprehensive backtest exports now include more useful exit diagnostics by default:
+
+- `backtest_exit_summary.csv`: counts, win rate, net PnL, holding time, and average MFE/MAE by exit reason
+- `backtest_break_even_summary.csv`: arm rate, minutes-to-arm, post-arm outcomes, and a blunt saved-vs-original-stop estimate
+- `backtest_daily_exit_mix.csv`: per-day exit counts and PnL split by exit reason
+- `backtest_trades.csv`: per-trade break-even and profit-ratchet fields so you can inspect which trades actually ratcheted
+- `backtest_position_events.csv`: in-place management events such as profit-ratchet step advances
+
 For built-in stress testing, add one or more `--stress-profile` flags:
 
 ```bash
@@ -283,11 +303,13 @@ python reconcile.py \
 The reconciliation output now includes:
 
 - entry and exit precision / recall
+- window-end open-position precision / recall
+- ratchet-event precision / recall
 - average timestamp deltas
 - exit-reason agreement
 - unique-ticker precision / recall
 - `ticker_reconciliation.csv` for per-ticker mismatch diagnosis
-- `matched_entries.csv` and `matched_exits.csv` alongside the unmatched rows
+- matched/unmatched CSVs for entries, exits, window-end open positions, and ratchets
 
 If you already want a normal exported backtest, `backtest.py` can run the reconciliation step directly:
 
@@ -439,7 +461,8 @@ For the first VPS validation run, use [SOAK_RUN.md](deploy/SOAK_RUN.md) and star
 - `EMERGING` requires strengthening, not just presence. The intrabar state machine looks for repeated watchlist observations with improving rank and rising composite score before promoting a ticker from `WATCHLIST` to `EMERGING`.
 - `ENTRY_READY` is the only tradeable signal kind. It is the trader-oriented label for the strongest intrabar candidate and should be read as "this is strong enough to trade now."
 - `ENTRY_READY` has explicit tuning knobs in the env templates: `ENTRY_READY_TOP_N`, `ENTRY_READY_COOLDOWN_MINUTES`, `ENTRY_READY_MIN_OBSERVATIONS`, `ENTRY_READY_MIN_RANK_IMPROVEMENT`, and `ENTRY_READY_MIN_COMPOSITE_GAIN`. Use those to keep the live entry tier tighter than `EMERGING` without adding another fake confirmation stage.
-- Execution is currently aligned with the momentum ranking again. The bot buys the strongest `entry_ready` names, then exits them at `+2%` take profit or `-2%` stop loss.
+- Execution is currently aligned with the momentum ranking again. The bot buys the strongest `entry_ready` names, then exits them at `+2%` take profit, `-2%` stop loss, a blunt stale-position timeout after `4` hours, an optional one-step break-even stop ratchet, or an optional laddered profit ratchet that extends TP and lifts SL in place instead of closing and reopening.
+- When `PROFIT_RATCHET_ENABLED=true`, the system is intentionally not using venue-owned take profit. The engine manages TP touches and ratchet decisions itself while Bybit still owns the current stop. That is the only honest way to extend a winner in place; venue TP would close it before the ratchet logic could act.
 - `INTRADAY_REGIME_*` is now the practical no-trade layer. It only blocks `entry_ready` promotion; the engine still logs broad intrabar context on bad days so you can see what it wanted to do without actually entering.
 - `MAX_OPEN_POSITIONS` is back as a blunt portfolio safety net. It caps the total number of simultaneously open positions, while `MAX_ENTRIES_PER_REBALANCE` separately caps how many new names one rebalance pass may add.
 - `MAX_POSITIONS_PER_CLUSTER` is the more useful anti-pileup control. It stops the book from filling with multiple names from the same current cluster even when raw position count still looks safe.
@@ -450,7 +473,7 @@ For the first VPS validation run, use [SOAK_RUN.md](deploy/SOAK_RUN.md) and star
 - If a candle gap is detected mid-stream, the supervisor falls back to a fresh REST bootstrap instead of pretending state is intact.
 - Cooldown only advances after a successful alert send; a failed Telegram request does not silently suppress the next valid signal.
 - The confirmed-cycle consumer still exists because closed bars still need to advance state cleanly. It no longer emits tradeable or operator-facing confirmed tiers.
-- Analytics env knobs now include `MAX_DAILY_STOP_LOSSES`, `ANALYTICS_POST_EXIT_BARS`, `ANALYTICS_LOG_POSITION_MARKS`, and `ANALYTICS_LOG_PORTFOLIO_SNAPSHOTS`.
+- Analytics and exit-management env knobs now include `MAX_DAILY_STOP_LOSSES`, `STALE_POSITION_MAX_MINUTES`, `BREAK_EVEN_STOP_ENABLED`, `BREAK_EVEN_STOP_TRIGGER_FRACTION_OF_TP`, `PROFIT_RATCHET_ENABLED`, `PROFIT_RATCHET_MAX_STEPS`, `PROFIT_RATCHET_REQUIRE_ENTRY_READY`, `ANALYTICS_POST_EXIT_BARS`, `ANALYTICS_LOG_POSITION_MARKS`, and `ANALYTICS_LOG_PORTFOLIO_SNAPSHOTS`.
 - Runtime control knobs now include `RUNTIME_HEALTH_SNAPSHOT_*` and `RUNTIME_DRIFT_CHECK_*`, which govern the SQLite control-plane cadence rather than alpha logic.
 - Execution throttles now include `MAX_ENTRIES_PER_REBALANCE` for per-batch entry control and `MAX_DAILY_STOP_LOSSES` for the UTC-day kill switch.
 - For VPS analysis, prefer pulling the SQLite backup to the Mac and regenerating CSVs locally rather than grepping raw logs. Example:
